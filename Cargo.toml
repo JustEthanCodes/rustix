@@ -1,0 +1,32 @@
+[workspace]
+members = ["crates/crabshell"]
+resolver = "2"
+
+[package]
+name = "rustix-kernel"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "A freestanding 64-bit Rust kernel for the Rustix operating system"
+
+[dependencies]
+crabshell = { path = "crates/crabshell" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustix"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = false
