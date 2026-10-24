@@ -7,7 +7,7 @@ Rustix is an early kernel prototype, not a security-reviewed operating system. I
 - `src/arch/x86_64/io.rs` issues privileged x86 port-I/O instructions behind narrow driver wrappers.
 - `src/arch/x86_64/serial.rs` configures and writes to the legacy COM1 UART. It is intended for early kernel context only.
 - `src/arch/x86_64/keyboard.rs` reads raw bytes from a legacy PS/2-compatible controller; callers must poll without blocking.
-- `src/arch/x86_64/cpu.rs` executes CPUID for boot-time feature reporting; x86_64 requires CPUID support.
+- `src/arch/x86_64/cpu.rs` executes CPUID for boot-time feature reporting, reads CR0/CR4/CR3 without modifying them, and performs gated, read-only `RDMSR` reads of EFER.NXE, `IA32_PAT`, and supported MTRR registers. EFER and PAT reads are gated by their CPUID features; MTRR reads are skipped unless CPUID reports MTRR support and are bounded to the reported variable-register count, up to 32 pairs. These paths assume CPL 0 and architectural feature/MSR availability, and they do not write control registers or MSRs.
 - `src/arch/x86_64/interrupts.rs` loads the GDT/TSS/IDT and exception-entry assembly, reads CR2 on page faults, and halts after printing the saved context. The exception gates are kernel-only and maskable interrupts remain disabled.
 - `src/boot.rs` reads Limine response pointers and entries, then validates and copies range metadata into an owned boot snapshot. Nullness, alignment, count bounds, arithmetic, and range overlap are checked; the kernel still trusts Limine to make non-null response objects readable for the handoff lifetime.
 - `src/main.rs` uses `cli` and `hlt` to stop the bootstrap CPU after a fatal startup error.

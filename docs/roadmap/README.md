@@ -11,9 +11,9 @@ This roadmap describes an incremental path from the current bare-metal kernel to
 
 ## Current status
 
-- **Milestone 0: current working tree passes `just verify`; clean-checkout reproducibility remains pending.** The WSL2 Ubuntu 24.04 run on 2026-10-16 built the image and reached the Crabshell prompt in QEMU. A fresh checkout with uncached build/tool state and a CI run have not yet been tested.
-- **Milestone 1: host validation and QEMU boot-metadata reporting have been exercised.** The bounded boot snapshot, memory-range classification, and CPUID reporting were covered by `just verify`; the Limine pointer-readability trust boundary remains explicit.
-- **Milestone 2: in progress, not complete.** A bounded frame allocator is retained in `BootInfo`, and bootstrap GDT/TSS/IDT fatal exception handlers exist. The kernel still inherits Limine's page tables; there is no owned page-table manager, global heap, live frame-allocation caller, or fault-injection/emulator validation.
+- **Milestone 0: local exit criteria met from a clean detached worktree; hosted CI pending.** On 2026-10-16, `just verify` passed in WSL2 Ubuntu 24.04 from both the working tree and a clean detached worktree with an empty `target` directory. The clean run downloaded and compiled the pinned Limine host utility, formatted and tested the workspace, checked and built the target, created the image, and passed the 20-second QEMU prompt smoke test. Hosted CI has not been observed.
+- **Milestone 1: validation criteria met for the current Limine path.** The bounded boot snapshot, memory-range classification, and CPUID reporting were covered by host tests and QEMU reporting; the Limine pointer-readability trust boundary remains explicit.
+- **Milestone 2: local exit criteria met on 2026-10-24; hosted CI and physical-hardware validation remain pending.** The boot path owns and activates a clone of Limine's reachable page-table hierarchy, preserves inherited mappings, hardens kernel HHDM aliases to R/NX or RW/NX while retaining PAT attributes, invalidates stale translations on CR3 transitions, and retains table-frame tokens. `just verify`, `just frame-smoke`, and `just fault-smoke` passed after final review; QEMU exercised the active-PCID/CR3 invalidation path with CR4.PGE clear. The PGE-toggle path is statically reviewed but was not exercised by this QEMU configuration. The bounded heap does not grow from frames; broad mapping policy, reclamation, IRQ-safe allocation, and physical-hardware validation remain outside this milestone's completed scope.
 - **Milestones 3 and later: planned.** There is no general IRQ system, scheduler, userspace, syscall ABI, persistent filesystem, GUI, or networking stack.
 
 ## Dependency path
@@ -32,7 +32,7 @@ Some device-driver work can proceed in parallel after the core ownership, lockin
 
 ---
 
-## Milestone 0 — repeatable Rust kernel boot (current baseline)
+## Milestone 0 — repeatable Rust kernel boot (local exit criteria met)
 
 ### Implementation present
 
@@ -49,15 +49,16 @@ Some device-driver work can proceed in parallel after the core ownership, lockin
 - [x] Current source passed formatting, host tests, target check, and optimized build through `just verify`.
 - [x] The pinned image built and the bounded QEMU smoke test reached the Crabshell prompt in WSL2 Ubuntu 24.04 on 2026-10-16.
 - [x] A separate interactive QEMU session exercised `help`, `ls`, `meminfo`, directory navigation, and file create/write/append/read/copy/move/remove operations; `cp` replaced an existing destination, `rmdir` refused a nonempty directory, and unsupported `memtest` was rejected as expected.
-- [ ] Repeat verification from a clean checkout with uncached build/tool state; CI has not yet been observed.
+- [x] Repeat verification from a clean detached worktree with an empty `target` directory and uncached build/tool state; fresh Limine download/host-tool compilation, image creation, and QEMU prompt smoke test all passed on 2026-10-16.
+- [ ] Observe the hosted CI workflow; it has not yet been run or verified.
 
 The QEMU serial log showed the startup banner, HHDM offset, validated memory-map summary, frame counts, CPUID report, and initial prompt. The interactive command check is a focused manual test, not exhaustive shell coverage or a persistence test. `cat` returned `hello Rustix from QEMU`, `cp` replaced an existing destination with source data, `rmdir` refused a nonempty directory, and `pwd` returned to `/home/rustix` after cleanup. If a future smoke test fails, preserve `target/rustix-qemu-serial.log` as failure evidence.
 
-**Exit criteria:** a clean checkout builds the image, reaches `_start`, reports the expected startup state, and reaches the Crabshell prompt in the automated QEMU test. The current working tree meets the boot path checks; clean-checkout reproducibility is still pending.
+**Exit criteria:** met locally. A clean detached worktree with uncached build/tool state built the image, reached `_start`, reported the expected startup state, and reached the Crabshell prompt in the automated QEMU test. Hosted CI remains unobserved, but is tracked separately from the local exit criteria.
 
 ---
 
-## Milestone 1 — validated boot state and machine diagnostics (validation exercised)
+## Milestone 1 — validated boot state and machine diagnostics (current Limine path validated)
 
 ### Source work present
 
@@ -76,40 +77,63 @@ The QEMU serial log showed the startup banner, HHDM offset, validated memory-map
 - [x] Build and boot the image with the current request-section/linker layout; the QEMU serial log showed the boot metadata and CPUID report.
 - [ ] Revisit loader pointer validation before introducing another boot source: numeric checks cannot prove non-null response data is mapped and readable.
 
-**Exit criteria:** the host tests and QEMU metadata/reporting path were observed in the 2026-10-16 WSL2 `just verify` run. The loader readability trust boundary remains documented; clean-checkout reproducibility is tracked under Milestone 0.
+**Exit criteria:** met for the current Limine path. Host tests and QEMU metadata/reporting were observed in the 2026-10-16 WSL2 `just verify` run, including the clean detached-worktree verification. The loader readability trust boundary remains documented and must be reconsidered before adding another boot source.
 
 ---
 
-## Milestone 2 — memory ownership, paging, heap, and exceptions (in progress)
+## Milestone 2 — memory ownership, paging, heap, and exceptions (local exit criteria met)
 
-This milestone must establish a safe basis for future allocation and kernel services. Do not allocate a frame for a mapping or dereference it through the HHDM until the mapping/ownership proof is explicit.
+This milestone establishes a safe basis for future allocation and kernel services. HHDM access is limited to checked full-frame token paths that rely on Limine's documented contract. The boot path clones the complete reachable inherited hierarchy and activates it only after validating the requested stack span, kernel segments, candidate-root HHDM alias, and kernel-image HHDM permissions.
 
 ### Source work present
 
 - [x] Fixed-capacity frame allocator over validated `Usable` ranges, with page alignment, first-MiB reservation, deallocation, coalescing, bounded metadata, and host tests (`src/frame.rs`).
 - [x] Initialize allocator metadata from the boot snapshot and expose counts through Crabshell `meminfo`.
+- [x] Specify frame-token ownership and failure semantics: `Frame` is non-copyable, failed deallocation returns the token without changing allocator state, and the current API documents (but does not enforce) one allocator instance per physical map.
 - [x] Bootstrap GDT/TSS/IDT and fatal handlers for exception vectors 0–31.
 - [x] Give double faults a dedicated IST stack; report saved register/error context and CR2/error bits for page faults.
 - [x] Keep maskable IRQ delivery disabled; current exception handling is fatal-only.
 
 ### Required memory-management work
 
-- [ ] Specify how one allocator instance owns its ranges, how allocated frames are returned, and how exhaustion/metadata exhaustion is surfaced to callers.
-- [ ] Document the active virtual-address width, HHDM coverage, physical-address width, page size, and the policy for MMIO, guard regions, kernel image, stacks, boot data, and page-table frames.
-- [ ] Design a kernel-owned page-table transition that preserves every mapping needed to execute during and after the switch: kernel text/data/BSS, current stack, `BootInfo`, Limine requests/responses still needed, GDT/TSS/IDT, exception stacks, serial state, and any direct-map access used by the transition.
-- [ ] Implement checked page-table entry construction and mapping operations: canonical/aligned addresses, permissions, cache attributes, ownership, huge-page behavior, and explicit writable-executable rejection by default.
-- [ ] Ensure mapping failure (including no free frame or range-table exhaustion) rolls back partial page-table allocations or leaves the old map active.
-- [ ] Add host tests for mapping/address policy and allocator failure invariants. Add a reviewable emulator test for mapping, unmapping, permission behavior, and frame reclamation before replacing the inherited CR3.
-- [ ] Only after a mapping policy works, add a kernel heap with documented alignment, allocation/free semantics, deterministic exhaustion behavior, and an explicit rule for interrupt contexts.
+- [x] Read `CR4.LA57` and `CPUID.80000008H` when available to report active/max address widths; validate Limine pointers against active canonical width and host-test 48-/57-bit boundaries.
+- [x] Document base revision 3 HHDM region coverage, page-boundary behavior, and x86 permissions/cache attributes. HHDM access is limited to opt-in, checked frame and candidate-table probes relying on the protocol contract; there is no general physical-memory service.
+- [x] Reject physical map ranges outside the reported CPUID width when available; validate page-rounded HHDM address arithmetic/canonicality for base revision 3 mapped types. This is protocol-derived validation, not a page-table walk or proof of pointer readability.
+- [x] Record current transition-critical objects, their mapping sources/permissions, and unresolved bounds in `docs/architecture/memory.md`.
+- [x] Capture Limine's executable physical/virtual bases and resolve the complete linker-defined half-open kernel-image span in `BootInfo`; validate the linker/loader base agreement, canonical virtual span, arithmetic, and reported physical width.
+- [x] Capture and validate the linker-defined page-aligned text, rodata, and data segment bounds in `BootInfo`; host-test their ordering, contiguity, rounded image coverage, and derived physical ranges. `just verify` reported all three in QEMU on 2026-10-21. This metadata does not prove inherited page-table coverage or live permissions.
+- [x] Request a 256 KiB Limine x86_64 stack, require its response, and capture/validate the requested span from entry `RSP`; verify its HHDM translation and `BootloaderReclaimable` backing. `just frame-smoke` walked all 64 pages in QEMU. This request fixed stack-frame overflow in the diagnostic path.
+- [x] Record that Limine guarantees at least the requested stack size but does not report the larger allocation's exact bounds or guard status; preserve the requested 256 KiB span and do not infer a guard page.
+- [x] Decode the inherited CR3 root address and interpret its low bits using the reported physical-address width and active `CR4.PCIDE` state; host-test reserved-bit and width rejection. `just frame-smoke` reads the root, walks kernel segments and the requested stack span, compares effective PAT/MTRR types for kernel-image/HHDM aliases, and exercises the active-root transition.
+- [x] Document the active clone's kernel alias W^X policy, inherited cache behavior, MMIO limits, huge-page splitting, stack bounds, and inherited-root preservation in `docs/architecture/memory.md`.
+- [x] Clone every reachable present inherited page-table hierarchy entry into allocator-owned table frames, preserving inherited leaves and non-present entries. Validate kernel segments, the full requested stack span, candidate-root HHDM access, and critical paths; keep the inherited root and backing frames untouched.
+- [x] Add pure host-tested 4 KiB mapping-range validation and leaf-PTE bit encoding. Validation requires alignment, checked bounds, known physical width, canonical virtual ranges, and W^X; encoding bounds the physical width and PAT index and requires NXE for non-executable entries. These helpers alone do not prove frame ownership, mapping coverage, or PAT cache semantics, and do not touch tables.
+- [x] Implement a bounded candidate-root builder for 4 KiB mappings backed by allocator-issued table and leaf tokens. It requires NXE, uses range-bound PAT attributes, restricts walks to owned tables, and holds a unique mutable backend borrow. Mapping preflights the path and prepares all missing tables before linking them; host tests cover 4-/5-level paths, W^X, ownership rejection, and rollback. An active-state guard prevents candidate mutation/release while CR3 names its root.
+- [x] Ensure candidate mapping failure (including frame exhaustion and prepare failure) rolls back partial page-table allocations without changing the active root. Host tests cover rollback and retryable release failure; `just frame-smoke` maps, walks, unmaps, and releases a separate candidate mapping in QEMU.
+- [x] Validate and activate the cloned root in QEMU, preserving CR3 low-bit mode, invalidating the active PCID, and flushing global translations when CR4.PGE is enabled; verify the active CR3 plus critical translations after the switch. On failure, restore and verify the inherited root with the same TLB invalidation before releasing the inactive candidate.
+- [x] Add host tests for raw PTE-bit encoding and parsing a supplied PAT layout to find WB/UC/WC indexes.
+- [x] Read EFER.NXE only when NX is supported and read `IA32_PAT` only when PAT is supported; report these read-only values and recognized PAT indexes at boot.
+- [x] Host-test that rejected deallocations preserve free-range state and return the frame token for unaligned, unmanaged, already-free, and range-table-full cases.
+- [x] Add a pure host-tested MTRR decoder/resolver for supplied fixed and variable register values, including disabled-MTRR behavior and overlap rules. Host tests and `just verify` passed on 2026-10-21.
+- [x] Capture supported MTRR capability, default-type, fixed-range, and variable-range registers read-only at boot. Retain at most 32 variable pairs; report capacity overflow explicitly without a partial snapshot. Host tests cover feature gating, supported fixed/variable register reads, unsupported fixed ranges, and capacity overflow. `just verify` passed on 2026-10-22; the QEMU serial log reported the live MTRR summary.
+- [x] Validate captured MTRR capability/default-type bits, register counts and fixed-range availability, WC support, and variable-range mask/alignment; resolve the Intel SDM Table 11-7 PAT/MTRR combinations for one physical address only when `CR0.CD=0` and `CR0.NW=0`. Host tests cover all 30 documented type pairs and malformed inputs. Boot validates the captured PAT/MTRR state and prints a diagnostic resolution at PA 0; `just verify` passed on 2026-10-22. This policy helper does not establish the cache type of an inherited mapping.
+- [x] Add a pure range-level PAT selector that returns an index only when it yields the requested effective type across every fixed/variable MTRR transition in the aligned physical range. Host tests cover variable boundaries, fixed-range transitions, no-uniform-index failure, and malformed range inputs. This remains policy-only and does not inspect live PTEs or aliases.
+- [x] Compose range-level PAT selection with validated mapping metadata; bind the selected attributes to the physical extent and use them to encode individual 4 KiB leaves. Host tests cover a range crossing variable-MTRR types, width mismatch, and rejecting attributes for a different extent. This does not inspect inherited PTEs, establish frame ownership, or detect cache aliases.
+- [x] Calculate HHDM addresses only for allocator-issued frame tokens whose complete page remains in a validated `Usable` region, with known physical width and checked protocol bounds. `just frame-smoke` passed in QEMU: one frame was written, read, cleared, and returned to the allocator. This relies on Limine's base revision 3 HHDM guarantee and does not inspect live PTEs or validate arbitrary physical addresses.
+- [x] Validate the inherited CR3 root's numeric HHDM location only when its page lies wholly in a validated `BootloaderReclaimable` region and address-width arithmetic passes. Host tests reject unknown widths and other region types; `just frame-smoke` reads the 512 root entries in QEMU and confirms the HHDM access.
+- [x] Add a bounded read-only 4-/5-level page-table walker with synthetic host tests for translations, permissions, PAT selection bits, 2 MiB pages, and absent entries. The opt-in QEMU probe follows every page in linker-defined text/rodata/data spans and the requested stack span, checking translations and effective cache types for kernel-image/HHDM aliases.
+- [x] Add host-tested candidate page-table mapping/unmapping and transactional ownership handling; `just frame-smoke` verifies a separate candidate root can map, walk, unmap, and release one frame without changing CR3. The default boot path separately activates an inherited-root clone after critical translation and kernel-alias permission/cache checks.
+- [x] Harden kernel-image HHDM aliases before activation: text/rodata become R/NX and data/BSS become RW/NX. Split inherited 1 GiB/2 MiB mappings as needed while preserving translation and PAT bits. Host tests cover both large-page splits; QEMU verifies every kernel-image alias retains its physical translation, desired permissions, and PAT index.
+- [x] Add a 256 KiB BSS-backed global heap with 128 allocation records, first-fit aligned placement, exact-layout free/reuse, deterministic arena/metadata exhaustion, and an explicit prohibition on interrupt-context allocation. Host tests cover alignment, reuse, exhaustion, and invalid frees; the QEMU boot probe exercises the global allocator before entering the shell. The arena is fixed and does not grow from physical frames.
 
 ### Required exception/descriptor validation
 
 - [x] Source contains GDT/TSS/IDT setup and normalized stubs for architectural exception vectors 0–31; double fault uses IST1.
-- [ ] Target-assemble and link the stubs; inspect descriptor layout/selectors and verify call-stack alignment and error-code normalization.
-- [ ] Add fault-injection tests for at least a controlled page fault and a controlled exception. Confirm diagnostics are captured and the kernel halts rather than returning.
-- [ ] Confirm the descriptor setup and exception paths boot in QEMU before relying on them as a memory-management safety net.
+- [x] Target-assemble/link and inspect the stubs and descriptor setup; ELF disassembly confirms call-stack alignment and the error-code normalization paths, while compile-time size assertions pin the IDT, TSS, and exception-context layouts.
+- [x] Add QEMU fault-injection tests for a controlled page fault and invalid opcode. `just fault-smoke` verifies vector diagnostics, the exact CR2 address, no shell prompt or return marker, and that QEMU remains halted until its timeout; it then restores the default release kernel and ISO.
+- [x] Boot the descriptor setup and both tested exception paths in QEMU. These checks cover only the injected page fault and invalid opcode, not all vectors or physical hardware.
 
-**Exit criteria:** the kernel owns and validates its page-table state, frame allocation/mapping invariants are tested, OOM/failure leaves memory state consistent, page faults are diagnosable, and the kernel remains bootable under emulator tests. Not met: page tables, heap, fault-injection, and boot verification remain outstanding.
+**Exit criteria:** met locally on 2026-10-24. `just verify`, `just frame-smoke`, and `just fault-smoke` passed after final review, covering host tests, the target build, active cloned-root boot, frame and candidate-map probes, heap behavior, and fatal page-fault/invalid-opcode diagnostics. The QEMU configuration reported CR4.PGE clear and exercised the CR3 reload path; the PGE-toggle global-TLB path is statically reviewed but was not exercised in QEMU. The active hierarchy preserves Limine's complete reachable mapping graph and hardens the kernel-image HHDM aliases; it is not a clean-room address-space policy, does not reclaim the old root or leaf frames, and has no general active mapping service. Hosted CI and physical-hardware validation remain pending and are not claimed by this local exit status.
 
 ---
 

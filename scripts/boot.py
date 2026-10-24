@@ -243,10 +243,19 @@ def smoke_test(timeout: int) -> None:
     output = serial_log.read_text(encoding="latin-1") if serial_log.exists() else ""
     expected = (
         "Rustix kernel: x86_64 Rust bootstrap",
+        "kernel HHDM aliases validated: text/rodata R/NX, data RW/NX, PAT preserved",
+        "page-table transition passed:",
+        "kernel heap probe passed: alignment, reuse, deterministic exhaustion",
         "crabshell: ready (volatile RAM filesystem)",
         "root@rustix:/home/rustix# ",
     )
     missing = [marker for marker in expected if marker not in output]
+    tlb_flush_markers = (
+        "page-table transition: global TLB flushed via CR4.PGE toggle",
+        "page-table transition: CR4.PGE clear; CR3 reload flushed active translations",
+    )
+    if not any(marker in output for marker in tlb_flush_markers):
+        missing.append("a page-table transition TLB invalidation marker")
     if missing:
         raise BuildError(
             "QEMU did not reach the expected kernel state; missing serial markers: "
@@ -256,6 +265,161 @@ def smoke_test(timeout: int) -> None:
 
     print(f"QEMU boot smoke test passed (bounded to {timeout}s).")
     print(f"Captured serial log: {serial_log.relative_to(ROOT)}")
+
+
+def fault_smoke_test(kind: str, timeout: int) -> None:
+    qemu = require_tool("qemu-system-x86_64")
+    if not ISO_PATH.is_file():
+        raise BuildError("boot image not found; build the fault-injection image first")
+
+    serial_log = TARGET_DIR / f"rustix-qemu-fault-{kind}.log"
+    serial_log.parent.mkdir(parents=True, exist_ok=True)
+    serial_log.unlink(missing_ok=True)
+    serial_device = "file:" + serial_log.relative_to(ROOT).as_posix()
+    command = [
+        qemu,
+        "-machine",
+        "q35",
+        "-m",
+        "256M",
+        "-cdrom",
+        str(ISO_PATH),
+        "-boot",
+        "d",
+        "-display",
+        "none",
+        "-monitor",
+        "none",
+        "-serial",
+        serial_device,
+        "-no-reboot",
+        "-no-shutdown",
+    ]
+
+    timed_out = False
+    try:
+        result = subprocess.run(command, cwd=ROOT, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        result = None
+
+    output = serial_log.read_text(encoding="latin-1") if serial_log.exists() else ""
+    if kind == "page-fault":
+        expected = (
+            "fault injection: triggering page fault at 0x00000000deadbeef",
+            "KERNEL EXCEPTION: vector 14 (page fault)",
+            "page fault address (CR2): 0x00000000deadbeef",
+        )
+    elif kind == "invalid-opcode":
+        expected = (
+            "fault injection: triggering invalid opcode with ud2",
+            "KERNEL EXCEPTION: vector 6 (invalid opcode)",
+        )
+    else:
+        raise BuildError(f"unsupported fault-injection test: {kind}")
+
+    missing = [marker for marker in expected if marker not in output]
+    if missing:
+        raise BuildError(
+            f"QEMU did not report the expected {kind} exception; missing serial markers: "
+            + ", ".join(repr(marker) for marker in missing)
+            + f"\nSerial output:\n{output or '<empty>'}"
+        )
+    if "root@rustix:/home/rustix# " in output:
+        raise BuildError(f"kernel reached the shell after {kind} injection\nSerial output:\n{output}")
+    if "fault injection unexpectedly returned" in output:
+        raise BuildError(f"{kind} instruction returned instead of faulting\nSerial output:\n{output}")
+    if not timed_out:
+        status = result.returncode if result is not None else "unknown"
+        raise BuildError(
+            f"QEMU did not remain halted after {kind} (exit status {status})\n"
+            f"Serial output:\n{output}"
+        )
+
+    print(f"QEMU {kind} fault-injection test passed (halt observed within {timeout}s).")
+    print(f"Captured serial log: {serial_log.relative_to(ROOT)}")
+
+
+def build_kernel(features: tuple[str, ...] = ()) -> None:
+    command = ["cargo", "build", "--release", "--target", "x86_64-unknown-none"]
+    if features:
+        command.extend(["--features", ",".join(features)])
+    subprocess.run(command, cwd=ROOT, check=True)
+
+
+def frame_smoke_workflow(timeout: int) -> None:
+    failure: BaseException | None = None
+    try:
+        build_kernel(("probe-hhdm-frame",))
+        build_image()
+        smoke_test(timeout)
+        serial_log = TARGET_DIR / "rustix-qemu-serial.log"
+        output = serial_log.read_text(encoding="latin-1") if serial_log.exists() else ""
+        markers = (
+            "HHDM frame probe passed: wrote, read, cleared, and reclaimed one frame",
+            "inherited root HHDM probe passed: read 512 entries",
+            "candidate inherited-root clone probe passed:",
+            "candidate page-table probe passed: mapped, walked, unmapped, and released",
+        )
+        missing = [marker for marker in markers if marker not in output]
+        if missing:
+            raise BuildError(
+                "QEMU did not report successful HHDM access probes; missing markers: "
+                + ", ".join(repr(marker) for marker in missing)
+                + f"\nSerial output:\n{output}"
+            )
+        print("QEMU HHDM, inherited-mapping, cloned-root, and candidate-map probes passed.")
+    except BaseException as error:
+        failure = error
+
+    try:
+        build_kernel()
+        build_image()
+    except BaseException as restore_error:
+        if failure is not None:
+            raise BuildError(
+                f"HHDM frame workflow failed ({failure}); restoring the default image "
+                f"also failed ({restore_error})"
+            ) from restore_error
+        raise
+
+    if failure is not None:
+        raise BuildError(
+            f"HHDM frame workflow failed; the default release image was restored: {failure}"
+        ) from failure
+    print("Restored the default release kernel and ISO after the HHDM frame probe.")
+
+
+def fault_smoke_workflow(timeout: int) -> None:
+    tests = (
+        ("page-fault", "inject-page-fault"),
+        ("invalid-opcode", "inject-invalid-opcode"),
+    )
+    failure: BaseException | None = None
+    try:
+        for kind, feature in tests:
+            build_kernel((feature,))
+            build_image()
+            fault_smoke_test(kind, timeout)
+    except BaseException as error:
+        failure = error
+
+    try:
+        build_kernel()
+        build_image()
+    except BaseException as restore_error:
+        if failure is not None:
+            raise BuildError(
+                f"fault-injection workflow failed ({failure}); restoring the default image "
+                f"also failed ({restore_error})"
+            ) from restore_error
+        raise
+
+    if failure is not None:
+        raise BuildError(
+            f"fault-injection workflow failed; the default release image was restored: {failure}"
+        ) from failure
+    print("Restored the default release kernel and ISO after fault-injection tests.")
 
 
 def run_interactive() -> None:
@@ -286,13 +450,56 @@ def run_interactive() -> None:
         raise BuildError(f"QEMU exited with status {result.returncode}")
 
 
+def run_debug() -> None:
+    qemu = require_tool("qemu-system-x86_64")
+    if not ISO_PATH.is_file():
+        raise BuildError("boot image not found; run 'just debug-image' first")
+
+    command = [
+        qemu,
+        "-machine",
+        "q35",
+        "-m",
+        "256M",
+        "-cdrom",
+        str(ISO_PATH),
+        "-boot",
+        "d",
+        "-display",
+        "none",
+        "-monitor",
+        "none",
+        "-serial",
+        "stdio",
+        "-gdb",
+        "tcp:127.0.0.1:1234",
+        "-S",
+        "-no-reboot",
+        "-no-shutdown",
+    ]
+    print("QEMU is paused; GDB stub listening on 127.0.0.1:1234.", flush=True)
+    print("Attach with the Rustix: QEMU (CodeLLDB) debug configuration.", flush=True)
+    result = subprocess.run(command, cwd=ROOT, check=False)
+    if result.returncode != 0:
+        raise BuildError(f"QEMU exited with status {result.returncode}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("image", help="create a pinned Limine BIOS/UEFI hybrid ISO")
     smoke = subparsers.add_parser("smoke", help="boot the ISO and check its serial output")
     smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
+    frame_smoke = subparsers.add_parser(
+        "frame-smoke", help="probe HHDM access and an inactive candidate root in QEMU"
+    )
+    frame_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
+    fault_smoke = subparsers.add_parser(
+        "fault-smoke", help="test fatal exceptions in QEMU, then restore the default image"
+    )
+    fault_smoke.add_argument("--timeout", type=int, default=10, help="per-test QEMU time limit")
     subparsers.add_parser("run", help="run the ISO with an interactive serial terminal")
+    subparsers.add_parser("debug", help="run the ISO paused with a loopback GDB stub")
     args = parser.parse_args()
 
     try:
@@ -300,6 +507,16 @@ def main() -> int:
             build_image()
         elif args.command == "run":
             run_interactive()
+        elif args.command == "debug":
+            run_debug()
+        elif args.command == "frame-smoke":
+            if args.timeout <= 0:
+                raise BuildError("--timeout must be a positive number of seconds")
+            frame_smoke_workflow(args.timeout)
+        elif args.command == "fault-smoke":
+            if args.timeout <= 0:
+                raise BuildError("--timeout must be a positive number of seconds")
+            fault_smoke_workflow(args.timeout)
         else:
             if args.timeout <= 0:
                 raise BuildError("--timeout must be a positive number of seconds")

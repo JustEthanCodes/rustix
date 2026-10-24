@@ -10,6 +10,12 @@ publish = false
 license = "MIT OR Apache-2.0"
 description = "A freestanding 64-bit Rust kernel for the Rustix operating system"
 
+[features]
+default = []
+inject-page-fault = []
+inject-invalid-opcode = []
+probe-hhdm-frame = []
+
 [dependencies]
 crabshell = { path = "crates/crabshell" }
 

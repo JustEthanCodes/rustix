@@ -12,6 +12,7 @@ PHDRS
 SECTIONS
 {
     . = 0xffffffff80000000;
+    __kernel_start = .;
 
     .text ALIGN(4K) :
     {
@@ -40,6 +41,20 @@ SECTIONS
         *(COMMON)
         *(.bss .bss.*)
     } :data
+
+    .got ALIGN(8) :
+    {
+        *(.got .got.*)
+    } :data
+
+    __kernel_end = .;
+
+    __kernel_text_mapping_start = ADDR(.text);
+    __kernel_text_mapping_end = ALIGN(ADDR(.text) + SIZEOF(.text), 4K);
+    __kernel_rodata_mapping_start = ADDR(.rodata);
+    __kernel_rodata_mapping_end = ALIGN(ADDR(.rodata) + SIZEOF(.rodata), 4K);
+    __kernel_data_mapping_start = ADDR(.limine_requests);
+    __kernel_data_mapping_end = ALIGN(__kernel_end, 4K);
 
     /DISCARD/ :
     {

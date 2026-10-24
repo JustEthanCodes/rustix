@@ -14,7 +14,7 @@ Unix-like is a compatibility direction. It does **not** mean the current kernel 
 4. The separately packaged `crabshell` `no_std` crate parses commands without allocation or dependence on kernel I/O, making that layer reusable by a future graphical frontend.
 5. The kernel library contains checked memory accounting and the bounded VFS implementation, both covered by host-side unit tests.
 
-The current shell and filesystem run in kernel mode. Files exist only in RAM and disappear at reboot. Bootstrap GDT/TSS/IDT setup and fatal exception handlers for vectors 0–31 exist, but maskable IRQs remain disabled and exception recovery is not implemented. There is no heap, Rustix-owned page-table manager, general IRQ subsystem, scheduler, user/kernel isolation, syscall ABI, on-disk filesystem, network stack, or userspace process.
+The current shell and filesystem run in kernel mode. Files exist only in RAM and disappear at reboot. Bootstrap GDT/TSS/IDT setup and fatal exception handlers for vectors 0–31 exist, but maskable IRQs remain disabled and exception recovery is not implemented. The active page tables are an owned clone of Limine's reachable hierarchy, and a bounded 256 KiB BSS heap is installed. There is no clean-room address-space policy, general active mapping service, frame reclamation, IRQ-safe allocation, general IRQ subsystem, scheduler, user/kernel isolation, syscall ABI, on-disk filesystem, network stack, or userspace process.
 
 ## Intended layers (planned)
 

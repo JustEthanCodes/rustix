@@ -17,13 +17,18 @@ Run from the repository root:
 ```sh
 just help
 just fmt       # check Rust formatting
-just test      # parser, RAM-filesystem, memory-map, and frame-allocator tests
+just test      # parser, RAM-filesystem, memory-map, paging policy, and frame-allocator tests
 just check     # type-check the freestanding kernel target
-just build     # optimized kernel ELF
-just image     # hybrid BIOS/UEFI ISO at target/rustix.iso
-just smoke     # bounded QEMU boot to the Crabshell prompt
-just run       # interactive serial shell in QEMU (Ctrl+C to stop)
-just verify    # fmt, workspace tests, target check, image, and QEMU smoke test
+just build       # optimized kernel ELF
+just image       # hybrid BIOS/UEFI ISO at target/rustix.iso
+just debug-build # optimized kernel ELF with full debug symbols
+just debug-image # ISO built from the debug-symbol-enabled ELF
+just debug-run   # paused QEMU with a loopback GDB stub for Zed/CodeLLDB
+just smoke       # bounded QEMU boot to the Crabshell prompt
+just frame-smoke # probe one owned frame through the HHDM, then restore the default image
+just fault-smoke # inject page fault and invalid opcode, then restore the default image
+just run         # interactive serial shell in QEMU (Ctrl+C to stop)
+just verify      # fmt, workspace tests, target check, image, and QEMU smoke test
 ```
 
 Equivalent Rust checks are `cargo fmt --all -- --check`, `cargo test --workspace --lib`, `cargo check --target x86_64-unknown-none`, and `cargo build --release --target x86_64-unknown-none`. Image creation and QEMU validation are provided by `scripts/boot.py` and are intentionally part of `just verify`.
@@ -32,7 +37,7 @@ The optimized ELF is written to `target/x86_64-unknown-none/release/rustix`. `ca
 
 ## Target-specific linker setup
 
-`.cargo/config.toml` applies the Rustix linker script and x86_64 kernel constraints only to `x86_64-unknown-none`. `linker.ld` emits an ELF64 x86_64 image at the higher-half base, retains Limine request sections in a writable load segment for bootloader response pointers, and defines `_start` as the entry symbol. The build uses no third-party Rust crates; the boot protocol is represented by small in-tree Rust structures and constants.
+`.cargo/config.toml` applies the Rustix linker script and x86_64 kernel constraints only to `x86_64-unknown-none`. `linker.ld` emits an ELF64 x86_64 image at the higher-half base, retains Limine request sections in a writable load segment for bootloader response pointers, defines `_start` as an assembly entry shim, and exports the load-image boundary symbols consumed by `BootInfo`. The shim captures the initial stack pointer before entering Rust. The build uses no third-party Rust crates; the boot protocol is represented by small in-tree Rust structures and constants.
 
 Changing the target, virtual base, relocation model, or request ABI requires updating the linker script, protocol documentation, and validation plan together. Do not use host builds of the kernel binary as evidence that the freestanding target links correctly.
 
@@ -43,6 +48,12 @@ Changing the target, virtual base, relocation model, or request ABI requires upd
 `just smoke` launches `target/rustix.iso` in `qemu-system-x86_64` with a 256 MiB q35 machine, headless display, captured COM1 output, and a 20-second deadline. QEMU is expected to remain running at the interactive shell; the runner terminates it at the deadline and requires the startup banner, Crabshell-ready message, and initial prompt. On a failure it prints the serial log. The log remains at `target/rustix-qemu-serial.log` for inspection.
 
 `just run` launches the same image with the serial port attached to the host terminal, allowing interactive shell use. Stop the emulator with `Ctrl+C`.
+
+## Debugging the kernel from Zed
+
+On the Windows Zed workspace with the repository built through WSL2, run the `Rustix: QEMU Debug Server` task from the task picker. It builds the release ELF with full DWARF debug information, creates the ISO, and starts QEMU paused with its GDB stub bound only to `127.0.0.1:1234`. Then open Zed's debugger (`F4`) and start `Rustix: QEMU (CodeLLDB)`. The configuration loads the ELF from the Windows worktree, maps WSL compiler paths back to the workspace, and sets a breakpoint at `rustix_start`; continue once from the initial reset stop to reach the Rust entry function. Stop QEMU with `Ctrl+C` in its task terminal.
+
+The debug build uses a per-command Cargo profile override and does not change the normal release profile. It writes to the usual release ELF and ISO paths, so a later `just build`, `just image`, or `just run` rebuilds the normal image. CodeLLDB remote debugging must be available in Zed. The GDB stub listens on loopback only; do not change this to a public interface.
 
 `just verify` includes the emulator smoke test and therefore needs Python 3, xorriso, QEMU, network access for the first Limine download, and the Rust target. `.github/workflows/ci.yml` installs the system tools on Ubuntu 24.04 and runs the same command. This verifies the boot path in CI; it is still not a substitute for testing physical hardware.
 

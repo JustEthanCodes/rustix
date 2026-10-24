@@ -128,6 +128,11 @@ pub(crate) struct ExceptionContext {
     rflags: u64,
 }
 
+const _: [(); 16] = [(); size_of::<IdtEntry>()];
+const _: [(); 4096] = [(); size_of::<IdtTable>()];
+const _: [(); 104] = [(); size_of::<TaskStateSegment>()];
+const _: [(); 160] = [(); size_of::<ExceptionContext>()];
+
 extern "C" {
     static exception_stub_table: [usize; EXCEPTION_COUNT];
     fn rustix_load_gdt(descriptor_table_pointer: *const DescriptorTablePointer);

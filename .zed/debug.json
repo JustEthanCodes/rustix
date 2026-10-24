@@ -1,0 +1,15 @@
+[
+  {
+    "label": "Rustix: QEMU (CodeLLDB)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/target/x86_64-unknown-none/release/rustix",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "sourceLanguages": ["rust"],
+    "processCreateCommands": ["gdb-remote 127.0.0.1:1234"],
+    "postRunCommands": ["breakpoint set --name rustix_start"],
+    "sourceMap": {
+      "/mnt/c/Users/ethan/Projects/rustix": "$ZED_WORKTREE_ROOT"
+    }
+  }
+]
