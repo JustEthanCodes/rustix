@@ -166,7 +166,9 @@ Userspace begins only after page tables, exception handling, scheduling, and con
 - [ ] Implement copy-in/copy-out helpers that validate lengths, arithmetic, canonical ranges, permissions, and faults; never form a kernel reference directly from a user pointer.
 - [ ] Specify version discovery, stable syscall numbers, argument layouts, error encoding, partial-I/O behavior, interruption/restart, and compatibility policy before exposing calls.
 - [ ] Add initial process lifecycle and descriptor-table semantics: create/load, exit, wait, close, duplication/inheritance, and process cleanup.
-- [ ] Load a deliberately small documented executable format with bounds/segment/permission checks; reject malformed binaries safely.
+- [ ] Load a deliberately small documented executable format with bounds/segment/permission checks and reject malformed binaries safely. Use `.bin` for command-line executables and `.app` for GUI applications; these suffixes identify the intended application role, not different executable formats. `.app` is a Rustix file suffix, not an Apple/macOS app bundle.
+- [ ] Begin moving the existing `cp`, `mv`, and `mkdir` shell commands into separate command crates that build `.bin` executables. Since persistent storage is not available yet, preinstall these binaries in the reproducible system image.
+- [ ] Establish a trusted command-search policy: normal command lookup checks `~/.bin/` before `/usr/bin/`; commands run through `sudo` use a restricted trusted system path and do not inherit the caller's command path.
 - [ ] Build adversarial tests for bad pointers, overflow, invalid mappings, process teardown, descriptor misuse, and failed exec.
 
 ### First user-visible target
@@ -190,6 +192,8 @@ Keep the current RAM filesystem as a bootstrap/test implementation. Persistence 
 - [ ] Add persistent write/read/remount/reboot integration tests; never claim persistence from an in-memory cache alone.
 - [ ] Add a driver ownership and DMA policy before any device can write into arbitrary kernel memory.
 - [ ] Define file descriptors and basic process I/O semantics before exposing them to applications.
+- [ ] Define the planned top-level filesystem layout: `/home`, `/root`, `/etc`, `/usr`, `/dev`, `/proc`, `/sys`, `/tmp`, `/var`, `/run`, `/mnt`, `/media`, and `/boot`, plus `/usr/sbin`. Document that `/proc` and `/sys` are future virtual interfaces, `/dev` exposes device interfaces, `/tmp` and `/run` are volatile, and mount-point and boot-file usage depends on later storage/boot design.
+- [ ] Specify that `/etc` and `/usr` are root-owned and writable only by root, while normal users may read configuration and execute permitted programs. Keep readable account metadata separate from a root-only credential file containing password hashes. Reserve `/usr/Apps` for globally installed `.app` GUI applications and `/usr/bin` for globally installed `.bin` command-line tools; `/usr/sbin` is reserved for system-administration tools if needed.
 
 **Exit criteria:** a reproducible image mounts a documented on-disk filesystem, user-visible tools can create/read files across reboot, and corruption/I/O errors fail safely.
 
@@ -199,15 +203,57 @@ Keep the current RAM filesystem as a bootstrap/test implementation. Persistence 
 
 Crabshell is currently an in-kernel parser/frontend. The long-term terminal application should reuse its parser model without linking kernel internals or bypassing syscalls.
 
+The planned filesystem layout is illustrated below. This is a directory-layout proposal, not a claim that these paths or services are implemented; `/dev`, `/proc`, and `/sys` are intended system interfaces, while `/tmp` and `/run` are volatile.
+
+```text
+/
+├── boot/
+├── dev/
+├── etc/
+├── home/
+│   ├── Public/  (created when a second account is added)
+│   └── test/
+│       ├── Apps/
+│       ├── Desktop/
+│       ├── Documents/
+│       ├── Downloads/
+│       ├── Pictures/
+│       ├── Videos/
+│       ├── .bin/
+│       ├── .config/
+│       └── .local/
+├── media/
+├── mnt/
+├── proc/
+├── root/
+├── run/
+├── sys/
+├── tmp/
+├── usr/
+│   ├── Apps/
+│   ├── bin/
+│   └── sbin/
+└── var/
+    └── log/
+```
+
 ### Planned work
 
 - [ ] Start a user-mode `init` process and establish executable search, environment, current directory, descriptor inheritance, and process startup rules.
+- [ ] Design a local-account and privilege model. Reserve UID/GID 0 for root, IDs 1–999 for future system/service accounts, and assign regular users IDs starting at 1000; initially give each user a primary group with the same ID. Use local username/password authentication, with a reviewed password-hashing implementation, a unique salt, and a trustworthy random source; Argon2id is a candidate, but exact implementation and parameters require a later security review. Never store plaintext passwords.
+- [ ] Create the first regular account through installation or first-boot setup and grant it administrator privileges. Later accounts are standard users by default; root can explicitly grant or revoke administrator status. Run a text login prompt on the serial/terminal console and start the shell under the authenticated user's identity. Do not permit direct root login during normal operation; GUI login is deferred to the GUI milestone.
+- [ ] Create `/home/{username}/` for each regular user and `/root/` for the root account. Give regular-user homes `Apps/`, `Desktop/`, `Documents/`, `Downloads/`, `Pictures/`, `Videos/`, `.local/`, `.config/`, and `.bin/`. Homes and newly created files are private by default. Use owner/group/other read, write, and execute permissions initially; defer ACLs.
+- [ ] Create `/home/Public/` when a second account is added. All users may read it and add files; only a file's owner or root may change or remove that file. Test the shared-directory permission behavior explicitly.
+- [ ] Keep `/etc` and `/usr` root-owned and writable only by root. Normal users may read configuration and execute permitted programs. Store readable account metadata separately from password hashes, which must be in a root-only credential file. Global `.app` files go in `/usr/Apps/`; global `.bin` tools go in `/usr/bin/`.
+- [ ] Restrict `sudo` to administrators; require the invoking administrator's password for every invocation, with no credential caching. Run the requested command as root using a restricted trusted command path, not the caller's environment. Add increasing delays after repeated failed password attempts rather than permanent account lockout. Record successful and failed privileged actions in `/var/log/` without logging passwords; durable logging depends on persistent storage.
+- [ ] Provide a root-only `userctl` command-line tool for creating, disabling, removing, and administering accounts, changing passwords, and granting or revoking administrator privileges. Account removal disables login but preserves the home directory unless file deletion is explicitly requested.
+- [ ] Provide designated, administrator-controlled recovery media that can reset any local account, including an administrator account, without a separate recovery secret in the initial design. Document that this alone does not protect against physical attackers; secure boot and disk encryption are separate future security work.
 - [ ] Port or adapt Crabshell into a userspace terminal application that uses only the documented syscall/VFS interfaces.
-- [ ] Add a small utility set with explicit scope: file listing, text output, create/remove/copy/move, and system information.
+- [ ] Add a small utility set with explicit scope: file listing, text output, create/remove/copy/move, and system information. Keep every command in its own crate and build it as a separate `.bin` executable; this applies to future command-line tools as well as `cp`, `mv`, and `mkdir`. Install per-user CLI tools in `~/.bin/` and single-file GUI `.app` applications in `~/Apps/`; GUI drag-and-drop installation is a later goal. Initial installation is copying a file and removal is deleting it; global installation requires root. Never silently overwrite a same-named app or tool. Defer package management, dependency tracking, and automatic updates.
 - [ ] Add command-line quoting, escaping, history, redirection, and pipelines only with parser tests and process/descriptor/pipe semantics to support them.
-- [ ] Add integration tests that launch tools from the filesystem image and exercise them through syscalls; keep unsupported features explicit.
+- [ ] Add integration tests for login identity, account-ID allocation, password verification and failure delays, private homes, `/home/Public/` ownership rules, `/etc` and `/usr` write restrictions, `sudo` authorization and trusted command lookup, `userctl` authorization, account recovery, and launching tools as user processes. Verify password hashes are not exposed and credentials never appear in logs.
 
-**Exit criteria:** shell and basic tools run as isolated user processes from a reproducible image; no shell command directly calls kernel-private VFS internals.
+**Exit criteria:** the shell and basic tools run as isolated user processes from a reproducible image; local login and account administration enforce the documented identity and permission model; account, `sudo`, and recovery tests pass; no shell command directly calls kernel-private VFS internals.
 
 ---
 
