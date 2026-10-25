@@ -143,20 +143,21 @@ Do not enable interrupts as a side effect of installing exception gates. IRQ del
 
 ### Planned work
 
-- [ ] Select and document the initial interrupt-controller policy for QEMU and target hardware (for example, legacy PIC compatibility versus local I/O APIC; do not enable both accidentally).
-- [ ] Add validated ACPI table discovery and parsing for the tables required by enabled features. Use MADT data for APIC topology and interrupt-source overrides; treat HPET as an optional timer source rather than a universal prerequisite. Defer MCFG parsing to the PCI-discovery work in Milestone 5.
+- [ ] Use the existing QEMU `q35` machine with one vCPU as the first IRQ target. Use the local APIC and I/O APIC described by ACPI MADT, keep the legacy 8259 PIC masked, and do not enable both routing paths.
+- [ ] Add a bounded ACPI table reader before MADT/APIC setup. Request the RSDP from Limine; map only table spans covered by validated ACPI memory-map regions, read-only and NX, with checked lengths, signatures, checksums, and fixed capacity. Copy the required MADT/FADT data into owned kernel state before releasing any ACPI mapping. Do not use the HHDM or the frame allocator to access arbitrary ACPI physical addresses.
+- [ ] Parse MADT topology and interrupt-source overrides for the selected QEMU machine. Use FADT power-control data only where needed; treat HPET as an optional timer source, and defer MCFG/PCI parsing to Milestone 5.
 - [ ] Add IRQ vector allocation, controller masking/unmasking, end-of-interrupt acknowledgement, spurious-interrupt handling, and a policy for unexpected IRQs.
-- [ ] Add a verified monotonic timer and a wall-clock source (for example, a validated CMOS RTC or another platform source) for timestamps; test interval arithmetic, conversion, and clock assumptions. Do not use wall-clock values for scheduling intervals, and define behavior when wall time is unavailable or invalid.
+- [ ] Use a periodic 8254 PIT tick, initially about 100 Hz and routed through the I/O APIC according to the MADT, as the first scheduler timer. Add a verified monotonic counter and test interval arithmetic and drift; keep wall-clock time separate and define behavior when its RTC/platform source is unavailable or invalid.
 - [ ] Establish interrupt-safe lock primitives and rules for code callable from normal, exception, and IRQ contexts. Add bounded wait queues and sleep/wakeup semantics so threads can block without busy-polling.
-- [ ] Add a general active kernel mapping service with ownership, permission, cache-policy, TLB-invalidation, and rollback rules before using frames to grow the heap or create process address spaces.
-- [ ] Before scheduler/process/VFS workloads need general dynamic allocation, replace or extend the fixed 256 KiB/128-record bootstrap heap with a bounded, frame-backed kernel heap. Define exhaustion behavior, synchronization, and the contexts in which allocation is forbidden.
-- [ ] Define the lifetime and reclaim policy for Limine bootloader-reclaimable memory and the retained old page-table root. Reclaim only after proving no live references remain; otherwise document the retained-memory budget and explicit deferral.
-- [ ] Add a minimal kernel-thread context and lifecycle model, stack ownership/guard policy, context-switch tests, and emulator scheduling tests.
-- [ ] Add preemption only after lock, stack, timer, wait-queue, and interrupt-return invariants have deterministic tests.
-- [ ] Keep application-processor startup/SMP as a separate sub-milestone after per-CPU state, TLB invalidation, and lock semantics exist.
+- [ ] Add a general active kernel mapping service with transactional map/unmap, owned table frames, TLB invalidation before a mapped frame token is returned, explicit permissions/cache policy, and rollback. Map ordinary RAM only with allocator-issued `Frame` tokens. Keep ACPI reads in the bounded read-only path above; require explicit physical ranges and cache policy for later MMIO mappings.
+- [ ] Before scheduler/process/VFS workloads need general dynamic allocation, extend the fixed 256 KiB/128-record bootstrap heap with a bounded, frame-backed heap that grows in 4 KiB pages inside a documented virtual range. Choose its maximum after workload estimates and tests. Allocation failure must be explicit; do not leave partially updated mappings or allocator state.
+- [ ] Forbid heap allocation in IRQ/exception contexts. Define allocator synchronization and exhaustion handling before preemption; use fallible allocation where possible and a controlled fatal path only for operations that cannot recover.
+- [ ] Keep Limine bootloader-reclaimable memory, ACPI memory, the active boot stack, and the inherited old page-table root reserved during this milestone. Do not return these regions to the frame allocator; later reclamation requires an owned stack and proof that no live references remain, plus an explicit retained-memory budget.
+- [ ] Add single-vCPU cooperative kernel threads first: define lifecycle, owned stacks and guard policy, yield/sleep/wakeup behavior, and context-switch tests. Do not enable timer preemption in this initial scheduler slice.
+- [ ] Add timer-driven preemption only after lock, stack, timer, wait-queue, and interrupt-return invariants have deterministic tests. Keep SMP as a separate sub-milestone after per-CPU state, TLB shootdown, and lock semantics exist.
 - [ ] Add interrupt-driven UART and PS/2 input paths with bounded ring buffers and thread wakeups after the IRQ and wait-queue foundations are tested; retain polling as an early boot and recovery path.
 
-**Exit criteria:** tested IRQ acknowledgement, timekeeping, wait-queue wakeups, and deterministic thread lifecycle/context-switch behavior; bounded QEMU tests under repeated timer and input interrupts; and the dynamic allocation and mapping foundations required by later process work. No `sti` before the design and tests are ready.
+**Exit criteria:** the single-vCPU QEMU `q35` configuration validates the selected APIC routing, PIT tick, and IRQ acknowledgement; host/QEMU tests cover ACPI bounds and malformed tables, mapping rollback/TLB behavior, heap exhaustion, wait-queue wakeups, and cooperative context switching. Interrupt-driven input is tested without busy-polling, and no heap allocation occurs in IRQ/exception context. No `sti` before the design and tests are ready.
 
 ---
 
@@ -197,16 +198,20 @@ Keep the current RAM filesystem as a bootstrap/test implementation. Persistence 
 - [ ] Establish bounded PCI/device discovery, including checked ACPI MCFG handling where required, before adding PCI-backed devices. Keep discovery separate from individual driver policy.
 - [ ] Define DMA buffer ownership, address translation, cache synchronization, device reset, and error handling before any device can DMA into kernel memory. Scope and test the trust assumptions; do not equate PCI enumeration with safe DMA.
 - [ ] Add a narrowly scoped block-device interface with request validation, timeout/error reporting, and a QEMU-supported initial device driver (such as virtio-blk) on top of the shared PCI/DMA foundations.
-- [ ] Choose and document the first on-disk filesystem format. Specify partition discovery, byte order, block size, metadata limits, corruption handling, and read-only/recovery behavior before writable support.
-- [ ] Add persistent write/read/remount/reboot integration tests; never claim persistence from an in-memory cache alone.
+- [ ] Choose and document the first on-disk filesystem format before implementing writable storage. Specify partition discovery, byte order, block size, metadata limits, crash consistency, corruption handling, and read-only/recovery behavior.
+- [ ] On detected corruption, report the failure and refuse writable mounting rather than attempting automatic repair. Plan a separate offline checker/repair tool; do not repair data implicitly.
+- [ ] Define crash-safe atomic replacement or equivalent transactional behavior for critical files such as account metadata and credentials. Flush the new data before replacing the old file, and test interruption at each update stage.
+- [ ] Define explicit no-space errors and partial-write behavior. Never silently discard or overwrite existing user data to recover space.
+- [ ] Add persistent write/read/remount/reboot and failure-injection integration tests; never claim persistence from an in-memory cache alone.
 - [ ] Define file descriptors and basic process I/O semantics before exposing them to applications.
 - [ ] Define the planned top-level filesystem layout: `/home`, `/root`, `/etc`, `/usr`, `/dev`, `/proc`, `/sys`, `/tmp`, `/var`, `/run`, `/mnt`, `/media`, and `/boot`, plus `/usr/sbin`. Document that `/proc` and `/sys` are future virtual interfaces, `/dev` exposes device interfaces, `/tmp` and `/run` are volatile, and mount-point and boot-file usage depends on later storage/boot design.
 - [ ] Specify filesystem ownership and permission metadata. Support owner/group/other read, write, and execute permissions, default creation modes/umask, and the directory sticky bit. Use sticky-directory semantics for `/tmp` (mode equivalent to `01777`) and later `/home/Public/`, so users can create entries without removing or renaming another user's files.
 - [ ] Specify that `/etc` and `/usr` are root-owned and writable only by root, while normal users may read configuration and execute permitted programs. Keep readable account metadata separate from a root-only credential file containing password hashes. Reserve `/usr/Apps` for globally installed `.app` GUI applications and `/usr/bin` for globally installed `.bin` command-line tools; `/usr/sbin` is reserved for system-administration tools if needed.
 - [ ] Provide a trustworthy CSPRNG before password hashing or security-sensitive random values. Evaluate validated entropy sources (for example, supported CPU randomness instructions or a virtio RNG device) as inputs; do not treat one hardware source alone as a complete CSPRNG. Test initialization, failure, and unavailable-entropy behavior.
 - [ ] Provide wall-clock time before persistent audit logs require calendar timestamps. Keep monotonic time as the source for elapsed-time and timeout calculations; define behavior when the wall clock is unavailable or invalid.
+- [ ] Define kernel/platform shutdown and reboot operations, including filesystem flush ordering and failure behavior. Parse and validate ACPI FADT power-control data when needed; test the supported QEMU shutdown/reboot paths.
 
-**Exit criteria:** PCI discovery and the DMA ownership policy are validated for the supported QEMU device path; a reproducible image mounts a documented on-disk filesystem; user-visible tools can create/read files across reboot; and corruption/I/O errors fail safely.
+**Exit criteria:** PCI discovery and the DMA ownership policy are validated for the supported QEMU device path; a reproducible image mounts a documented on-disk filesystem; filesystem tests pass across remount and reboot and fail safely on corruption, I/O errors, and exhausted space. Milestone 5 validates storage through test/integration harnesses; user-space utilities are verified in Milestone 6.
 
 ---
 
@@ -262,12 +267,13 @@ The planned filesystem layout is illustrated below. This is a directory-layout p
 - [ ] Establish normal command lookup order as `~/.bin/` before `/usr/bin/`; `sudo` must use its restricted trusted system path instead of inheriting the user's search path.
 - [ ] Port or adapt Crabshell into a userspace terminal application that uses only the documented syscall/VFS interfaces. Introduce TTY and PTY abstractions for serial and later graphical terminals so the shell does not depend on a specific device.
 - [ ] Move `cp`, `mv`, `mkdir`, and future command-line utilities into separate application crates using the shared userspace runtime and `.bin` suffix. Preinstall the initial tools in the reproducible system image. Later per-user installation copies files into `~/.bin/`; global installation into `/usr/bin/` requires root. Never silently overwrite a same-named tool; defer package management, dependency tracking, and automatic updates.
-- [ ] Add bounded pipe buffers and a minimal process-signal model, including foreground interruption (`SIGINT`) and child-exit notification (`SIGCHLD`), before enabling pipelines, redirection, or interrupting a foreground command with `Ctrl+C`. Keep semantics explicit and tested rather than claiming full POSIX job control.
+- [ ] Add bounded pipe buffers and a minimal process-control model: foreground process groups, `SIGINT` for `Ctrl+C`, `SIGCHLD`/wait status for child exit, and a basic `kill` mechanism. Implement these before enabling pipelines, redirection, or interrupting a foreground command. Keep semantics explicit and tested rather than claiming full POSIX job control.
 - [ ] Add command-line quoting, escaping, and history only with parser tests; enable redirection and pipelines only after the corresponding descriptor, pipe, TTY/PTY, and signal semantics are implemented.
 - [ ] Defer installation of single-file GUI `.app` files into `~/Apps/` or `/usr/Apps/` to the GUI milestone. Initial installation there is copying a file and removal is deleting it; global installation requires root, and name conflicts must never silently overwrite an existing app.
-- [ ] Add integration tests for login identity, account-ID allocation, password verification and failure delays, private homes, `/home/Public/` sticky-directory behavior, `/etc` and `/usr` write restrictions, `sudo` authorization and trusted command lookup, `userctl` authorization, account recovery, and launching tools as user processes. Verify password hashes are not exposed and credentials never appear in logs.
+- [ ] Add administrator-only `shutdown` and `reboot` user commands as separate `.bin` command crates, using the Milestone 5 kernel/platform operations.
+- [ ] Add integration tests for login identity, account-ID allocation, password verification and failure delays, private homes, `/home/Public/` sticky-directory behavior, `/etc` and `/usr` write restrictions, `sudo` authorization and trusted command lookup, `userctl` authorization, account recovery, process signals/wait status, pipes, foreground `Ctrl+C`, and launching tools as user processes. Verify password hashes are not exposed and credentials never appear in logs.
 
-**Exit criteria:** the userspace shell and basic `.bin` tools run as isolated processes from a reproducible filesystem image using the shared userspace runtime; local login and account administration enforce the documented identity and permission model; account, `sudo`, recovery, TTY, and command-launch tests pass; no shell command directly calls kernel-private VFS internals.
+**Exit criteria:** the userspace shell and basic `.bin` tools run as isolated processes from a reproducible filesystem image using the shared userspace runtime; local login and account administration enforce the documented identity and permission model; account, `sudo`, recovery, TTY, process-control, and command-launch tests pass; no shell command directly calls kernel-private VFS internals.
 
 ---
 
@@ -304,6 +310,24 @@ Networking is not implied by the current device drivers. The initial target shou
 - [ ] Add higher-level transports/services only when the required protocol semantics, tested CSPRNG/entropy-source behavior, and security model are designed.
 
 **Exit criteria:** documented user processes can communicate through a tested virtual NIC/network stack, with malformed input and resource exhaustion handled safely. Do not claim internet, TLS, or POSIX sockets merely from a packet driver.
+
+---
+
+## Milestone 9 — installation, updates, and physical security (long-term)
+
+This milestone depends on persistent storage. Local installation and update workflows can precede networking; remote update-server integration additionally depends on the networking and GUI milestones. Recovery media by itself is not protection against physical attackers.
+
+### Planned work
+
+- [ ] Define a reproducible installer for placing Rustix on a target disk, including partition/boot setup, first-boot account creation, failure handling, and recovery. Preserve a supported local/offline install path.
+- [ ] Define system upgrade transactions with integrity checks, safe interruption behavior, and rollback or recovery after a failed upgrade. Do not report success until changes are durable.
+- [ ] Add a package manager for both `.app` GUI applications and `.bin` command-line tools. Support per-user and system-wide installation/removal; system-wide changes require root. Keep package/dependency metadata and file ownership consistent with the filesystem policy.
+- [ ] Require signed update metadata and packages, verified before installation. Trust Rustix's official signing keys for system updates; require explicit user trust for third-party user-app publishers or repositories. In-app updaters must use the same verification policy.
+- [ ] Route system-application updates through Rustix system updates and the package manager. Allow user-installed applications to update through either a verified in-app updater or the package manager.
+- [ ] Once networking and the GUI are available, let the GUI check an update server and fetch eligible system and application updates. Keep the local/offline update path available.
+- [ ] Design secure boot, disk encryption, and key recovery as long-term physical-security goals. Specify the threat model and recovery-key policy before claiming protection against physical attackers.
+
+**Exit criteria:** a documented local installation and upgrade path recovers safely from interrupted or invalid updates; package signatures and repository trust are enforced; and physical-security claims match the implemented boot and key-protection mechanisms.
 
 ---
 
