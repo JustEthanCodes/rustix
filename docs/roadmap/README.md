@@ -143,15 +143,20 @@ Do not enable interrupts as a side effect of installing exception gates. IRQ del
 
 ### Planned work
 
-- [ ] Select and document the initial interrupt controller policy for QEMU and target hardware (for example, legacy PIC compatibility versus local I/O APIC; do not enable both accidentally).
+- [ ] Select and document the initial interrupt-controller policy for QEMU and target hardware (for example, legacy PIC compatibility versus local I/O APIC; do not enable both accidentally).
+- [ ] Add validated ACPI table discovery and parsing for the tables required by enabled features. Use MADT data for APIC topology and interrupt-source overrides; treat HPET as an optional timer source rather than a universal prerequisite. Defer MCFG parsing to the PCI-discovery work in Milestone 5.
 - [ ] Add IRQ vector allocation, controller masking/unmasking, end-of-interrupt acknowledgement, spurious-interrupt handling, and a policy for unexpected IRQs.
-- [ ] Add a calibrated/verified timer source and monotonic timekeeping; test interval arithmetic and drift assumptions.
-- [ ] Establish interrupt-safe lock primitives and rules for code callable from normal, exception, and IRQ contexts. No allocator or blocking console operation may run in an unsafe interrupt context.
+- [ ] Add a verified monotonic timer and a wall-clock source (for example, a validated CMOS RTC or another platform source) for timestamps; test interval arithmetic, conversion, and clock assumptions. Do not use wall-clock values for scheduling intervals, and define behavior when wall time is unavailable or invalid.
+- [ ] Establish interrupt-safe lock primitives and rules for code callable from normal, exception, and IRQ contexts. Add bounded wait queues and sleep/wakeup semantics so threads can block without busy-polling.
+- [ ] Add a general active kernel mapping service with ownership, permission, cache-policy, TLB-invalidation, and rollback rules before using frames to grow the heap or create process address spaces.
+- [ ] Before scheduler/process/VFS workloads need general dynamic allocation, replace or extend the fixed 256 KiB/128-record bootstrap heap with a bounded, frame-backed kernel heap. Define exhaustion behavior, synchronization, and the contexts in which allocation is forbidden.
+- [ ] Define the lifetime and reclaim policy for Limine bootloader-reclaimable memory and the retained old page-table root. Reclaim only after proving no live references remain; otherwise document the retained-memory budget and explicit deferral.
 - [ ] Add a minimal kernel-thread context and lifecycle model, stack ownership/guard policy, context-switch tests, and emulator scheduling tests.
-- [ ] Add preemption only after lock, stack, timer, and interrupt-return invariants have deterministic tests.
+- [ ] Add preemption only after lock, stack, timer, wait-queue, and interrupt-return invariants have deterministic tests.
 - [ ] Keep application-processor startup/SMP as a separate sub-milestone after per-CPU state, TLB invalidation, and lock semantics exist.
+- [ ] Add interrupt-driven UART and PS/2 input paths with bounded ring buffers and thread wakeups after the IRQ and wait-queue foundations are tested; retain polling as an early boot and recovery path.
 
-**Exit criteria:** tested IRQ acknowledgement and timer behavior, deterministic thread lifecycle/context-switch tests, and bounded QEMU tests under repeated timer interrupts. No `sti` before the design and tests are ready.
+**Exit criteria:** tested IRQ acknowledgement, timekeeping, wait-queue wakeups, and deterministic thread lifecycle/context-switch behavior; bounded QEMU tests under repeated timer and input interrupts; and the dynamic allocation and mapping foundations required by later process work. No `sti` before the design and tests are ready.
 
 ---
 
@@ -166,10 +171,12 @@ Userspace begins only after page tables, exception handling, scheduling, and con
 - [ ] Implement copy-in/copy-out helpers that validate lengths, arithmetic, canonical ranges, permissions, and faults; never form a kernel reference directly from a user pointer.
 - [ ] Specify version discovery, stable syscall numbers, argument layouts, error encoding, partial-I/O behavior, interruption/restart, and compatibility policy before exposing calls.
 - [ ] Add initial process lifecycle and descriptor-table semantics: create/load, exit, wait, close, duplication/inheritance, and process cleanup.
-- [ ] Load a deliberately small documented executable format with bounds/segment/permission checks and reject malformed binaries safely. Use `.bin` for command-line executables and `.app` for GUI applications; these suffixes identify the intended application role, not different executable formats. `.app` is a Rustix file suffix, not an Apple/macOS app bundle.
-- [ ] Begin moving the existing `cp`, `mv`, and `mkdir` shell commands into separate command crates that build `.bin` executables. Since persistent storage is not available yet, preinstall these binaries in the reproducible system image.
-- [ ] Establish a trusted command-search policy: normal command lookup checks `~/.bin/` before `/usr/bin/`; commands run through `sudo` use a restricted trusted system path and do not inherit the caller's command path.
-- [ ] Build adversarial tests for bad pointers, overflow, invalid mappings, process teardown, descriptor misuse, and failed exec.
+- [ ] Load statically linked ELF64 executables with checked `PT_LOAD` bounds, alignment, permissions, and entry points; reject malformed binaries safely. Use `.bin` for command-line programs and `.app` for GUI applications as role-based filename suffixes for the same underlying format. `.app` is a Rustix single-file application suffix, not an Apple/macOS app bundle; initially require application resources to be embedded or absent.
+- [ ] Add user-mode exception handling: faults attributable to Ring 3 terminate the offending process with a reported status, while faults in kernel mode remain fatal. Test page faults, general-protection faults, invalid opcodes, and divide errors from both privilege levels.
+- [ ] Define user virtual-memory regions, stack bounds/guard behavior, and a minimal anonymous allocation interface such as `mmap`/`munmap` (or a documented equivalent) before running general user programs. Add bounds, permissions, exhaustion, and teardown tests.
+- [ ] Add a shared userspace runtime crate (for example, `librustix`) for process entry, syscall wrappers, panic handling, common I/O/formatting, and a user allocator backed by the anonymous mapping interface. Keep it separate from kernel internals and use it from independent application crates.
+- [ ] Keep the first user-visible target as a minimal `init` executable loaded from a bounded boot payload or other reproducible non-filesystem source; persistent filesystem loading and ordinary command utilities follow in Milestones 5 and 6.
+- [ ] Build adversarial tests for bad pointers, overflow, invalid mappings, user/kernel fault separation, process teardown, descriptor misuse, and failed exec.
 
 ### First user-visible target
 
@@ -187,15 +194,19 @@ Keep the current RAM filesystem as a bootstrap/test implementation. Persistence 
 
 - [ ] Define VFS node, mount, path, metadata, and file-descriptor contracts independently of a particular disk format.
 - [ ] Preserve volatile RAMFS as a test backend and add tests for mount/path errors, capacity, partial I/O, and object lifetime.
-- [ ] Add a narrowly scoped block-device interface with request validation, timeout/error reporting, and a QEMU-supported initial device driver (such as virtio-blk after PCI discovery is ready).
+- [ ] Establish bounded PCI/device discovery, including checked ACPI MCFG handling where required, before adding PCI-backed devices. Keep discovery separate from individual driver policy.
+- [ ] Define DMA buffer ownership, address translation, cache synchronization, device reset, and error handling before any device can DMA into kernel memory. Scope and test the trust assumptions; do not equate PCI enumeration with safe DMA.
+- [ ] Add a narrowly scoped block-device interface with request validation, timeout/error reporting, and a QEMU-supported initial device driver (such as virtio-blk) on top of the shared PCI/DMA foundations.
 - [ ] Choose and document the first on-disk filesystem format. Specify partition discovery, byte order, block size, metadata limits, corruption handling, and read-only/recovery behavior before writable support.
 - [ ] Add persistent write/read/remount/reboot integration tests; never claim persistence from an in-memory cache alone.
-- [ ] Add a driver ownership and DMA policy before any device can write into arbitrary kernel memory.
 - [ ] Define file descriptors and basic process I/O semantics before exposing them to applications.
 - [ ] Define the planned top-level filesystem layout: `/home`, `/root`, `/etc`, `/usr`, `/dev`, `/proc`, `/sys`, `/tmp`, `/var`, `/run`, `/mnt`, `/media`, and `/boot`, plus `/usr/sbin`. Document that `/proc` and `/sys` are future virtual interfaces, `/dev` exposes device interfaces, `/tmp` and `/run` are volatile, and mount-point and boot-file usage depends on later storage/boot design.
+- [ ] Specify filesystem ownership and permission metadata. Support owner/group/other read, write, and execute permissions, default creation modes/umask, and the directory sticky bit. Use sticky-directory semantics for `/tmp` (mode equivalent to `01777`) and later `/home/Public/`, so users can create entries without removing or renaming another user's files.
 - [ ] Specify that `/etc` and `/usr` are root-owned and writable only by root, while normal users may read configuration and execute permitted programs. Keep readable account metadata separate from a root-only credential file containing password hashes. Reserve `/usr/Apps` for globally installed `.app` GUI applications and `/usr/bin` for globally installed `.bin` command-line tools; `/usr/sbin` is reserved for system-administration tools if needed.
+- [ ] Provide a trustworthy CSPRNG before password hashing or security-sensitive random values. Evaluate validated entropy sources (for example, supported CPU randomness instructions or a virtio RNG device) as inputs; do not treat one hardware source alone as a complete CSPRNG. Test initialization, failure, and unavailable-entropy behavior.
+- [ ] Provide wall-clock time before persistent audit logs require calendar timestamps. Keep monotonic time as the source for elapsed-time and timeout calculations; define behavior when the wall clock is unavailable or invalid.
 
-**Exit criteria:** a reproducible image mounts a documented on-disk filesystem, user-visible tools can create/read files across reboot, and corruption/I/O errors fail safely.
+**Exit criteria:** PCI discovery and the DMA ownership policy are validated for the supported QEMU device path; a reproducible image mounts a documented on-disk filesystem; user-visible tools can create/read files across reboot; and corruption/I/O errors fail safely.
 
 ---
 
@@ -239,21 +250,24 @@ The planned filesystem layout is illustrated below. This is a directory-layout p
 
 ### Planned work
 
-- [ ] Start a user-mode `init` process and establish executable search, environment, current directory, descriptor inheritance, and process startup rules.
-- [ ] Design a local-account and privilege model. Reserve UID/GID 0 for root, IDs 1–999 for future system/service accounts, and assign regular users IDs starting at 1000; initially give each user a primary group with the same ID. Use local username/password authentication, with a reviewed password-hashing implementation, a unique salt, and a trustworthy random source; Argon2id is a candidate, but exact implementation and parameters require a later security review. Never store plaintext passwords.
+- [ ] Build on the minimal `init` process and syscall/runtime foundations from Milestone 4. Establish executable search, environment, current directory, descriptor inheritance, and process startup rules using the VFS.
+- [ ] Design a local-account and privilege model. Reserve UID/GID 0 for root, IDs 1–999 for future system/service accounts, and assign regular users IDs starting at 1000; initially give each user a primary group with the same ID. Use local username/password authentication, with a reviewed password-hashing implementation, a unique salt, and the Milestone 5 CSPRNG; Argon2id is a candidate, but exact implementation and parameters require a later security review. Never store plaintext passwords.
 - [ ] Create the first regular account through installation or first-boot setup and grant it administrator privileges. Later accounts are standard users by default; root can explicitly grant or revoke administrator status. Run a text login prompt on the serial/terminal console and start the shell under the authenticated user's identity. Do not permit direct root login during normal operation; GUI login is deferred to the GUI milestone.
-- [ ] Create `/home/{username}/` for each regular user and `/root/` for the root account. Give regular-user homes `Apps/`, `Desktop/`, `Documents/`, `Downloads/`, `Pictures/`, `Videos/`, `.local/`, `.config/`, and `.bin/`. Homes and newly created files are private by default. Use owner/group/other read, write, and execute permissions initially; defer ACLs.
-- [ ] Create `/home/Public/` when a second account is added. All users may read it and add files; only a file's owner or root may change or remove that file. Test the shared-directory permission behavior explicitly.
+- [ ] Create `/home/{username}/` for each regular user and `/root/` for the root account. Give regular-user homes `Apps/`, `Desktop/`, `Documents/`, `Downloads/`, `Pictures/`, `Videos/`, `.local/`, `.config/`, and `.bin/` directories. Homes and newly created files are private by default. Use owner/group/other read, write, and execute permissions initially; defer ACLs.
+- [ ] Create `/home/Public/` when a second account is added. All users may read it and add files; only a file's owner or root may change or remove that file. Implement and test this with sticky-directory semantics rather than ordinary `rwx` bits alone.
 - [ ] Keep `/etc` and `/usr` root-owned and writable only by root. Normal users may read configuration and execute permitted programs. Store readable account metadata separately from password hashes, which must be in a root-only credential file. Global `.app` files go in `/usr/Apps/`; global `.bin` tools go in `/usr/bin/`.
-- [ ] Restrict `sudo` to administrators; require the invoking administrator's password for every invocation, with no credential caching. Run the requested command as root using a restricted trusted command path, not the caller's environment. Add increasing delays after repeated failed password attempts rather than permanent account lockout. Record successful and failed privileged actions in `/var/log/` without logging passwords; durable logging depends on persistent storage.
 - [ ] Provide a root-only `userctl` command-line tool for creating, disabling, removing, and administering accounts, changing passwords, and granting or revoking administrator privileges. Account removal disables login but preserves the home directory unless file deletion is explicitly requested.
 - [ ] Provide designated, administrator-controlled recovery media that can reset any local account, including an administrator account, without a separate recovery secret in the initial design. Document that this alone does not protect against physical attackers; secure boot and disk encryption are separate future security work.
-- [ ] Port or adapt Crabshell into a userspace terminal application that uses only the documented syscall/VFS interfaces.
-- [ ] Add a small utility set with explicit scope: file listing, text output, create/remove/copy/move, and system information. Keep every command in its own crate and build it as a separate `.bin` executable; this applies to future command-line tools as well as `cp`, `mv`, and `mkdir`. Install per-user CLI tools in `~/.bin/` and single-file GUI `.app` applications in `~/Apps/`; GUI drag-and-drop installation is a later goal. Initial installation is copying a file and removal is deleting it; global installation requires root. Never silently overwrite a same-named app or tool. Defer package management, dependency tracking, and automatic updates.
-- [ ] Add command-line quoting, escaping, history, redirection, and pipelines only with parser tests and process/descriptor/pipe semantics to support them.
-- [ ] Add integration tests for login identity, account-ID allocation, password verification and failure delays, private homes, `/home/Public/` ownership rules, `/etc` and `/usr` write restrictions, `sudo` authorization and trusted command lookup, `userctl` authorization, account recovery, and launching tools as user processes. Verify password hashes are not exposed and credentials never appear in logs.
+- [ ] Restrict `sudo` to administrators; require the invoking administrator's password for every invocation, with no credential caching. Run the requested command as root using a restricted trusted command path, not the caller's environment. Add increasing delays after repeated failed password attempts rather than permanent account lockout. Record successful and failed privileged actions in `/var/log/` without logging passwords.
+- [ ] Establish normal command lookup order as `~/.bin/` before `/usr/bin/`; `sudo` must use its restricted trusted system path instead of inheriting the user's search path.
+- [ ] Port or adapt Crabshell into a userspace terminal application that uses only the documented syscall/VFS interfaces. Introduce TTY and PTY abstractions for serial and later graphical terminals so the shell does not depend on a specific device.
+- [ ] Move `cp`, `mv`, `mkdir`, and future command-line utilities into separate application crates using the shared userspace runtime and `.bin` suffix. Preinstall the initial tools in the reproducible system image. Later per-user installation copies files into `~/.bin/`; global installation into `/usr/bin/` requires root. Never silently overwrite a same-named tool; defer package management, dependency tracking, and automatic updates.
+- [ ] Add bounded pipe buffers and a minimal process-signal model, including foreground interruption (`SIGINT`) and child-exit notification (`SIGCHLD`), before enabling pipelines, redirection, or interrupting a foreground command with `Ctrl+C`. Keep semantics explicit and tested rather than claiming full POSIX job control.
+- [ ] Add command-line quoting, escaping, and history only with parser tests; enable redirection and pipelines only after the corresponding descriptor, pipe, TTY/PTY, and signal semantics are implemented.
+- [ ] Defer installation of single-file GUI `.app` files into `~/Apps/` or `/usr/Apps/` to the GUI milestone. Initial installation there is copying a file and removal is deleting it; global installation requires root, and name conflicts must never silently overwrite an existing app.
+- [ ] Add integration tests for login identity, account-ID allocation, password verification and failure delays, private homes, `/home/Public/` sticky-directory behavior, `/etc` and `/usr` write restrictions, `sudo` authorization and trusted command lookup, `userctl` authorization, account recovery, and launching tools as user processes. Verify password hashes are not exposed and credentials never appear in logs.
 
-**Exit criteria:** the shell and basic tools run as isolated user processes from a reproducible image; local login and account administration enforce the documented identity and permission model; account, `sudo`, and recovery tests pass; no shell command directly calls kernel-private VFS internals.
+**Exit criteria:** the userspace shell and basic `.bin` tools run as isolated processes from a reproducible filesystem image using the shared userspace runtime; local login and account administration enforce the documented identity and permission model; account, `sudo`, recovery, TTY, and command-launch tests pass; no shell command directly calls kernel-private VFS internals.
 
 ---
 
@@ -267,7 +281,9 @@ A GUI is intentionally downstream of stable memory management, interrupts/input,
 - [ ] Establish an input subsystem that separates raw device events from key mapping and terminal policy. Plan PS/2 and USB HID support separately; do not treat the current raw scancode poller as a keyboard driver stack.
 - [ ] Define a graphics buffer ownership/presentation API, clipping rules, pixel format, and bounds/overflow checks.
 - [ ] Implement a minimal compositor/windowing policy only after process isolation and input routing are ready.
-- [ ] Run Crabshell as a terminal application in a GUI window using the same parser and userspace services as the serial/TTY path.
+- [ ] Define and launch single-file `.app` GUI applications using the documented static ELF64 format and shared userspace runtime; specify how any required resources are embedded.
+- [ ] Support drag-and-drop installation of a `.app` file into `~/Apps/`; global installation into `/usr/Apps/` requires root. Reject malformed apps and never silently overwrite an existing file.
+- [ ] Run Crabshell as a terminal application in a GUI window using the same parser and userspace services as the serial/TTY path, backed by the TTY/PTY interface rather than direct device access.
 - [ ] Preserve serial as a headless recovery/debug console and add repeatable QEMU display/input tests.
 
 **Exit criteria:** a documented GUI session starts from userspace, renders a terminal, accepts tested input, and does not require direct kernel-private VFS access.
@@ -280,12 +296,12 @@ Networking is not implied by the current device drivers. The initial target shou
 
 ### Planned work
 
-- [ ] Complete PCI/device discovery and define DMA buffer ownership, address translation, cache synchronization, and reset/error behavior.
+- [ ] Build on the PCI discovery and DMA ownership/mapping foundations established in Milestone 5; add only networking-specific device and buffer policy here.
 - [ ] Implement one virtual NIC driver with bounded queues and timeouts; test against QEMU user networking.
 - [ ] Choose and document a minimal link/network protocol scope before implementation. Keep packet parsing length-checked and fuzzable on the host.
 - [ ] Add interface configuration, routing, socket/descriptor ownership, and per-process access policy.
 - [ ] Add adversarial packet tests and integration tests for link loss, malformed packets, queue exhaustion, and device reset.
-- [ ] Add higher-level transports/services only when the required protocol semantics, entropy source, and security model are designed.
+- [ ] Add higher-level transports/services only when the required protocol semantics, tested CSPRNG/entropy-source behavior, and security model are designed.
 
 **Exit criteria:** documented user processes can communicate through a tested virtual NIC/network stack, with malformed input and resource exhaustion handled safely. Do not claim internet, TLS, or POSIX sockets merely from a packet driver.
 
@@ -302,6 +318,8 @@ Every milestone should include the relevant subset of these gates:
 5. **Boot/integration:** QEMU tests for changes to boot, paging, descriptors, interrupts, drivers, processes, or persistence.
 6. **Documentation/status:** update architecture and roadmap docs; never check off a criterion without evidence.
 7. **Compatibility:** claim Unix/POSIX behavior only for the exact documented subset with conformance-style tests.
+8. **Privilege boundaries:** test user/kernel fault separation, file ownership and special permission bits, credential confidentiality, trusted `sudo` command lookup, and recovery assumptions.
+9. **Resource readiness:** do not begin process, VFS-cache, or driver workloads that require dynamic allocation, active mappings, DMA, wall-clock time, or secure randomness until the corresponding service and failure behavior are validated.
 
 ## Working rule
 
