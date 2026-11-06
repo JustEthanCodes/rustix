@@ -348,7 +348,7 @@ def build_kernel(features: tuple[str, ...] = ()) -> None:
 
 
 def frame_smoke_workflow(timeout: int) -> None:
-    failure: BaseException | None = None
+    failure: BuildError | OSError | subprocess.SubprocessError | None = None
     try:
         build_kernel(("probe-hhdm-frame",))
         build_image()
@@ -369,13 +369,13 @@ def frame_smoke_workflow(timeout: int) -> None:
                 + f"\nSerial output:\n{output}"
             )
         print("QEMU HHDM, inherited-mapping, cloned-root, and candidate-map probes passed.")
-    except BaseException as error:
+    except (BuildError, OSError, subprocess.SubprocessError) as error:
         failure = error
 
     try:
         build_kernel()
         build_image()
-    except BaseException as restore_error:
+    except (BuildError, OSError, subprocess.SubprocessError) as restore_error:
         if failure is not None:
             raise BuildError(
                 f"HHDM frame workflow failed ({failure}); restoring the default image "
@@ -395,19 +395,19 @@ def fault_smoke_workflow(timeout: int) -> None:
         ("page-fault", "inject-page-fault"),
         ("invalid-opcode", "inject-invalid-opcode"),
     )
-    failure: BaseException | None = None
+    failure: BuildError | OSError | subprocess.SubprocessError | None = None
     try:
         for kind, feature in tests:
             build_kernel((feature,))
             build_image()
             fault_smoke_test(kind, timeout)
-    except BaseException as error:
+    except (BuildError, OSError, subprocess.SubprocessError) as error:
         failure = error
 
     try:
         build_kernel()
         build_image()
-    except BaseException as restore_error:
+    except (BuildError, OSError, subprocess.SubprocessError) as restore_error:
         if failure is not None:
             raise BuildError(
                 f"fault-injection workflow failed ({failure}); restoring the default image "
