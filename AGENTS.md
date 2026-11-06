@@ -140,3 +140,8 @@ Before reporting work complete:
 - Run appropriate formatting/tests/build/boot checks, or clearly state why they could not run.
 - Report files changed, behavior delivered, validation actually observed, and remaining risks.
 - Keep milestone status accurate. A subsystem is not complete just because it has code.
+
+<!-- entire-agent:begin -->
+Read .entire/agent-guide.md for this repository's workflow, source inspection, and verification guidance.
+@.entire/agent-guide.md
+<!-- entire-agent:end -->

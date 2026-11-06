@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "command": "try { & entire graph hook claude-subagent-start 2>$null } catch {}; exit 0",
+            "shell": "powershell",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "*"
+      }
+    ]
+  }
+}

@@ -105,3 +105,8 @@ Editor diagnostics are useful but are not proof that Rust compiled, assembly ass
 - `docs/architecture/drivers.md` — driver status and scope.
 - `docs/security.md` — unsafe boundaries and security requirements.
 - `docs/development/building.md`, `docs/development/testing.md` — commands and evidence expectations.
+
+<!-- entire-agent:begin -->
+Read .entire/agent-guide.md for this repository's workflow, source inspection, and verification guidance.
+@.entire/agent-guide.md
+<!-- entire-agent:end -->
