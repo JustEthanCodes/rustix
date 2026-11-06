@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a capability or improvement for Rustix.
+title: "Feature: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Rustix is developed incrementally. See `docs/roadmap/README.md` for the current scope; proposals should make their assumptions and validation needs explicit.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What need or limitation would this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the outcome you want. An implementation design is optional.
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints and scope
+      description: Note relevant architecture boundaries, unsupported behavior, or non-goals.
+    validations:
+      required: false
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: How should this be validated?
+      description: Suggest tests, target builds, emulator checks, or other evidence that would demonstrate the behavior.
+    validations:
+      required: false

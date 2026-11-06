@@ -1,0 +1,78 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Rustix: Format Check",
+      "type": "process",
+      "command": "just",
+      "args": ["fmt"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Rustix: Unit Tests",
+      "type": "process",
+      "command": "just",
+      "args": ["test"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Rustix: Target Check",
+      "type": "process",
+      "command": "just",
+      "args": ["check"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Rustix: Build Kernel",
+      "type": "process",
+      "command": "just",
+      "args": ["build"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Rustix: Build Image",
+      "type": "process",
+      "command": "just",
+      "args": ["image"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Rustix: QEMU Smoke Test",
+      "type": "process",
+      "command": "just",
+      "args": ["smoke"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Rustix: Run in QEMU",
+      "type": "process",
+      "command": "just",
+      "args": ["run"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Rustix: QEMU Debug Server",
+      "type": "process",
+      "command": "just",
+      "args": ["debug-run"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Rustix: Verify",
+      "type": "process",
+      "command": "just",
+      "args": ["verify"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}

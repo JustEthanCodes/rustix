@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Rustix: QEMU (CodeLLDB)",
+      "type": "lldb",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "sourceLanguages": ["rust"],
+      "targetCreateCommands": [
+        "target create ${workspaceFolder}/target/x86_64-unknown-none/release/rustix"
+      ],
+      "processCreateCommands": [
+        "gdb-remote 127.0.0.1:1234"
+      ],
+      "postRunCommands": [
+        "breakpoint set --name rustix_start"
+      ]
+    }
+  ]
+}

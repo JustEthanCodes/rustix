@@ -55,6 +55,10 @@ On the Windows Zed workspace with the repository built through WSL2, run the `Ru
 
 The debug build uses a per-command Cargo profile override and does not change the normal release profile. It writes to the usual release ELF and ISO paths, so a later `just build`, `just image`, or `just run` rebuilds the normal image. CodeLLDB remote debugging must be available in Zed. The GDB stub listens on loopback only; do not change this to a public interface.
 
+## Debugging from VS Code
+
+In the Dev Container, run the `Rustix: QEMU Debug Server` task to build the debug image and start QEMU paused with its GDB stub on `127.0.0.1:1234`. Then start the `Rustix: QEMU (CodeLLDB)` launch configuration; it connects to the stub and sets a breakpoint at `rustix_start`. Continue once from QEMU's initial reset stop to reach the Rust entry point. Stop QEMU from the task terminal when finished. The loopback-only GDB stub must not be exposed on a public interface.
+
 `just verify` includes the emulator smoke test and therefore needs Python 3, xorriso, QEMU, network access for the first Limine download, and the Rust target. `.github/workflows/ci.yml` installs the system tools on Ubuntu 24.04 and runs the same command. This verifies the boot path in CI; it is still not a substitute for testing physical hardware.
 
 ## Troubleshooting

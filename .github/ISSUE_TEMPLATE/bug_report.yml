@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a reproducible problem in Rustix.
+title: "Bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Rustix is an experimental x86_64 `no_std` kernel. Please include the exact environment and validation evidence; host tests do not validate privileged hardware behavior.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the problem and its impact.
+      placeholder: A concise description of the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include commands and the smallest reliable sequence of steps.
+      placeholder: |
+        1. Run ...
+        2. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+      description: Explain what you expected and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include host OS, Rust toolchain, target, and whether this was QEMU or physical hardware.
+      placeholder: OS/version, rustc version, target, QEMU version or hardware details
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Validation evidence
+      description: Include relevant command output, serial diagnostics, or a focused log excerpt. Mention checks that you ran and their results.
+    validations:
+      required: false

@@ -8,6 +8,8 @@ Rustix now boots into **Crabshell**, a small kernel-mode shell on the COM1 seria
 
 Prerequisites: a Rust stable toolchain, `just`, Python 3, `xorriso`, QEMU (`qemu-system-x86_64`), and the target installed by `rust-toolchain.toml` (or `rustup target add x86_64-unknown-none`). The first image build downloads a pinned Limine binary release and verifies its SHA-256.
 
+For a ready-to-use environment with these tools installed, open the repository in a Dev Container using `.devcontainer/`. The container uses Ubuntu 24.04 and includes the Rust target and `rustfmt` component from `rust-toolchain.toml`.
+
 ```sh
 just help
 just fmt

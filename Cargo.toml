@@ -7,7 +7,7 @@ name = "rustix-kernel"
 version = "0.1.0"
 edition = "2021"
 publish = false
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 description = "A freestanding 64-bit Rust kernel for the Rustix operating system"
 
 [features]
