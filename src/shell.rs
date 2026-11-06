@@ -132,20 +132,16 @@ fn execute(command: Command<'_>, filesystem: &mut RamFs, cwd: &mut usize, boot_i
             Ok(_) => {}
             Err(error) => report_fs_error(error),
         },
-        Command::Write { path, contents } => match filesystem.open_or_create_file(*cwd, path) {
-            Ok(node) => match filesystem.write_file(node, contents.as_bytes()) {
-                Ok(()) => {}
-                Err(error) => report_fs_error(error),
-            },
-            Err(error) => report_fs_error(error),
-        },
-        Command::Append { path, contents } => match filesystem.open_or_create_file(*cwd, path) {
-            Ok(node) => match filesystem.append_file(node, contents.as_bytes()) {
-                Ok(()) => {}
-                Err(error) => report_fs_error(error),
-            },
-            Err(error) => report_fs_error(error),
-        },
+        Command::Write { path, contents } => {
+            if let Err(error) = filesystem.write_file_path(*cwd, path, contents.as_bytes()) {
+                report_fs_error(error);
+            }
+        }
+        Command::Append { path, contents } => {
+            if let Err(error) = filesystem.append_file_path(*cwd, path, contents.as_bytes()) {
+                report_fs_error(error);
+            }
+        }
         Command::Cp {
             source,
             destination,

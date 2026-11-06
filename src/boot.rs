@@ -20,7 +20,8 @@ const REQUESTS_START: [u64; 4] = [
     0x181e_920a_7852_b9d9,
 ];
 const REQUESTS_END: [u64; 2] = [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62];
-const BASE_REVISION: [u64; 3] = [0xf956_2b2d_5c95_a6c8, 0x6a7b_3849_4453_6bdc, 3];
+const REQUIRED_BASE_REVISION: u64 = 3;
+const BASE_REVISION_REQUEST_ID: [u64; 2] = [0xf956_2b2d_5c95_a6c8, 0x6a7b_3849_4453_6bdc];
 const REQUESTED_BOOT_STACK_SIZE: u64 = 256 * 1024;
 
 #[used]
@@ -29,7 +30,11 @@ static REQUESTS_START_MARKER: [u64; 4] = REQUESTS_START;
 
 #[used]
 #[link_section = ".limine_requests"]
-static BASE_REVISION_REQUEST: [u64; 3] = BASE_REVISION;
+static mut BASE_REVISION_REQUEST: [u64; 3] = [
+    BASE_REVISION_REQUEST_ID[0],
+    BASE_REVISION_REQUEST_ID[1],
+    REQUIRED_BASE_REVISION,
+];
 
 #[used]
 #[link_section = ".limine_requests_end"]
@@ -88,6 +93,13 @@ struct MemoryMapEntry {
     kind: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RsdpResponse {
+    revision: u64,
+    address: *const u8,
+}
+
 #[used]
 #[link_section = ".limine_requests"]
 static mut STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest {
@@ -141,6 +153,19 @@ static mut MEMORY_MAP_REQUEST: Request<MemoryMapResponse> = Request {
     response: core::ptr::null_mut(),
 };
 
+#[used]
+#[link_section = ".limine_requests"]
+static mut RSDP_REQUEST: Request<RsdpResponse> = Request {
+    id: [
+        0xc7b1_dd30_df4c_8b88,
+        0x0a82_e883_a194_f07b,
+        0xc5e7_7b6b_397e_7b43,
+        0x2763_7845_accd_cf3c,
+    ],
+    revision: 0,
+    response: core::ptr::null_mut(),
+};
+
 unsafe extern "C" {
     static __kernel_start: u8;
     static __kernel_end: u8;
@@ -169,6 +194,11 @@ pub struct BootInfo {
     pub boot_stack_virtual_start: u64,
     pub boot_stack_virtual_end: u64,
     pub memory_map_revision: u64,
+    /// Limine base-revision-3 physical address of the RSDP, if ACPI is present.
+    /// The address is metadata only; no ACPI bytes are dereferenced during boot capture.
+    pub rsdp_physical_address: Option<u64>,
+    /// Copied xAPIC topology used by the later interrupt-controller setup.
+    pub acpi_madt: Option<rustix_kernel::acpi::Madt>,
     pub memory_map: MemoryMap,
     pub frame_allocator: FrameAllocator,
     pub cpu_info: crate::arch::x86_64::cpu::CpuInfo,
@@ -176,6 +206,7 @@ pub struct BootInfo {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootInfoError {
+    UnsupportedBaseRevision { reported: u64, required: u64 },
     MissingHhdmResponse,
     InvalidHhdmResponsePointer,
     InvalidHhdmOffset,
@@ -194,6 +225,9 @@ pub enum BootInfoError {
     TooManyMemoryRegions,
     EmptyMemoryMap,
     InvalidEntriesPointer,
+    InvalidRsdpResponsePointer,
+    InvalidRsdpAddress,
+    InvalidRsdpMappingSpan,
     EntriesAddressOverflow,
     InvalidEntryPointer { index: usize },
     InvalidPhysicalRange { index: usize },
@@ -208,6 +242,18 @@ pub enum BootInfoError {
 /// that a loader-provided pointer is mapped and readable. That remains part of
 /// the documented Limine handoff trust boundary until the kernel owns its maps.
 pub fn capture_boot_information(entry_rsp: u64) -> Result<BootInfo, BootInfoError> {
+    let base_revision_request = core::ptr::addr_of_mut!(BASE_REVISION_REQUEST);
+    // SAFETY: Limine updates the writable base-revision request before entering
+    // the kernel. A volatile read observes the loader's support result.
+    let revision_pointer = base_revision_request.cast::<u64>().wrapping_add(2);
+    let reported_base_revision = unsafe { core::ptr::read_volatile(revision_pointer) };
+    if reported_base_revision != 0 {
+        return Err(BootInfoError::UnsupportedBaseRevision {
+            reported: reported_base_revision,
+            required: REQUIRED_BASE_REVISION,
+        });
+    }
+
     let cpu_info = crate::arch::x86_64::cpu::identify();
     let inherited_cr3_raw = crate::arch::x86_64::cpu::read_cr3_raw();
     let inherited_cr3_root = parse_cr3_root(
@@ -402,6 +448,46 @@ pub fn capture_boot_information(entry_rsp: u64) -> Result<BootInfo, BootInfoErro
     ) {
         return Err(BootInfoError::InitialStackNotBootloaderReclaimable);
     }
+    let rsdp_request = core::ptr::addr_of_mut!(RSDP_REQUEST);
+    // SAFETY: Limine completes supported request responses before `_start`.
+    let rsdp_response_pointer =
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*rsdp_request).response)) };
+    let rsdp_physical_address = if rsdp_response_pointer.is_null() {
+        None
+    } else {
+        if !is_valid_pointer(rsdp_response_pointer, virtual_address_bits) {
+            return Err(BootInfoError::InvalidRsdpResponsePointer);
+        }
+        // SAFETY: Limine's response pointer is non-null, aligned, and canonical.
+        // As for the other boot responses, readability relies on the handoff contract.
+        let response = unsafe { rsdp_response_pointer.read_volatile() };
+        if response.address.is_null() {
+            return Err(BootInfoError::InvalidRsdpAddress);
+        }
+        let address = response.address as u64;
+        if let Err(error) =
+            memory_map.validate_rsdp_span(address, 20, cpu_info.physical_address_bits)
+        {
+            crate::kprintln!("RSDP physical span {:#x} rejected: {:?}", address, error);
+            let page_start = address & !0xfff;
+            let page_end = page_start.checked_add(4096);
+            if let Some(page_end) = page_end {
+                for region in memory_map.regions() {
+                    if region.start() < page_end && page_start < region.end() {
+                        crate::kprintln!(
+                            "RSDP page intersects {:#x}..{:#x} ({:?})",
+                            region.start(),
+                            region.end(),
+                            region.kind()
+                        );
+                    }
+                }
+            }
+            return Err(BootInfoError::InvalidRsdpMappingSpan);
+        }
+        Some(address)
+    };
+
     let frame_allocator =
         FrameAllocator::from_memory_map(&memory_map).map_err(BootInfoError::FrameAllocator)?;
 
@@ -421,6 +507,8 @@ pub fn capture_boot_information(entry_rsp: u64) -> Result<BootInfo, BootInfoErro
         boot_stack_virtual_start,
         boot_stack_virtual_end,
         memory_map_revision: response.revision,
+        rsdp_physical_address,
+        acpi_madt: None,
         memory_map,
         frame_allocator,
         cpu_info,
@@ -490,6 +578,13 @@ pub fn report_boot_information(boot_info: &BootInfo) {
         boot_info.memory_map.usable_bytes() / (1024 * 1024),
         boot_info.memory_map_revision
     );
+    match boot_info.rsdp_physical_address {
+        Some(address) => crate::kprintln!(
+            "ACPI RSDP: physical {:#018x} (initial 20-byte span validated; not dereferenced)",
+            address
+        ),
+        None => crate::kprintln!("ACPI RSDP: unavailable"),
+    }
     crate::kprintln!(
         "physical frames: {} managed, {} free (4 KiB each)",
         boot_info.frame_allocator.managed_frames(),

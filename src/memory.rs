@@ -417,6 +417,70 @@ pub enum HhdmAddressError {
     InvalidHhdmRange,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcpiSpanError {
+    EmptyRange,
+    AddressOverflow,
+    SpanTooLarge,
+    PhysicalRangeOutOfBounds,
+    NotFullyAcpiBacked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcpiSpanAuthorization {
+    AcpiTableMemory,
+    LegacyRsdpReserved,
+}
+
+/// A physical ACPI-related byte span whose complete 4 KiB mapping extent has
+/// explicit memory-map authorization and fits the known physical-address width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedAcpiSpan {
+    byte_start: u64,
+    byte_end: u64,
+    mapping_start: u64,
+    mapping_end: u64,
+    authorization: AcpiSpanAuthorization,
+}
+
+impl ValidatedAcpiSpan {
+    pub const fn byte_start(self) -> u64 {
+        self.byte_start
+    }
+
+    pub const fn byte_end(self) -> u64 {
+        self.byte_end
+    }
+
+    pub const fn mapping_start(self) -> u64 {
+        self.mapping_start
+    }
+
+    pub const fn mapping_end(self) -> u64 {
+        self.mapping_end
+    }
+
+    /// Whether one aligned 4 KiB physical page is fully covered by this span's
+    /// validated page-rounded mapping extent.
+    pub fn contains_mapping_page(self, physical_page: u64) -> bool {
+        if physical_page & 0xfff != 0 {
+            return false;
+        }
+        let Some(page_end) = physical_page.checked_add(4096) else {
+            return false;
+        };
+        let authorization_contains_page = match self.authorization {
+            AcpiSpanAuthorization::AcpiTableMemory => true,
+            AcpiSpanAuthorization::LegacyRsdpReserved => {
+                physical_page >= 0x80_000 && page_end <= 0x10_0000
+            }
+        };
+        authorization_contains_page
+            && physical_page >= self.mapping_start
+            && page_end <= self.mapping_end
+    }
+}
+
 /// Validated, allocation-free snapshot of the physical memory map.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MemoryMap {
@@ -450,6 +514,172 @@ impl MemoryMap {
                 .regions()
                 .iter()
                 .any(|region| region.start <= start && end <= region.end && region.kind == kind)
+    }
+
+    /// Check that a non-empty physical span is covered only by ACPI reclaimable
+    /// or ACPI NVS regions, optionally enforcing the reported physical width.
+    /// Adjacent ACPI regions may jointly cover the span; gaps and other region
+    /// kinds are rejected. This checks metadata only and does not authorize a
+    /// dereference or imply that the span is mapped.
+    pub fn validate_acpi_span(
+        &self,
+        start: u64,
+        length: u64,
+        physical_address_bits: Option<u8>,
+    ) -> Result<ValidatedAcpiSpan, AcpiSpanError> {
+        const PAGE_SIZE: u64 = 4096;
+        const MAX_SPAN_SIZE: u64 = 64 * 1024;
+
+        if length == 0 {
+            return Err(AcpiSpanError::EmptyRange);
+        }
+        if length > MAX_SPAN_SIZE {
+            return Err(AcpiSpanError::SpanTooLarge);
+        }
+        let end = start
+            .checked_add(length)
+            .ok_or(AcpiSpanError::AddressOverflow)?;
+        if physical_address_bits
+            .is_some_and(|bits| !physical_range_fits_address_width(start, end, bits))
+        {
+            return Err(AcpiSpanError::PhysicalRangeOutOfBounds);
+        }
+        let mapping_start = start & !(PAGE_SIZE - 1);
+        let mapping_end = end
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(AcpiSpanError::AddressOverflow)?
+            & !(PAGE_SIZE - 1);
+        if mapping_end <= mapping_start {
+            return Err(AcpiSpanError::AddressOverflow);
+        }
+        if physical_address_bits.is_some_and(|bits| {
+            !physical_range_fits_address_width(mapping_start, mapping_end, bits)
+        }) {
+            return Err(AcpiSpanError::PhysicalRangeOutOfBounds);
+        }
+        if !self.range_is_within_acpi_regions(mapping_start, mapping_end, physical_address_bits) {
+            return Err(AcpiSpanError::NotFullyAcpiBacked);
+        }
+
+        Ok(ValidatedAcpiSpan {
+            byte_start: start,
+            byte_end: end,
+            mapping_start,
+            mapping_end,
+            authorization: AcpiSpanAuthorization::AcpiTableMemory,
+        })
+    }
+
+    /// Validate an RSDP span in ACPI memory or in the bounded legacy x86
+    /// firmware window `[0x80000, 0x100000)`. The legacy exception is only for
+    /// the RSDP itself; table addresses must use `validate_acpi_span`.
+    pub fn validate_rsdp_span(
+        &self,
+        start: u64,
+        length: u64,
+        physical_address_bits: Option<u8>,
+    ) -> Result<ValidatedAcpiSpan, AcpiSpanError> {
+        if let Ok(span) = self.validate_acpi_span(start, length, physical_address_bits) {
+            return Ok(span);
+        }
+        const PAGE_SIZE: u64 = 4096;
+        const LEGACY_RSDP_START: u64 = 0x80_000;
+        const LEGACY_RSDP_END: u64 = 0x10_0000;
+        const MAX_SPAN_SIZE: u64 = 64 * 1024;
+
+        if length == 0 {
+            return Err(AcpiSpanError::EmptyRange);
+        }
+        if length > MAX_SPAN_SIZE {
+            return Err(AcpiSpanError::SpanTooLarge);
+        }
+        let end = start
+            .checked_add(length)
+            .ok_or(AcpiSpanError::AddressOverflow)?;
+        if physical_address_bits
+            .is_some_and(|bits| !physical_range_fits_address_width(start, end, bits))
+        {
+            return Err(AcpiSpanError::PhysicalRangeOutOfBounds);
+        }
+        let mapping_start = start & !(PAGE_SIZE - 1);
+        let mapping_end = end
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(AcpiSpanError::AddressOverflow)?
+            & !(PAGE_SIZE - 1);
+        if mapping_end <= mapping_start {
+            return Err(AcpiSpanError::AddressOverflow);
+        }
+        if mapping_start < LEGACY_RSDP_START
+            || mapping_end > LEGACY_RSDP_END
+            || physical_address_bits.is_some_and(|bits| {
+                !physical_range_fits_address_width(mapping_start, mapping_end, bits)
+            })
+            || !self.range_is_covered_by_kind(mapping_start, mapping_end, RegionKind::Reserved)
+        {
+            return Err(AcpiSpanError::NotFullyAcpiBacked);
+        }
+
+        Ok(ValidatedAcpiSpan {
+            byte_start: start,
+            byte_end: end,
+            mapping_start,
+            mapping_end,
+            authorization: AcpiSpanAuthorization::LegacyRsdpReserved,
+        })
+    }
+
+    fn range_is_covered_by_kind(&self, start: u64, end: u64, kind: RegionKind) -> bool {
+        if start >= end {
+            return false;
+        }
+        let mut covered_until = start;
+        for region in self.regions() {
+            if region.end <= covered_until {
+                continue;
+            }
+            if region.start > covered_until || region.kind != kind {
+                return false;
+            }
+            covered_until = region.end.min(end);
+            if covered_until == end {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn range_is_within_acpi_regions(
+        &self,
+        start: u64,
+        end: u64,
+        physical_address_bits: Option<u8>,
+    ) -> bool {
+        if start >= end
+            || physical_address_bits
+                .is_some_and(|bits| !physical_range_fits_address_width(start, end, bits))
+        {
+            return false;
+        }
+
+        let mut covered_until = start;
+        for region in self.regions() {
+            if region.end <= covered_until {
+                continue;
+            }
+            if region.start > covered_until
+                || !matches!(
+                    region.kind,
+                    RegionKind::AcpiReclaimable | RegionKind::AcpiNvs
+                )
+            {
+                return false;
+            }
+            covered_until = region.end.min(end);
+            if covered_until == end {
+                return true;
+            }
+        }
+        false
     }
 
     /// Calculate the Limine base-revision-3 HHDM address of a page-aligned
@@ -1094,6 +1324,94 @@ mod tests {
             RegionKind::BootloaderReclaimable
         ));
         assert!(!map.range_is_within_region_kind(0x2000, 0x8000, RegionKind::Usable));
+    }
+
+    #[test]
+    fn validates_acpi_spans_against_region_kinds_and_physical_width() {
+        let map = MemoryMap::from_raw(&[
+            RawMemoryRegion {
+                base: 0x1000,
+                length: 0x1000,
+                kind: 2,
+            },
+            RawMemoryRegion {
+                base: 0x2000,
+                length: 0x1000,
+                kind: 3,
+            },
+            RawMemoryRegion {
+                base: 0x4000,
+                length: 0x1000,
+                kind: 0,
+            },
+        ])
+        .unwrap();
+
+        assert!(map.range_is_within_acpi_regions(0x1800, 0x2800, Some(16)));
+        assert!(map.range_is_within_acpi_regions(0x1000, 0x3000, None));
+        assert!(!map.range_is_within_acpi_regions(0x1800, 0x4000, None));
+        assert!(!map.range_is_within_acpi_regions(0x1800, 0x2800, Some(12)));
+        assert!(!map.range_is_within_acpi_regions(0x1000, 0x1000, None));
+
+        let span = map.validate_acpi_span(0x1800, 0x900, Some(14)).unwrap();
+        assert_eq!(span.byte_start(), 0x1800);
+        assert_eq!(span.byte_end(), 0x2100);
+        assert_eq!(span.mapping_start(), 0x1000);
+        assert_eq!(span.mapping_end(), 0x3000);
+        assert!(span.contains_mapping_page(0x1000));
+        assert!(span.contains_mapping_page(0x2000));
+        assert!(!span.contains_mapping_page(0x3000));
+        assert!(!span.contains_mapping_page(0x1800));
+        assert_eq!(
+            map.validate_acpi_span(0x2ff0, 0x20, None),
+            Err(super::AcpiSpanError::NotFullyAcpiBacked)
+        );
+        assert_eq!(
+            map.validate_acpi_span(0x1800, 0x900, Some(13)),
+            Err(super::AcpiSpanError::PhysicalRangeOutOfBounds)
+        );
+        assert_eq!(
+            map.validate_acpi_span(u64::MAX - 15, 16, None),
+            Err(super::AcpiSpanError::AddressOverflow)
+        );
+        assert_eq!(
+            map.validate_acpi_span(0x1000, 64 * 1024 + 1, None),
+            Err(super::AcpiSpanError::SpanTooLarge)
+        );
+    }
+
+    #[test]
+    fn validates_legacy_rsdp_only_inside_reserved_firmware_window() {
+        let map = MemoryMap::from_raw(&[
+            RawMemoryRegion {
+                base: 0x80_000,
+                length: 0x80_000,
+                kind: 1,
+            },
+            RawMemoryRegion {
+                base: 0x10_0000,
+                length: 0x1000,
+                kind: 2,
+            },
+        ])
+        .unwrap();
+        let span = map.validate_rsdp_span(0xf5290, 20, Some(36)).unwrap();
+        assert_eq!(span.mapping_start(), 0xf5000);
+        assert_eq!(span.mapping_end(), 0xf6000);
+        assert!(span.contains_mapping_page(0xf5000));
+        assert!(!span.contains_mapping_page(0x100000));
+        assert_eq!(
+            map.validate_rsdp_span(0x7fff0, 32, Some(36)),
+            Err(super::AcpiSpanError::NotFullyAcpiBacked)
+        );
+        assert_eq!(
+            map.validate_rsdp_span(0xffff0, 32, Some(36)),
+            Err(super::AcpiSpanError::NotFullyAcpiBacked)
+        );
+        assert_eq!(
+            map.validate_rsdp_span(0xf5290, 20, Some(19)),
+            Err(super::AcpiSpanError::PhysicalRangeOutOfBounds)
+        );
     }
 
     #[test]

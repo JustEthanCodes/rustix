@@ -205,6 +205,19 @@ impl RamFs {
         Ok(())
     }
 
+    pub fn write_file_path(
+        &mut self,
+        cwd: usize,
+        path: &str,
+        contents: &[u8],
+    ) -> Result<(), FsError> {
+        if contents.len() > FILE_CAPACITY {
+            return Err(FsError::FileTooLarge);
+        }
+        let node = self.open_or_create_file(cwd, path)?;
+        self.write_file(node, contents)
+    }
+
     pub fn append_file(&mut self, node: usize, contents: &[u8]) -> Result<(), FsError> {
         let node = self.node_mut(node)?;
         if node.kind == EntryKind::Directory {
@@ -218,6 +231,19 @@ impl RamFs {
         node.data[node.data_len..new_len].copy_from_slice(contents);
         node.data_len = new_len;
         Ok(())
+    }
+
+    pub fn append_file_path(
+        &mut self,
+        cwd: usize,
+        path: &str,
+        contents: &[u8],
+    ) -> Result<(), FsError> {
+        if contents.len() > FILE_CAPACITY {
+            return Err(FsError::FileTooLarge);
+        }
+        let node = self.open_or_create_file(cwd, path)?;
+        self.append_file(node, contents)
     }
 
     /// Copy a file to a destination path, replacing an existing destination file.
@@ -479,7 +505,7 @@ fn split_parent(path: &str) -> Result<(&str, &str), FsError> {
 mod tests {
     use core::assert_eq;
 
-    use super::{EntryKind, FsError, RamFs, ROOT_NODE};
+    use super::{EntryKind, FsError, RamFs, FILE_CAPACITY, MAX_NODES, ROOT_NODE};
 
     #[test]
     fn resolves_absolute_relative_and_parent_components() {
@@ -496,12 +522,69 @@ mod tests {
     #[test]
     fn creates_reads_appends_and_removes_files() {
         let mut fs = RamFs::new();
-        let file = fs.create_file_path(ROOT_NODE, "/note.txt").unwrap();
-        fs.write_file(file, b"hello").unwrap();
-        fs.append_file(file, b" rustix").unwrap();
+        fs.write_file_path(ROOT_NODE, "/note.txt", b"hello")
+            .unwrap();
+        fs.append_file_path(ROOT_NODE, "/note.txt", b" rustix")
+            .unwrap();
+        let file = fs.resolve(ROOT_NODE, "/note.txt").unwrap();
         assert_eq!(fs.read_file(file).unwrap(), b"hello rustix");
         fs.remove_file_path(ROOT_NODE, "/note.txt").unwrap();
         assert_eq!(fs.resolve(ROOT_NODE, "/note.txt"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn oversized_path_writes_and_appends_do_not_create_files_or_consume_nodes() {
+        let mut fs = RamFs::new();
+        let oversized = [0u8; FILE_CAPACITY + 1];
+
+        for _ in 0..3 {
+            assert_eq!(
+                fs.write_file_path(ROOT_NODE, "/oversized-write", &oversized),
+                Err(FsError::FileTooLarge)
+            );
+            assert_eq!(
+                fs.append_file_path(ROOT_NODE, "/oversized-append", &oversized),
+                Err(FsError::FileTooLarge)
+            );
+        }
+        assert_eq!(
+            fs.resolve(ROOT_NODE, "/oversized-write"),
+            Err(FsError::NotFound)
+        );
+        assert_eq!(
+            fs.resolve(ROOT_NODE, "/oversized-append"),
+            Err(FsError::NotFound)
+        );
+
+        let names = [
+            "entry-00", "entry-01", "entry-02", "entry-03", "entry-04", "entry-05", "entry-06",
+            "entry-07", "entry-08", "entry-09", "entry-10", "entry-11", "entry-12", "entry-13",
+            "entry-14", "entry-15", "entry-16", "entry-17", "entry-18", "entry-19", "entry-20",
+            "entry-21", "entry-22", "entry-23", "entry-24", "entry-25", "entry-26", "entry-27",
+            "entry-28", "entry-29", "entry-30",
+        ];
+        assert_eq!(names.len(), MAX_NODES - 1);
+        for name in names {
+            fs.create_file(ROOT_NODE, name).unwrap();
+        }
+        assert_eq!(fs.create_file(ROOT_NODE, "full"), Err(FsError::NoSpace));
+    }
+
+    #[test]
+    fn path_write_and_append_preserve_existing_file_on_capacity_failure() {
+        let mut fs = RamFs::new();
+        let file = fs.create_file_path(ROOT_NODE, "/saved").unwrap();
+        fs.write_file(file, b"kept").unwrap();
+        let oversized = [0u8; FILE_CAPACITY + 1];
+        assert_eq!(
+            fs.write_file_path(ROOT_NODE, "/saved", &oversized),
+            Err(FsError::FileTooLarge)
+        );
+        assert_eq!(
+            fs.append_file_path(ROOT_NODE, "/saved", &oversized),
+            Err(FsError::FileTooLarge)
+        );
+        assert_eq!(fs.read_file(file), Ok(&b"kept"[..]));
     }
 
     #[test]

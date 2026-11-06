@@ -8,7 +8,7 @@
 use crate::frame::{Frame, FrameAllocator, FrameError};
 use crate::memory::{
     is_canonical_virtual_address, physical_range_fits_address_width, HhdmAddressError, MemoryMap,
-    RegionKind,
+    RegionKind, ValidatedAcpiSpan,
 };
 
 /// Base page size supported by the initial Rustix mapping policy.
@@ -575,6 +575,7 @@ const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER: u64 = 1 << 2;
 const PTE_WRITE_THROUGH: u64 = 1 << 3;
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
+const PTE_ACCESSED: u64 = 1 << 5;
 const PTE_PAT_4K: u64 = 1 << 7;
 const PTE_NO_EXECUTE: u64 = 1 << 63;
 
@@ -1430,9 +1431,29 @@ struct CandidateTable<P: Copy> {
     prepared: Option<P>,
 }
 
+enum CandidateMappingBacking {
+    Owned(Frame),
+    BorrowedAcpi { physical_address: u64 },
+}
+
+impl CandidateMappingBacking {
+    const fn physical_address(&self) -> u64 {
+        match self {
+            Self::Owned(frame) => frame.address(),
+            Self::BorrowedAcpi { physical_address } => *physical_address,
+        }
+    }
+}
+
 struct CandidateMapping {
     virtual_address: u64,
-    frame: Frame,
+    backing: CandidateMappingBacking,
+}
+
+struct CandidateMapInternalFailure<E> {
+    cause: CandidateMapErrorKind<E>,
+    backing: CandidateMappingBacking,
+    rollback_retained_table_frames: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1481,7 +1502,7 @@ pub enum CandidateMapErrorKind<E> {
     LargePageConflict,
     UnownedIntermediateTable,
     InvalidIntermediateEntry,
-    FrameAlreadyOwned,
+    PhysicalPageAlreadyMapped,
 }
 
 /// A failed map operation returns the caller's leaf-frame token.
@@ -1491,6 +1512,14 @@ pub struct CandidateMapFailure<E> {
     pub frame: Frame,
     /// Newly allocated table frames retained by the candidate because allocator
     /// metadata could not accept their rollback. They remain owned and unlinked.
+    pub rollback_retained_table_frames: usize,
+}
+
+/// Failure to map a validated, non-owned ACPI page.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CandidateBorrowedMapFailure<E> {
+    pub cause: CandidateMapErrorKind<E>,
+    /// Newly allocated table frames retained by the candidate after rollback.
     pub rollback_retained_table_frames: usize,
 }
 
@@ -1542,14 +1571,17 @@ pub enum CandidatePageTableReadError<E> {
 
 /// A bounded, allocator-owned page-table hierarchy.
 ///
-/// It supports 4 KiB mappings of allocator-issued leaf frames. All table pages
-/// and explicitly owned leaf frames remain represented by non-copyable `Frame`
-/// tokens. An optional inherited-hierarchy clone preserves its pre-existing
-/// leaf mappings without claiming ownership of those leaf frames. Mapping
-/// allocates and prepares every missing table before writing a parent or leaf
-/// entry; allocation/read/prepare failures therefore leave candidate
-/// translations unchanged. Unmap removes an explicitly owned leaf and returns
-/// its frame, but retains empty intermediate tables until `release`.
+/// It supports 4 KiB mappings of allocator-issued leaf frames and bounded
+/// borrowed ACPI pages. All table pages and explicitly owned leaf frames remain
+/// represented by non-copyable `Frame` tokens; borrowed ACPI mappings never
+/// transfer physical-page ownership. An optional inherited-hierarchy clone
+/// preserves its pre-existing leaf mappings without claiming ownership of those
+/// leaf frames. Mapping allocates and prepares every missing table before writing
+/// a parent or leaf entry; allocation/read/prepare failures therefore leave
+/// candidate translations unchanged. Unmap returns an owned leaf frame only
+/// through `unmap_owned_page`, while `unmap_acpi_page` removes borrowed ACPI
+/// leaves without freeing their pages. Empty intermediate tables remain until
+/// `release`.
 ///
 /// The caller may install a fully validated hierarchy as the active CR3 with
 /// `mark_active`. Active candidates reject mutation and release so page-table
@@ -1976,11 +2008,67 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
         mapping: ValidatedMappingRange,
         cache_attributes: SelectedCacheAttributes,
     ) -> Result<(), CandidateMapFailure<M::Error>> {
+        let backing = CandidateMappingBacking::Owned(frame);
+        match self.map_page_with_backing(allocator, mapping, cache_attributes, backing) {
+            Ok(()) => Ok(()),
+            Err(failure) => match failure.backing {
+                CandidateMappingBacking::Owned(frame) => Err(CandidateMapFailure {
+                    cause: failure.cause,
+                    frame,
+                    rollback_retained_table_frames: failure.rollback_retained_table_frames,
+                }),
+                CandidateMappingBacking::BorrowedAcpi { .. } => {
+                    unreachable!("owned map failure retains its owned frame token")
+                }
+            },
+        }
+    }
+
+    /// Map one page from a validated ACPI extent without transferring ownership
+    /// of the physical page to the allocator. The mapping is supervisor,
+    /// read-only, and NX; it may only be installed while this candidate is inactive.
+    pub fn map_acpi_page(
+        &mut self,
+        allocator: &mut FrameAllocator,
+        span: ValidatedAcpiSpan,
+        mapping: ValidatedMappingRange,
+        cache_attributes: SelectedCacheAttributes,
+    ) -> Result<(), CandidateBorrowedMapFailure<M::Error>> {
+        if mapping.length() != PAGE_SIZE
+            || !span.contains_mapping_page(mapping.physical_start)
+            || mapping.physical_start.checked_add(PAGE_SIZE) != Some(mapping.physical_end)
+            || mapping.physical_address_bits != self.config.physical_address_bits
+            || mapping.permissions.writable
+            || mapping.permissions.executable
+            || mapping.permissions.user_accessible
+        {
+            return Err(CandidateBorrowedMapFailure {
+                cause: CandidateMapErrorKind::InvalidMapping,
+                rollback_retained_table_frames: 0,
+            });
+        }
+        let backing = CandidateMappingBacking::BorrowedAcpi {
+            physical_address: mapping.physical_start,
+        };
+        self.map_page_with_backing(allocator, mapping, cache_attributes, backing)
+            .map_err(|failure| CandidateBorrowedMapFailure {
+                cause: failure.cause,
+                rollback_retained_table_frames: failure.rollback_retained_table_frames,
+            })
+    }
+
+    fn map_page_with_backing(
+        &mut self,
+        allocator: &mut FrameAllocator,
+        mapping: ValidatedMappingRange,
+        cache_attributes: SelectedCacheAttributes,
+        backing: CandidateMappingBacking,
+    ) -> Result<(), CandidateMapInternalFailure<M::Error>> {
         macro_rules! fail {
             ($cause:expr, $retained:expr) => {
-                return Err(CandidateMapFailure {
+                return Err(CandidateMapInternalFailure {
                     cause: $cause,
-                    frame,
+                    backing,
                     rollback_retained_table_frames: $retained,
                 })
             };
@@ -1995,14 +2083,14 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
         if !candidate_config_is_valid(self.config) {
             fail!(CandidateMapErrorKind::InvalidConfiguration, 0);
         }
-        let frame_address = frame.address();
-        let Some(frame_end) = frame_address.checked_add(PAGE_SIZE) else {
+        let physical_address = backing.physical_address();
+        let Some(physical_end) = physical_address.checked_add(PAGE_SIZE) else {
             fail!(CandidateMapErrorKind::InvalidMapping, 0);
         };
         if mapping.length() != PAGE_SIZE
             || mapping.virtual_start & (PAGE_SIZE - 1) != 0
-            || mapping.physical_start != frame_address
-            || mapping.physical_end != frame_end
+            || mapping.physical_start != physical_address
+            || mapping.physical_end != physical_end
             || mapping.physical_address_bits != self.config.physical_address_bits
         {
             fail!(CandidateMapErrorKind::InvalidMapping, 0);
@@ -2027,14 +2115,14 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
             .mappings
             .iter()
             .flatten()
-            .any(|item| item.frame.address() == frame_address)
+            .any(|item| item.backing.physical_address() == physical_address)
             || self
                 .tables
                 .iter()
                 .flatten()
-                .any(|table| table.frame.address() == frame_address)
+                .any(|table| table.frame.address() == physical_address)
         {
-            fail!(CandidateMapErrorKind::FrameAlreadyOwned, 0);
+            fail!(CandidateMapErrorKind::PhysicalPageAlreadyMapped, 0);
         }
         let Some(mapping_slot) = self.mappings.iter().position(Option::is_none) else {
             fail!(CandidateMapErrorKind::MappingCapacity, 0);
@@ -2073,7 +2161,8 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
             if entry & PTE_PAGE_SIZE != 0 {
                 fail!(CandidateMapErrorKind::LargePageConflict, 0);
             }
-            let allowed = PTE_ADDRESS_FIELD_MASK | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            let allowed =
+                PTE_ADDRESS_FIELD_MASK | PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_ACCESSED;
             let physical_mask =
                 ((1u64 << self.config.physical_address_bits) - 1) & !(PAGE_SIZE - 1);
             let child_address = entry & PTE_ADDRESS_FIELD_MASK;
@@ -2220,17 +2309,18 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
         };
         self.mappings[mapping_slot] = Some(CandidateMapping {
             virtual_address: mapping.virtual_start,
-            frame,
+            backing,
         });
         self.mapping_count += 1;
         Ok(())
     }
 
-    /// Remove one inactive-candidate leaf mapping and return its owned frame.
-    pub fn unmap_owned_page(
+    /// Remove an inactive-candidate leaf mapping and return its backing record.
+    fn unmap_candidate_page(
         &mut self,
         virtual_address: u64,
-    ) -> Result<Frame, CandidateUnmapError<M::Error>> {
+        expect_owned: bool,
+    ) -> Result<CandidateMappingBacking, CandidateUnmapError<M::Error>> {
         if self.active {
             return Err(CandidateUnmapError::Active);
         }
@@ -2254,6 +2344,16 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                     .is_some_and(|mapping| mapping.virtual_address == virtual_address)
             })
             .ok_or(CandidateUnmapError::NotMapped)?;
+        let is_owned = matches!(
+            self.mappings[mapping_slot]
+                .as_ref()
+                .expect("mapping slot validated")
+                .backing,
+            CandidateMappingBacking::Owned(_)
+        );
+        if is_owned != expect_owned {
+            return Err(CandidateUnmapError::OwnershipMismatch);
+        }
 
         let indexes = page_table_indexes(virtual_address, self.config.levels);
         let mut current_table_slot = 0;
@@ -2275,7 +2375,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                 let mapping = self.mappings[mapping_slot]
                     .as_ref()
                     .expect("mapping slot validated");
-                if entry & PTE_ADDRESS_FIELD_MASK != mapping.frame.address() {
+                if entry & PTE_ADDRESS_FIELD_MASK != mapping.backing.physical_address() {
                     return Err(CandidateUnmapError::OwnershipMismatch);
                 }
                 // SAFETY: `prepared` belongs to this candidate-owned table and
@@ -2285,12 +2385,13 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                     .take()
                     .expect("mapping slot validated");
                 self.mapping_count -= 1;
-                return Ok(mapping.frame);
+                return Ok(mapping.backing);
             }
             if entry & PTE_PAGE_SIZE != 0 {
                 return Err(CandidateUnmapError::LargePageConflict);
             }
-            let allowed = PTE_ADDRESS_FIELD_MASK | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+            let allowed =
+                PTE_ADDRESS_FIELD_MASK | PTE_PRESENT | PTE_WRITABLE | PTE_USER | PTE_ACCESSED;
             let physical_mask =
                 ((1u64 << self.config.physical_address_bits) - 1) & !(PAGE_SIZE - 1);
             let child_address = entry & PTE_ADDRESS_FIELD_MASK;
@@ -2310,6 +2411,32 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
             current_table_slot = child_slot;
         }
         Err(CandidateUnmapError::InvalidConfiguration)
+    }
+
+    /// Remove one inactive-candidate leaf mapping and return its owned frame.
+    pub fn unmap_owned_page(
+        &mut self,
+        virtual_address: u64,
+    ) -> Result<Frame, CandidateUnmapError<M::Error>> {
+        match self.unmap_candidate_page(virtual_address, true)? {
+            CandidateMappingBacking::Owned(frame) => Ok(frame),
+            CandidateMappingBacking::BorrowedAcpi { .. } => {
+                unreachable!("unmap_candidate_page checked the expected owned backing")
+            }
+        }
+    }
+
+    /// Remove one inactive ACPI mapping without returning or freeing its page.
+    pub fn unmap_acpi_page(
+        &mut self,
+        virtual_address: u64,
+    ) -> Result<(), CandidateUnmapError<M::Error>> {
+        match self.unmap_candidate_page(virtual_address, false)? {
+            CandidateMappingBacking::BorrowedAcpi { .. } => Ok(()),
+            CandidateMappingBacking::Owned(_) => {
+                unreachable!("unmap_candidate_page checked the expected borrowed backing")
+            }
+        }
     }
 
     /// Return all held frames to the allocator. Active roots are never released.
@@ -2347,15 +2474,20 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
             let Some(mapping) = self.mappings[slot].take() else {
                 continue;
             };
-            if let Err(error) = allocator.deallocate(mapping.frame) {
-                self.mappings[slot] = Some(CandidateMapping {
-                    virtual_address: mapping.virtual_address,
-                    frame: error.frame,
-                });
-                return Err(CandidateReleaseFailure {
-                    error: CandidateReleaseError::Frame(error.error),
-                    candidate: self,
-                });
+            match mapping.backing {
+                CandidateMappingBacking::Owned(frame) => {
+                    if let Err(error) = allocator.deallocate(frame) {
+                        self.mappings[slot] = Some(CandidateMapping {
+                            virtual_address: mapping.virtual_address,
+                            backing: CandidateMappingBacking::Owned(error.frame),
+                        });
+                        return Err(CandidateReleaseFailure {
+                            error: CandidateReleaseError::Frame(error.error),
+                            candidate: self,
+                        });
+                    }
+                }
+                CandidateMappingBacking::BorrowedAcpi { .. } => {}
             }
             self.mapping_count -= 1;
         }
@@ -4373,6 +4505,294 @@ mod tests {
             Err(CandidateUnmapError::NotMapped)
         );
         assert!(candidate.release(&mut allocator).is_ok());
+    }
+
+    #[test]
+    fn candidate_page_tables_map_borrowed_acpi_without_owning_its_frame() {
+        let total_frames = 8;
+        let mut allocator = candidate_allocator(total_frames);
+        let mut memory = CandidateTestMemory::new();
+        let mut candidate =
+            CandidatePageTables::new(&mut allocator, &mut memory, four_level_walk_config())
+                .unwrap();
+        let acpi_physical = 0x20_0000;
+        let acpi_map = MemoryMap::from_raw(&[
+            RawMemoryRegion {
+                base: 0x10_0000,
+                length: PAGE_SIZE * total_frames as u64,
+                kind: 0,
+            },
+            RawMemoryRegion {
+                base: acpi_physical,
+                length: PAGE_SIZE,
+                kind: 2,
+            },
+        ])
+        .unwrap();
+        let span = acpi_map
+            .validate_acpi_span(acpi_physical, PAGE_SIZE, Some(40))
+            .unwrap();
+        let virtual_address = 0xffff_9000_0000_1000;
+        let mapping = validate_mapping_range(
+            virtual_address,
+            acpi_physical,
+            PAGE_SIZE,
+            KERNEL_READ_ONLY,
+            Some(40),
+            48,
+        )
+        .unwrap();
+        let pat = PatLayout::from_msr_value(0x0606_0606_0606_0606).unwrap();
+        let mtrrs = empty_mtrr_registers(0, (1 << 11) | MtrrMemoryType::WriteBack as u64)
+            .validated_layout(40)
+            .unwrap();
+        let attributes = mapping
+            .select_cache_attributes(CachePolicy::WriteBack, pat, &mtrrs, true)
+            .unwrap();
+        let free_before_map = allocator.free_frames();
+
+        candidate
+            .map_acpi_page(&mut allocator, span, mapping, attributes)
+            .unwrap();
+        assert_eq!(candidate.mapping_count(), 1);
+        assert_eq!(allocator.free_frames(), free_before_map - 3);
+        assert_eq!(
+            candidate.walk(virtual_address).unwrap(),
+            PageWalkOutcome::Mapped(PageTranslation {
+                physical_address: acpi_physical,
+                leaf_physical_base: acpi_physical,
+                page_size: PAGE_SIZE,
+                permissions: KERNEL_READ_ONLY,
+                pat_index: 0,
+                raw_leaf_entry: acpi_physical | 1 | (1 << 63),
+            })
+        );
+        let duplicate_virtual = candidate
+            .map_acpi_page(&mut allocator, span, mapping, attributes)
+            .unwrap_err();
+        assert_eq!(
+            duplicate_virtual.cause,
+            CandidateMapErrorKind::MappingAlreadyPresent
+        );
+        let other_virtual = virtual_address + PAGE_SIZE;
+        let other_mapping = validate_mapping_range(
+            other_virtual,
+            acpi_physical,
+            PAGE_SIZE,
+            KERNEL_READ_ONLY,
+            Some(40),
+            48,
+        )
+        .unwrap();
+        let duplicate_physical = candidate
+            .map_acpi_page(&mut allocator, span, other_mapping, attributes)
+            .unwrap_err();
+        assert_eq!(
+            duplicate_physical.cause,
+            CandidateMapErrorKind::PhysicalPageAlreadyMapped
+        );
+        assert_eq!(candidate.mapping_count(), 1);
+        assert_eq!(
+            candidate.unmap_owned_page(virtual_address),
+            Err(CandidateUnmapError::OwnershipMismatch)
+        );
+        assert_eq!(candidate.mapping_count(), 1);
+        // SAFETY: This synthetic test checks the inactive-only guard; the CPU
+        // never installs the candidate's root.
+        unsafe { candidate.mark_active() };
+        assert_eq!(
+            candidate.unmap_acpi_page(virtual_address),
+            Err(CandidateUnmapError::Active)
+        );
+        // SAFETY: The synthetic test never installed this root in CR3.
+        unsafe { candidate.mark_inactive() };
+        candidate.unmap_acpi_page(virtual_address).unwrap();
+        assert_eq!(candidate.mapping_count(), 0);
+        candidate
+            .map_acpi_page(&mut allocator, span, mapping, attributes)
+            .unwrap();
+        candidate.release(&mut allocator).unwrap();
+        assert_eq!(allocator.free_frames(), total_frames as u64);
+    }
+
+    #[test]
+    fn candidate_page_tables_reject_invalid_borrowed_acpi_mappings() {
+        let mut allocator = candidate_allocator(8);
+        let mut memory = CandidateTestMemory::new();
+        let mut candidate =
+            CandidatePageTables::new(&mut allocator, &mut memory, four_level_walk_config())
+                .unwrap();
+        let physical = 0x20_0000;
+        let other_physical = 0x30_0000;
+        let memory_map = MemoryMap::from_raw(&[
+            RawMemoryRegion {
+                base: 0x10_0000,
+                length: PAGE_SIZE * 8,
+                kind: 0,
+            },
+            RawMemoryRegion {
+                base: physical,
+                length: PAGE_SIZE,
+                kind: 2,
+            },
+            RawMemoryRegion {
+                base: other_physical,
+                length: PAGE_SIZE,
+                kind: 2,
+            },
+        ])
+        .unwrap();
+        let span = memory_map
+            .validate_acpi_span(physical, PAGE_SIZE, Some(40))
+            .unwrap();
+        let virtual_address = 0xffff_9000_0000_1000;
+        let writable = validate_mapping_range(
+            virtual_address,
+            physical,
+            PAGE_SIZE,
+            PagePermissions {
+                writable: true,
+                executable: false,
+                user_accessible: false,
+            },
+            Some(40),
+            48,
+        )
+        .unwrap();
+        let pat = PatLayout::from_msr_value(0x0606_0606_0606_0606).unwrap();
+        let mtrrs = empty_mtrr_registers(0, (1 << 11) | MtrrMemoryType::WriteBack as u64)
+            .validated_layout(40)
+            .unwrap();
+        let attributes = writable
+            .select_cache_attributes(CachePolicy::WriteBack, pat, &mtrrs, true)
+            .unwrap();
+        let failure = candidate
+            .map_acpi_page(&mut allocator, span, writable, attributes)
+            .unwrap_err();
+        assert_eq!(failure.cause, CandidateMapErrorKind::InvalidMapping);
+        let executable = validate_mapping_range(
+            virtual_address,
+            physical,
+            PAGE_SIZE,
+            PagePermissions {
+                executable: true,
+                ..KERNEL_READ_ONLY
+            },
+            Some(40),
+            48,
+        )
+        .unwrap();
+        let executable_attributes = executable
+            .select_cache_attributes(CachePolicy::WriteBack, pat, &mtrrs, true)
+            .unwrap();
+        assert_eq!(
+            candidate
+                .map_acpi_page(&mut allocator, span, executable, executable_attributes)
+                .unwrap_err()
+                .cause,
+            CandidateMapErrorKind::InvalidMapping
+        );
+        let user = validate_mapping_range(
+            virtual_address,
+            physical,
+            PAGE_SIZE,
+            PagePermissions {
+                user_accessible: true,
+                ..KERNEL_READ_ONLY
+            },
+            Some(40),
+            48,
+        )
+        .unwrap();
+        let user_attributes = user
+            .select_cache_attributes(CachePolicy::WriteBack, pat, &mtrrs, true)
+            .unwrap();
+        assert_eq!(
+            candidate
+                .map_acpi_page(&mut allocator, span, user, user_attributes)
+                .unwrap_err()
+                .cause,
+            CandidateMapErrorKind::InvalidMapping
+        );
+        let wrong_span = memory_map
+            .validate_acpi_span(other_physical, PAGE_SIZE, Some(40))
+            .unwrap();
+        let read_only = validate_mapping_range(
+            virtual_address,
+            physical,
+            PAGE_SIZE,
+            KERNEL_READ_ONLY,
+            Some(40),
+            48,
+        )
+        .unwrap();
+        let read_only_attributes = read_only
+            .select_cache_attributes(CachePolicy::WriteBack, pat, &mtrrs, true)
+            .unwrap();
+        assert_eq!(
+            candidate
+                .map_acpi_page(&mut allocator, wrong_span, read_only, read_only_attributes)
+                .unwrap_err()
+                .cause,
+            CandidateMapErrorKind::InvalidMapping
+        );
+        assert_eq!(candidate.mapping_count(), 0);
+        candidate.release(&mut allocator).unwrap();
+    }
+
+    #[test]
+    fn borrowed_acpi_mapping_rolls_back_new_tables_on_frame_exhaustion() {
+        let total_frames = 3;
+        let mut allocator = candidate_allocator(total_frames);
+        let mut memory = CandidateTestMemory::new();
+        let mut candidate =
+            CandidatePageTables::new(&mut allocator, &mut memory, four_level_walk_config())
+                .unwrap();
+        let physical = 0x20_0000;
+        let map = MemoryMap::from_raw(&[
+            RawMemoryRegion {
+                base: 0x10_0000,
+                length: PAGE_SIZE * total_frames as u64,
+                kind: 0,
+            },
+            RawMemoryRegion {
+                base: physical,
+                length: PAGE_SIZE,
+                kind: 2,
+            },
+        ])
+        .unwrap();
+        let span = map
+            .validate_acpi_span(physical, PAGE_SIZE, Some(40))
+            .unwrap();
+        let mapping = validate_mapping_range(
+            0xffff_9000_0000_1000,
+            physical,
+            PAGE_SIZE,
+            KERNEL_READ_ONLY,
+            Some(40),
+            48,
+        )
+        .unwrap();
+        let pat = PatLayout::from_msr_value(0x0606_0606_0606_0606).unwrap();
+        let mtrrs = empty_mtrr_registers(0, (1 << 11) | MtrrMemoryType::WriteBack as u64)
+            .validated_layout(40)
+            .unwrap();
+        let attributes = mapping
+            .select_cache_attributes(CachePolicy::WriteBack, pat, &mtrrs, true)
+            .unwrap();
+        let free_before_map = allocator.free_frames();
+
+        let failure = candidate
+            .map_acpi_page(&mut allocator, span, mapping, attributes)
+            .unwrap_err();
+        assert_eq!(failure.cause, CandidateMapErrorKind::OutOfFrames);
+        assert_eq!(failure.rollback_retained_table_frames, 0);
+        assert_eq!(allocator.free_frames(), free_before_map);
+        assert_eq!(candidate.table_count(), 1);
+        assert_eq!(candidate.mapping_count(), 0);
+        candidate.release(&mut allocator).unwrap();
+        assert_eq!(allocator.free_frames(), total_frames as u64);
     }
 
     #[test]

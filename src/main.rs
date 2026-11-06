@@ -137,6 +137,188 @@ unsafe impl rustix_kernel::paging::CandidatePageTableMemory for LimineHhdmCandid
     }
 }
 
+// Error payloads provide boot diagnostics through the derived `Debug` output.
+#[allow(dead_code)]
+#[derive(Debug)]
+enum AcpiMappingError {
+    InvalidAcpiSpan(rustix_kernel::memory::AcpiSpanError),
+    InvalidMapping(rustix_kernel::paging::MappingError),
+    CandidateMap(
+        rustix_kernel::paging::CandidateMapErrorKind<rustix_kernel::memory::HhdmAddressError>,
+    ),
+    CandidateWalk,
+    UnexpectedCurrentCr3,
+}
+
+struct CandidateAcpiReader<'candidate, 'memory, 'map> {
+    candidate: &'candidate mut rustix_kernel::paging::CandidatePageTables<
+        'memory,
+        LimineHhdmCandidateMemory<'map>,
+    >,
+    allocator: &'candidate mut rustix_kernel::frame::FrameAllocator,
+    memory_map: &'map rustix_kernel::memory::MemoryMap,
+    physical_address_bits: u8,
+    virtual_address_bits: u8,
+    cache_layout: rustix_kernel::paging::ValidatedMtrrLayout,
+    pat: rustix_kernel::paging::PatLayout,
+    normal_caching: bool,
+    candidate_cr3: u64,
+    previous_cr3: u64,
+    virtual_address: u64,
+}
+
+impl CandidateAcpiReader<'_, '_, '_> {
+    fn remove_temporary_mapping(&mut self) {
+        if let Err(error) = self.candidate.unmap_acpi_page(self.virtual_address) {
+            crate::kprintln!("temporary ACPI mapping could not be removed: {:?}", error);
+            halt_forever();
+        }
+    }
+}
+
+// The legacy-reserved authorization is accepted only for RSDP reads; all
+// root and child tables require ACPI-reclaimable/NVS memory-map coverage.
+impl CandidateAcpiReader<'_, '_, '_> {
+    fn read_mapped(
+        &mut self,
+        physical_start: u64,
+        output: &mut [u8],
+        allow_legacy_rsdp: bool,
+    ) -> Result<(), AcpiMappingError> {
+        use rustix_kernel::paging::{
+            validate_mapping_range, CachePolicy, PagePermissions, PageWalkOutcome, PAGE_SIZE,
+        };
+
+        if arch::x86_64::cpu::read_cr3_raw() != self.previous_cr3 {
+            return Err(AcpiMappingError::UnexpectedCurrentCr3);
+        }
+        if output.is_empty() {
+            return Ok(());
+        }
+        let length = u64::try_from(output.len()).map_err(|_| {
+            AcpiMappingError::InvalidAcpiSpan(rustix_kernel::memory::AcpiSpanError::AddressOverflow)
+        })?;
+        let span = if allow_legacy_rsdp {
+            self.memory_map.validate_rsdp_span(
+                physical_start,
+                length,
+                Some(self.physical_address_bits),
+            )
+        } else {
+            self.memory_map.validate_acpi_span(
+                physical_start,
+                length,
+                Some(self.physical_address_bits),
+            )
+        }
+        .map_err(AcpiMappingError::InvalidAcpiSpan)?;
+        let permissions = PagePermissions {
+            writable: false,
+            executable: false,
+            user_accessible: false,
+        };
+        let mut copied = 0usize;
+        while copied < output.len() {
+            let current_physical = physical_start.checked_add(copied as u64).ok_or(
+                AcpiMappingError::InvalidAcpiSpan(
+                    rustix_kernel::memory::AcpiSpanError::AddressOverflow,
+                ),
+            )?;
+            let physical_page = current_physical & !(PAGE_SIZE - 1);
+            let page_offset = current_physical - physical_page;
+            let page_length = (PAGE_SIZE - page_offset).min((output.len() - copied) as u64);
+            let mapping = validate_mapping_range(
+                self.virtual_address,
+                physical_page,
+                PAGE_SIZE,
+                permissions,
+                Some(self.physical_address_bits),
+                self.virtual_address_bits,
+            )
+            .map_err(AcpiMappingError::InvalidMapping)?;
+            let cache_attributes = mapping
+                .select_cache_attributes(
+                    CachePolicy::Uncacheable,
+                    self.pat,
+                    &self.cache_layout,
+                    self.normal_caching,
+                )
+                .map_err(AcpiMappingError::InvalidMapping)?;
+            self.candidate
+                .map_acpi_page(self.allocator, span, mapping, cache_attributes)
+                .map_err(|failure| AcpiMappingError::CandidateMap(failure.cause))?;
+
+            let candidate_mapping_is_valid = matches!(
+                self.candidate.walk(self.virtual_address),
+                Ok(PageWalkOutcome::Mapped(translation))
+                    if translation.physical_address == physical_page
+                        && translation.permissions == permissions
+            );
+            if !candidate_mapping_is_valid {
+                self.remove_temporary_mapping();
+                return Err(AcpiMappingError::CandidateWalk);
+            }
+            if arch::x86_64::cpu::read_cr3_raw() != self.previous_cr3 {
+                halt_forever();
+            }
+
+            // SAFETY: The candidate is a complete clone of the current inherited
+            // hierarchy with all critical paths verified; this temporary page is
+            // supervisor R/NX and the candidate remains owned by this stack.
+            unsafe { arch::x86_64::cpu::write_cr3_with_global_flush(self.candidate_cr3) };
+            // SAFETY: The CR3 write above installed the candidate root and maskable
+            // interrupts remain disabled during this single-core bootstrap read.
+            unsafe { self.candidate.mark_active() };
+            if arch::x86_64::cpu::read_cr3_raw() != self.candidate_cr3 {
+                // SAFETY: Restoring the previous validated root preserves all code,
+                // stack, data, and exception mappings needed by this path.
+                unsafe { arch::x86_64::cpu::write_cr3_with_global_flush(self.previous_cr3) };
+                if arch::x86_64::cpu::read_cr3_raw() != self.previous_cr3 {
+                    halt_forever();
+                }
+                // SAFETY: The verified CR3 is no longer the candidate root.
+                unsafe { self.candidate.mark_inactive() };
+                self.remove_temporary_mapping();
+                return Err(AcpiMappingError::UnexpectedCurrentCr3);
+            }
+
+            let source = (self.virtual_address + page_offset) as *const u8;
+            for offset in 0..page_length as usize {
+                // SAFETY: The exact physical page is temporarily mapped R/NX in
+                // the active candidate and this byte lies within its 4 KiB leaf.
+                output[copied + offset] = unsafe { source.add(offset).read_volatile() };
+            }
+
+            // SAFETY: The prior root remains allocated and its critical mappings
+            // were verified before this temporary switch.
+            unsafe { arch::x86_64::cpu::write_cr3_with_global_flush(self.previous_cr3) };
+            if arch::x86_64::cpu::read_cr3_raw() != self.previous_cr3 {
+                halt_forever();
+            }
+            // SAFETY: The previous root was restored and verified above.
+            unsafe { self.candidate.mark_inactive() };
+            self.remove_temporary_mapping();
+            copied += page_length as usize;
+        }
+        Ok(())
+    }
+}
+
+// SAFETY: `read_mapped` authorizes ordinary table reads only through validated
+// ACPI map regions; its separate RSDP entry point permits only the bounded legacy
+// reserved window recognized by `MemoryMap::validate_rsdp_span`.
+unsafe impl rustix_kernel::acpi::AcpiPhysicalReader for CandidateAcpiReader<'_, '_, '_> {
+    type Error = AcpiMappingError;
+
+    fn read(&mut self, physical_start: u64, output: &mut [u8]) -> Result<(), Self::Error> {
+        self.read_mapped(physical_start, output, false)
+    }
+
+    fn read_rsdp(&mut self, physical_start: u64, output: &mut [u8]) -> Result<(), Self::Error> {
+        self.read_mapped(physical_start, output, true)
+    }
+}
+
 // Capture Limine's entry RSP before a Rust prologue changes it. The synthetic
 // return slot is part of the SysV entry stack; realign before calling Rust.
 core::arch::global_asm!(
@@ -360,6 +542,29 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
         kprintln!("page-table transition aborted: active CR3 changed before switch");
         release_candidate_after_probe_failure(candidate, &mut boot_info.frame_allocator);
     }
+    if let Some(rsdp_physical_address) = boot_info.rsdp_physical_address {
+        match load_acpi_madt(
+            &mut candidate,
+            &mut boot_info.frame_allocator,
+            &boot_info.memory_map,
+            &boot_info.cpu_info,
+            rsdp_physical_address,
+            new_cr3,
+            inherited_cr3,
+        ) {
+            Ok(madt) => {
+                kprintln!(
+                    "ACPI MADT copied: LAPIC={:#x}, {} local APICs, {} I/O APICs, {} overrides",
+                    madt.local_apic_address,
+                    madt.local_apics().count(),
+                    madt.io_apics().count(),
+                    madt.interrupt_overrides().count()
+                );
+                boot_info.acpi_madt = Some(madt);
+            }
+            Err(error) => kprintln!("ACPI MADT unavailable: {:?}", error),
+        }
+    }
     // SAFETY: The candidate is a complete clone of every present inherited
     // hierarchy entry, with all referenced intermediate tables owned and the
     // critical code/data/stack paths compared before this point. The inherited
@@ -419,6 +624,87 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
             halt_forever()
         }
     }
+}
+
+// Error payloads provide boot diagnostics through the derived `Debug` output.
+#[allow(dead_code)]
+#[derive(Debug)]
+enum AcpiBootReadError {
+    PhysicalWidthUnknown,
+    PatUnavailable,
+    InvalidPat(rustix_kernel::paging::PatLayoutError),
+    InvalidMtrr(rustix_kernel::paging::MtrrError),
+    MtrrUnavailable,
+    NoVirtualWindow,
+    PageTableWalk,
+    Read(rustix_kernel::acpi::AcpiReadError<AcpiMappingError>),
+}
+
+fn load_acpi_madt<'candidate, 'memory, 'map>(
+    candidate: &'candidate mut rustix_kernel::paging::CandidatePageTables<
+        'memory,
+        LimineHhdmCandidateMemory<'map>,
+    >,
+    allocator: &'candidate mut rustix_kernel::frame::FrameAllocator,
+    memory_map: &'map rustix_kernel::memory::MemoryMap,
+    cpu_info: &arch::x86_64::cpu::CpuInfo,
+    rsdp_physical_address: u64,
+    candidate_cr3: u64,
+    previous_cr3: u64,
+) -> Result<rustix_kernel::acpi::Madt, AcpiBootReadError> {
+    use rustix_kernel::paging::{MtrrState, PageWalkOutcome, PatLayout};
+
+    let physical_address_bits = cpu_info
+        .physical_address_bits
+        .ok_or(AcpiBootReadError::PhysicalWidthUnknown)?;
+    let pat_value = cpu_info
+        .pat_msr_value
+        .ok_or(AcpiBootReadError::PatUnavailable)?;
+    let pat = PatLayout::from_msr_value(pat_value).map_err(AcpiBootReadError::InvalidPat)?;
+    let cache_layout = match &cpu_info.mtrr {
+        MtrrState::Captured(registers) => registers
+            .validated_layout(physical_address_bits)
+            .map_err(AcpiBootReadError::InvalidMtrr)?,
+        _ => return Err(AcpiBootReadError::MtrrUnavailable),
+    };
+
+    const WINDOW_BASE: u64 = 0xffff_c000_0000_0000;
+    const WINDOW_PAGES: u64 = 4096;
+    let mut virtual_address = WINDOW_BASE;
+    let mut window_found = false;
+    for _ in 0..WINDOW_PAGES {
+        match candidate.walk(virtual_address) {
+            Ok(PageWalkOutcome::NotPresent { .. }) => {
+                window_found = true;
+                break;
+            }
+            Ok(PageWalkOutcome::Mapped(_)) => {}
+            Err(_) => return Err(AcpiBootReadError::PageTableWalk),
+        }
+        virtual_address = virtual_address
+            .checked_add(rustix_kernel::paging::PAGE_SIZE)
+            .ok_or(AcpiBootReadError::NoVirtualWindow)?;
+    }
+    if !window_found {
+        return Err(AcpiBootReadError::NoVirtualWindow);
+    }
+
+    let mut reader = CandidateAcpiReader {
+        candidate,
+        allocator,
+        memory_map,
+        physical_address_bits,
+        virtual_address_bits: cpu_info.active_linear_address_bits,
+        cache_layout,
+        pat,
+        normal_caching: cpu_info.normal_caching,
+        candidate_cr3,
+        previous_cr3,
+        virtual_address,
+    };
+    let mut scratch = [0u8; rustix_kernel::acpi::MAX_ACPI_STRUCTURE_SIZE];
+    rustix_kernel::acpi::read_madt(&mut reader, rsdp_physical_address, &mut scratch)
+        .map_err(AcpiBootReadError::Read)
 }
 
 fn harden_kernel_hhdm_aliases(
