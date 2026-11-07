@@ -67,10 +67,10 @@ The QEMU serial log showed the startup banner, HHDM offset, validated memory-map
 - [x] Convert ranges to half-open `[start, end)` physical intervals.
 - [x] Preserve usable, reserved, ACPI, bad-memory, bootloader-reclaimable, executable/module, framebuffer, and unknown region classifications.
 - [x] Reject the complete snapshot rather than continue with partial or invalid map metadata.
-- [x] Report baseline CPUID vendor/features and document the current COM1-only console.
+- [x] Report baseline CPUID vendor/features and document the initial COM1 console scope.
 - [x] Document that classifying a range does not transfer ownership or authorize access/reclamation.
 
-### Remaining proof and polish
+### Validation evidence and documented boundary
 
 - [x] Host tests cover malformed and boundary memory-map values, including empty input, capacity, zero length, overflow, overlap, adjacency, and unknown types.
 - [x] Build and boot the image with the current request-section/linker layout; the QEMU serial log showed the boot metadata and CPUID report.

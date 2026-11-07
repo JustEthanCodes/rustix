@@ -8,7 +8,7 @@ version = "0.1.0"
 
 [[package]]
 name = "rustix-kernel"
-version = "0.1.0"
+version = "0.1.0-milestone3-stable"
 dependencies = [
  "crabshell",
 ]
