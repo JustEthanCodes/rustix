@@ -1,0 +1,70 @@
+{
+  "cli_version": "0.13.1",
+  "checkpoint_id": "01M6VCAQ1BN0EFB3YCAPZT989V",
+  "strategy": "manual-commit",
+  "branch": "dev",
+  "checkpoints_count": 1,
+  "files_touched": [
+    ".github/workflows/ci.yml",
+    "AGENTS.md",
+    "Cargo.toml",
+    "docs/architecture/acpi.md",
+    "docs/architecture/boot.md",
+    "docs/architecture/drivers.md",
+    "docs/architecture/interrupts.md",
+    "docs/architecture/memory.md",
+    "docs/architecture/overview.md",
+    "docs/development/building.md",
+    "docs/development/testing.md",
+    "docs/index.md",
+    "docs/roadmap/README.md",
+    "justfile",
+    "scripts/__pycache__/boot.cpython-314.pyc",
+    "scripts/boot.py",
+    "src/arch/x86_64/apic.rs",
+    "src/arch/x86_64/context.rs",
+    "src/arch/x86_64/cpu.rs",
+    "src/arch/x86_64/interrupts.rs",
+    "src/arch/x86_64/keyboard.rs",
+    "src/arch/x86_64/mod.rs",
+    "src/arch/x86_64/serial.rs",
+    "src/heap.rs",
+    "src/input.rs",
+    "src/kernel_threads.rs",
+    "src/lib.rs",
+    "src/main.rs",
+    "src/paging.rs",
+    "src/scheduler.rs",
+    "src/shell.rs",
+    "src/time.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/0/metadata.json",
+      "transcript": "/0/full.jsonl",
+      "content_hash": "/0/content_hash.txt",
+      "prompt": "/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 0
+  },
+  "redaction": {
+    "replacements": 7,
+    "layers": {
+      "betterleaks": 0,
+      "connection_string": 0,
+      "credential_key": 0,
+      "credential_value": 0,
+      "credentialed_uri": 0,
+      "entropy": 7,
+      "key_context": 0,
+      "provider_token": 0,
+      "shell_stdin": 0
+    }
+  }
+}
