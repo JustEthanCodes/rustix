@@ -8,11 +8,12 @@ Rustix keeps privileged platform access in `src/arch/x86_64/`. Device-facing rou
 
 | Driver | Source | Status and limits |
 |---|---|---|
-| 16550-compatible COM1 serial | [`src/arch/x86_64/serial.rs`](../../src/arch/x86_64/serial.rs) | Initialized during `_start`; polling formatted output and non-blocking input for Crabshell; bounded transmit waits. |
+| 16550-compatible COM1 serial | [`src/arch/x86_64/serial.rs`](../../src/arch/x86_64/serial.rs) | Polling formatted output and early-boot input; after APIC setup, IRQ4 drains RX bytes into a bounded queue and wakes the cooperative shell. Bounded transmit waits remain in use. |
 | x86 port I/O primitives | [`src/arch/x86_64/io.rs`](../../src/arch/x86_64/io.rs) | Small unsafe `in`/`out` wrappers used by platform drivers. |
-| PS/2-compatible keyboard controller | [`src/arch/x86_64/keyboard.rs`](../../src/arch/x86_64/keyboard.rs) | Non-blocking raw-byte polling API; filters auxiliary-device and controller-error bytes. Not yet connected to a kernel input queue. |
+| PS/2-compatible keyboard controller | [`src/arch/x86_64/keyboard.rs`](../../src/arch/x86_64/keyboard.rs) | Bounded IRQ1 drain into a raw-scancode queue, plus non-blocking polling fallback; filters auxiliary-device and controller-error bytes. |
+| Local APIC, I/O APIC, and PIT | [`src/arch/x86_64/apic.rs`](../../src/arch/x86_64/apic.rs) | One-vCPU MADT-routed IRQ delivery; PIC routes remain masked. PIT supplies the approximately 100 Hz scheduler tick. |
 
-The keyboard routine assumes a legacy controller is present and enabled. It does not initialize the controller, decode scancode sets, support USB HID, or use interrupts. Callers must not spin waiting for input; use `try_read_scancode()` when the kernel has a suitable polling opportunity.
+The PS/2 driver assumes a legacy controller is present. Initialization uses bounded waits; raw scancodes are not translated, and USB HID is unsupported. UART and keyboard IRQ paths use bounded queues and notify the cooperative scheduler; polling remains available for early boot/fallback.
 
 ## Driver development rules
 
@@ -24,4 +25,4 @@ The keyboard routine assumes a legacy controller is present and enabled. It does
 
 ## Planned driver work
 
-Add a timer and interrupt-controller path before interrupt-driven keyboard input; establish locking and per-CPU rules before enabling concurrency. Then consider framebuffer/console output, PCI discovery, storage, and networking as independently reviewed drivers. No support for those devices is implied by this plan.
+`src/time.rs` provides host-tested PIT divisor selection and monotonic tick arithmetic; the x86_64 APIC driver programs the PIT and delivers live ticks. This is a monotonic tick source, not wall-clock time. Timer preemption and SMP require separately designed locking and per-CPU rules. Framebuffer/console output, PCI discovery, storage, and networking remain future drivers; no support for those devices is implied.

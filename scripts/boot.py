@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import select
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -197,7 +202,41 @@ def build_image() -> None:
     print(f"Created hybrid BIOS/UEFI image: {ISO_PATH.relative_to(ROOT)}")
 
 
-def smoke_test(timeout: int) -> None:
+def find_ovmf_firmware() -> tuple[Path, Path | None]:
+    """Find a known installed OVMF image or CODE/VARS pair."""
+    directories = (
+        Path("/usr/share/ovmf"),
+        Path("/usr/share/OVMF"),
+        Path("/usr/share/qemu"),
+        Path("/usr/share/edk2/ovmf"),
+    )
+    combined_names = ("OVMF.fd", "ovmf.fd")
+    for directory in directories:
+        for name in combined_names:
+            firmware = directory / name
+            if firmware.is_file():
+                return firmware.resolve(), None
+
+    for directory in directories:
+        for suffix in ("", "_4M"):
+            code = directory / f"OVMF_CODE{suffix}.fd"
+            variables = directory / f"OVMF_VARS{suffix}.fd"
+            if code.is_file() and variables.is_file():
+                return code.resolve(), variables.resolve()
+
+    raise BuildError(
+        "OVMF firmware was not found in standard system locations; "
+        "install the 'ovmf' package (for example, 'sudo apt install ovmf')"
+    )
+
+
+def smoke_test(
+    timeout: int,
+    *,
+    firmware_arguments: tuple[str, ...] = (),
+    additional_expected: tuple[str, ...] = (),
+    uefi: bool = False,
+) -> None:
     qemu = require_tool("qemu-system-x86_64")
     if not ISO_PATH.is_file():
         raise BuildError("boot image not found; run 'just image' first")
@@ -225,6 +264,7 @@ def smoke_test(timeout: int) -> None:
         "-no-reboot",
         "-no-shutdown",
     ]
+    command.extend(firmware_arguments)
 
     timed_out = False
     try:
@@ -245,10 +285,10 @@ def smoke_test(timeout: int) -> None:
         "Rustix kernel: x86_64 Rust bootstrap",
         "kernel HHDM aliases validated: text/rodata R/NX, data RW/NX, PAT preserved",
         "page-table transition passed:",
-        "kernel heap probe passed: alignment, reuse, deterministic exhaustion",
+        "kernel heap probe passed: bootstrap exhaustion, frame-backed growth, reuse",
         "crabshell: ready (volatile RAM filesystem)",
         "root@rustix:/home/rustix# ",
-    )
+    ) + additional_expected
     missing = [marker for marker in expected if marker not in output]
     tlb_flush_markers = (
         "page-table transition: global TLB flushed via CR4.PGE toggle",
@@ -263,8 +303,227 @@ def smoke_test(timeout: int) -> None:
             + f"\nSerial output:\n{output or '<empty>'}"
         )
 
-    print(f"QEMU boot smoke test passed (bounded to {timeout}s).")
+    label = "UEFI boot" if uefi else "boot"
+    print(f"QEMU {label} smoke test passed (bounded to {timeout}s).")
     print(f"Captured serial log: {serial_log.relative_to(ROOT)}")
+
+
+def uefi_smoke_test(timeout: int, extra_expected: tuple[str, ...] = ()) -> None:
+    firmware, variables_template = find_ovmf_firmware()
+    expected_madt = (
+        "ACPI MADT copied: LAPIC=0xfee00000, 1 local APICs, "
+        "1 I/O APICs, 5 overrides"
+    )
+
+    if variables_template is None:
+        smoke_test(
+            timeout,
+            firmware_arguments=("-bios", str(firmware)),
+            additional_expected=(
+                expected_madt,
+                "timer IRQ path passed: 3 ticks, EOI acknowledged",
+                *extra_expected,
+            ),
+            uefi=True,
+        )
+        return
+
+    TARGET_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ovmf-", dir=TARGET_DIR) as temporary_directory:
+        variables_copy = Path(temporary_directory) / "OVMF_VARS.fd"
+        shutil.copyfile(variables_template, variables_copy)
+        smoke_test(
+            timeout,
+            firmware_arguments=(
+                "-drive",
+                f"if=pflash,format=raw,readonly=on,file={firmware}",
+                "-drive",
+                f"if=pflash,format=raw,file={variables_copy}",
+            ),
+            additional_expected=(
+                expected_madt,
+                "timer IRQ path passed: 3 ticks, EOI acknowledged",
+                *extra_expected,
+            ),
+            uefi=True,
+        )
+
+
+def input_smoke_test(timeout: int) -> None:
+    qemu = require_tool("qemu-system-x86_64")
+    if not ISO_PATH.is_file():
+        raise BuildError("boot image not found; build the default image first")
+    firmware, variables_template = find_ovmf_firmware()
+    serial_log = TARGET_DIR / "rustix-qemu-input.log"
+    serial_log.parent.mkdir(parents=True, exist_ok=True)
+    serial_log.unlink(missing_ok=True)
+
+    # Keep the QMP Unix socket on the host filesystem; WSL /mnt/c does not
+    # support AF_UNIX socket paths.
+    with tempfile.TemporaryDirectory(prefix="input-smoke-") as temporary_directory:
+        temporary = Path(temporary_directory)
+        qmp_path = temporary / "qmp.sock"
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            serial_port = reservation.getsockname()[1]
+
+        firmware_arguments: list[str]
+        if variables_template is None:
+            firmware_arguments = ["-bios", str(firmware)]
+        else:
+            variables_copy = temporary / "OVMF_VARS.fd"
+            shutil.copyfile(variables_template, variables_copy)
+            firmware_arguments = [
+                "-drive",
+                f"if=pflash,format=raw,readonly=on,file={firmware}",
+                "-drive",
+                f"if=pflash,format=raw,file={variables_copy}",
+            ]
+
+        command = [
+            qemu,
+            "-machine",
+            "q35",
+            "-m",
+            "256M",
+            "-cdrom",
+            str(ISO_PATH),
+            "-boot",
+            "d",
+            "-display",
+            "none",
+            "-monitor",
+            "none",
+            "-serial",
+            f"tcp:127.0.0.1:{serial_port},server=on,wait=off",
+            "-qmp",
+            f"unix:{qmp_path},server=on,wait=off",
+            "-no-reboot",
+            "-no-shutdown",
+            *firmware_arguments,
+        ]
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        serial_connection: socket.socket | None = None
+        qmp_connection: socket.socket | None = None
+        serial_output = bytearray()
+        qmp_buffer = bytearray()
+
+        def connect_until_ready(address: str | tuple[str, int], family: int) -> socket.socket:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise BuildError(f"QEMU exited early with status {process.returncode}")
+                connection = socket.socket(family, socket.SOCK_STREAM)
+                connection.settimeout(0.2)
+                try:
+                    connection.connect(address)
+                    connection.setblocking(False)
+                    return connection
+                except OSError:
+                    connection.close()
+                    time.sleep(0.05)
+            raise BuildError("timed out connecting to QEMU serial/QMP sockets")
+
+        def read_qmp_message(deadline: float) -> dict[str, object]:
+            while b"\n" not in qmp_buffer:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BuildError("timed out waiting for a QMP response")
+                ready, _, _ = select.select([qmp_connection], [], [], remaining)
+                if not ready:
+                    raise BuildError("timed out waiting for a QMP response")
+                chunk = qmp_connection.recv(4096)
+                if not chunk:
+                    raise BuildError("QEMU closed its QMP connection")
+                qmp_buffer.extend(chunk)
+            line, _, rest = qmp_buffer.partition(b"\n")
+            qmp_buffer[:] = rest
+            return json.loads(line)
+
+        def qmp_execute(name: str, arguments: dict[str, object] | None = None) -> object:
+            request: dict[str, object] = {"execute": name}
+            if arguments is not None:
+                request["arguments"] = arguments
+            qmp_connection.sendall(json.dumps(request).encode("ascii") + b"\n")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                response = read_qmp_message(deadline)
+                if "error" in response:
+                    raise BuildError(f"QMP {name} failed: {response['error']}")
+                if "return" in response:
+                    return response["return"]
+            raise BuildError(f"timed out executing QMP command {name}")
+
+        def wait_for_serial(marker: str, deadline: float, start_at: int = 0) -> int:
+            encoded_marker = marker.encode("latin-1")
+            while encoded_marker not in serial_output[start_at:]:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BuildError(f"timed out waiting for serial marker {marker!r}")
+                ready, _, _ = select.select([serial_connection], [], [], min(remaining, 0.25))
+                if not ready:
+                    if process.poll() is not None:
+                        raise BuildError(f"QEMU exited early with status {process.returncode}")
+                    continue
+                chunk = serial_connection.recv(4096)
+                if not chunk:
+                    raise BuildError("QEMU closed its serial connection")
+                serial_output.extend(chunk)
+            return serial_output.index(encoded_marker, start_at) + len(encoded_marker)
+
+        try:
+            serial_connection = connect_until_ready(("127.0.0.1", serial_port), socket.AF_INET)
+            qmp_connection = connect_until_ready(str(qmp_path), socket.AF_UNIX)
+            qmp_connection.setblocking(False)
+            greeting = read_qmp_message(time.monotonic() + 3)
+            if "QMP" not in greeting:
+                raise BuildError("QEMU returned an invalid QMP greeting")
+            qmp_execute("qmp_capabilities")
+
+            deadline = time.monotonic() + timeout
+            offset = wait_for_serial("root@rustix:/home/rustix# ", deadline)
+            serial_connection.sendall(b"help\r")
+            offset = wait_for_serial("Crabshell commands:", deadline, offset)
+            offset = wait_for_serial("root@rustix:/home/rustix# ", deadline, offset)
+            qmp_execute("human-monitor-command", {"command-line": "sendkey a"})
+            wait_for_serial("PS/2 raw scancode IRQ: 0x1e", deadline, offset)
+
+            output = serial_output.decode("latin-1")
+            expected = (
+                "timer IRQ path passed: 3 ticks, EOI acknowledged",
+                "interrupt-driven input: UART RX ready, PS/2 raw scancodes ready",
+                "kernel shell thread runtime: cooperative input wait",
+                "kernel heap probe passed: bootstrap exhaustion, frame-backed growth, reuse",
+                "Crabshell commands:",
+                "PS/2 raw scancode IRQ: 0x1e",
+            )
+            missing = [marker for marker in expected if marker not in output]
+            if missing:
+                raise BuildError(
+                    "QEMU input smoke missed serial markers: "
+                    + ", ".join(repr(marker) for marker in missing)
+                )
+            print("QEMU UART IRQ, PS/2 IRQ, and scheduler-backed input smoke passed.")
+        finally:
+            serial_log.write_bytes(serial_output)
+            if serial_connection is not None:
+                serial_connection.close()
+            if qmp_connection is not None:
+                qmp_connection.close()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+
+    print(f"Captured input serial log: {serial_log.relative_to(ROOT)}")
 
 
 def fault_smoke_test(kind: str, timeout: int) -> None:
@@ -390,6 +649,72 @@ def frame_smoke_workflow(timeout: int) -> None:
     print("Restored the default release kernel and ISO after the HHDM frame probe.")
 
 
+def active_map_smoke_workflow(timeout: int) -> None:
+    failure: BuildError | OSError | subprocess.SubprocessError | None = None
+    try:
+        build_kernel(("probe-active-mapping",))
+        build_image()
+        smoke_test(timeout)
+        serial_log = TARGET_DIR / "rustix-qemu-serial.log"
+        output = serial_log.read_text(encoding="latin-1") if serial_log.exists() else ""
+        marker = "active mapping probe passed: mapped, accessed, unmapped, reclaimed frame"
+        if marker not in output:
+            raise BuildError(
+                "QEMU did not report successful active mapping; "
+                f"missing serial marker {marker!r}\nSerial output:\n{output}"
+            )
+        print("QEMU active owned-page mapping/unmapping probe passed.")
+    except (BuildError, OSError, subprocess.SubprocessError) as error:
+        failure = error
+
+    try:
+        build_kernel()
+        build_image()
+    except (BuildError, OSError, subprocess.SubprocessError) as restore_error:
+        if failure is not None:
+            raise BuildError(
+                f"active mapping workflow failed ({failure}); restoring the default image "
+                f"also failed ({restore_error})"
+            ) from restore_error
+        raise
+
+    if failure is not None:
+        raise BuildError(
+            f"active mapping workflow failed; the default release image was restored: {failure}"
+        ) from failure
+    print("Restored the default release kernel and ISO after the active mapping probe.")
+
+
+def thread_smoke_workflow(timeout: int) -> None:
+    failure: BuildError | OSError | subprocess.SubprocessError | None = None
+    try:
+        build_kernel(("probe-kernel-threads",))
+        build_image()
+        uefi_smoke_test(
+            timeout,
+            ("cooperative thread path passed: yield, event wakeup, timed sleep, stack guards",),
+        )
+    except (BuildError, OSError, subprocess.SubprocessError) as error:
+        failure = error
+
+    try:
+        build_kernel()
+        build_image()
+    except (BuildError, OSError, subprocess.SubprocessError) as restore_error:
+        if failure is not None:
+            raise BuildError(
+                f"thread smoke failed ({failure}); restoring the default image "
+                f"also failed ({restore_error})"
+            ) from restore_error
+        raise
+
+    if failure is not None:
+        raise BuildError(
+            f"thread smoke failed; the default release image was restored: {failure}"
+        ) from failure
+    print("Restored the default release kernel and ISO after the thread smoke.")
+
+
 def fault_smoke_workflow(timeout: int) -> None:
     tests = (
         ("page-fault", "inject-page-fault"),
@@ -490,10 +815,26 @@ def main() -> int:
     subparsers.add_parser("image", help="create a pinned Limine BIOS/UEFI hybrid ISO")
     smoke = subparsers.add_parser("smoke", help="boot the ISO and check its serial output")
     smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
+    uefi_smoke = subparsers.add_parser(
+        "uefi-smoke", help="boot the ISO with installed OVMF firmware and check ACPI"
+    )
+    uefi_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
     frame_smoke = subparsers.add_parser(
         "frame-smoke", help="probe HHDM access and an inactive candidate root in QEMU"
     )
     frame_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
+    active_map_smoke = subparsers.add_parser(
+        "active-map-smoke", help="probe active owned-page mapping in QEMU, then restore the image"
+    )
+    active_map_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
+    thread_smoke = subparsers.add_parser(
+        "thread-smoke", help="test cooperative kernel threads with OVMF, then restore the default image"
+    )
+    thread_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
+    input_smoke = subparsers.add_parser(
+        "input-smoke", help="test UART and PS/2 IRQ input waking the shell with OVMF"
+    )
+    input_smoke.add_argument("--timeout", type=int, default=30, help="QEMU time limit in seconds")
     fault_smoke = subparsers.add_parser(
         "fault-smoke", help="test fatal exceptions in QEMU, then restore the default image"
     )
@@ -513,10 +854,26 @@ def main() -> int:
             if args.timeout <= 0:
                 raise BuildError("--timeout must be a positive number of seconds")
             frame_smoke_workflow(args.timeout)
+        elif args.command == "active-map-smoke":
+            if args.timeout <= 0:
+                raise BuildError("--timeout must be a positive number of seconds")
+            active_map_smoke_workflow(args.timeout)
+        elif args.command == "thread-smoke":
+            if args.timeout <= 0:
+                raise BuildError("--timeout must be a positive number of seconds")
+            thread_smoke_workflow(args.timeout)
+        elif args.command == "input-smoke":
+            if args.timeout <= 0:
+                raise BuildError("--timeout must be a positive number of seconds")
+            input_smoke_test(args.timeout)
         elif args.command == "fault-smoke":
             if args.timeout <= 0:
                 raise BuildError("--timeout must be a positive number of seconds")
             fault_smoke_workflow(args.timeout)
+        elif args.command == "uefi-smoke":
+            if args.timeout <= 0:
+                raise BuildError("--timeout must be a positive number of seconds")
+            uefi_smoke_test(args.timeout)
         else:
             if args.timeout <= 0:
                 raise BuildError("--timeout must be a positive number of seconds")

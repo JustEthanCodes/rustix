@@ -18,16 +18,16 @@ The source contains:
 - A separate allocation-free `no_std` `crabshell` parser crate and a kernel-mode COM1 shell frontend.
 - A volatile, fixed-capacity RAM filesystem used by the shell.
 - A validated, fixed-capacity boot memory-map snapshot, CPUID/address-width reporting, read-only CR0 caching-mode reporting, and gated read-only EFER.NXE/IA32_PAT/MTRR reporting.
-- A fixed-capacity physical frame allocator retained in `BootInfo`; Crabshell's `meminfo` command reports counts. The opt-in `probe-hhdm-frame` QEMU feature allocates, validates, writes, reads, clears, and returns one `Usable` frame through Limine's HHDM contract. `src/paging.rs` has a bounded candidate-root builder that owns allocator-issued table/leaf tokens and maps/unmaps 4 KiB leaves transactionally. The default boot path clones and activates the full reachable inherited hierarchy, hardens kernel-image HHDM aliases to R/NX or RW/NX while preserving PAT bits, and retains the active table tokens. A 256 KiB BSS-backed global heap is installed; it has fixed capacity and does not grow from frames.
+- A fixed-capacity physical frame allocator retained in `BootInfo`; Crabshell's `meminfo` command reports counts. `src/paging.rs` provides a bounded candidate-root builder with transactional owned-page mappings, and the default path clones and activates the inherited hierarchy while hardening kernel-image HHDM aliases and retaining page-table tokens. The global heap starts with a 256 KiB BSS arena and has a bounded frame-backed extension of up to 1 MiB in a reserved virtual range.
 - Pure 4 KiB mapping-range validation, leaf-PTE bit encoding, PAT layout parsing, and host-tested MTRR/PAT policy in `src/paging.rs`; these helpers check alignment, address widths, canonical virtual ranges, W^X, NXE input, PAT indices, captured-register validity, MTRR overlap rules, and Intel SDM Table 11-7 effective types under normal caching. Discontinuous variable-MTRR masks are explicitly unsupported. A pure selector chooses a PAT index only when its effective type remains uniform across all MTRR boundaries in an aligned physical range, and range-bound selected attributes can encode 4 KiB leaves. The bounded candidate builder stores its unique mutable table-memory backend borrow, uses allocator-issued `Frame` tokens for table pages and leaf mappings, restricts walks to owned tables, and rolls back failures. Active candidates reject mutation and release. Boot captures CR0 caching mode, EFER.NXE, `IA32_PAT`, and a bounded MTRR snapshot read-only when supported, validates the captured state, and reports a diagnostic PA 0 resolution. QEMU checks the requested 256 KiB stack, active CR3 clone, kernel-image HHDM alias permissions/cache preservation, and heap allocation behavior; the old root and its leaf frames are not reclaimed.
-- Bootstrap GDT/TSS/IDT setup and fatal exception handlers for vectors 0–31. Double faults use an IST stack and page faults report CR2. Opt-in QEMU tests inject a page fault and invalid opcode and verify diagnostics plus fatal halt; maskable IRQs remain disabled and exceptions are not recoverable.
+- Bootstrap GDT/TSS/IDT setup, fatal exception handlers for vectors 0–31, and a validated single-vCPU xAPIC/I/O APIC path with masked-first IRQ routes, EOI, spurious/unexpected-vector policy, and a PIT tick. Double faults use an IST stack and page faults report CR2. OVMF validation covers timer, UART, and PS/2 IRQ delivery; opt-in QEMU tests inject a page fault and invalid opcode and verify diagnostics plus fatal halt. Exceptions remain unrecoverable.
 
 Important incomplete work:
 
 - Milestone 0's local exit criteria were met on 2026-10-16: `just verify` passed from both the working tree and a clean detached worktree in WSL2 Ubuntu 24.04. The detached worktree had an empty `target` directory, so the run exercised fresh Limine download/host-tool compilation, formatting, 19 host tests, target check, optimized build, image creation, and the 20-second QEMU prompt smoke test. Hosted CI has not been observed.
 - A separate interactive `just run` session exercised directory navigation and create/write/append/read/copy/move/list/remove operations; `cp` replaced an existing destination, `rmdir` rejected a nonempty directory and succeeded after its child was removed, and unsupported `memtest` was rejected as expected. Boot snapshot tests and QEMU boot-metadata reporting were exercised. Structural checks still cannot prove that a Limine-provided non-null pointer is mapped or readable; that remains a loader trust boundary.
 - Milestone 2's local exit criteria were met on 2026-10-24 after final review and successful `just verify`, `just frame-smoke`, and `just fault-smoke` runs. The frame allocator specifies token ownership and preserves the token on failed deallocation; unique allocator-instance use is still caller-enforced. The active root is an allocator-owned clone of Limine's reachable hierarchy, with critical translations checked, kernel-image HHDM aliases set R/NX or RW/NX while PAT bits are preserved, and CR3 transitions flushing the current translations and global entries when PGE is enabled. QEMU exercised the PGE-clear CR3 reload path; the PGE-toggle path is statically reviewed but not exercised by this configuration. QEMU also exercised the 256 KiB requested stack, fixed BSS heap alignment/reuse/exhaustion, frame probes, and fatal page-fault/invalid-opcode paths. Host tests cover clone/table ownership, huge-page splitting, active-state guards, frame rollback, and heap behavior. Hosted CI and physical-hardware validation remain unobserved. The old root and inherited leaf frames are retained; there is no clean-room address-space policy, active general mapping service, frame reclamation, or IRQ-safe heap path.
-- There is no scheduler, userspace, syscall ABI, persistent filesystem, user/kernel isolation, or general IRQ subsystem.
+- Milestone 3's local exit criteria were met on 2026-11-07: `just verify` passed with 127 host tests, BIOS/OVMF boot, active mapping/TLB, cooperative thread, and UART/PS/2 input QEMU smokes. The kernel now has single-vCPU cooperative scheduling and scheduler-backed interrupt input; timer preemption, SMP, userspace, a syscall ABI, persistent filesystem, and user/kernel isolation remain absent.
 
 Never advance status or check off a roadmap item merely because source code or an interface exists. Update `docs/roadmap/README.md` only to reflect implementation and validation actually achieved.
 
@@ -54,13 +54,16 @@ When code and documentation disagree, inspect the implementation, resolve the di
 - `src/memory.rs` — allocation-free memory-map, address-width, canonical-address, Limine HHDM-range, and linker-defined kernel segment validation.
 - `src/frame.rs` — bounded physical-frame allocator core; it only uses validated `Usable` ranges, reserves the first MiB, and has fixed range metadata.
 - `src/paging.rs` — checked mapping/cache policy, inherited page-table walking, and a bounded candidate-root builder. The default boot path activates a cloned hierarchy and retains its owned table tokens; the HHDM backend accesses only complete allocator-owned `Usable` frames after checked address derivation.
-- `src/shell.rs` — serial line editor and kernel-side Crabshell executor.
+- `src/shell.rs` — kernel-side Crabshell executor using UART IRQ input and cooperative event waits when the runtime is available; polling remains fallback.
 - `src/vfs.rs` — fixed-capacity volatile RAM filesystem and host-side tests.
 - `crates/crabshell/` — separate `no_std` parser crate. It has no terminal, filesystem, or kernel dependencies.
-- `src/arch/x86_64/serial.rs` — polling COM1 driver for shell input/output.
-- `src/arch/x86_64/interrupts.rs` — bootstrap GDT/TSS/IDT, assembly stubs, and fatal exception diagnostics.
+- `src/arch/x86_64/serial.rs` — COM1 output/polling plus bounded IRQ RX queue.
+- `src/arch/x86_64/interrupts.rs` — bootstrap GDT/TSS/IDT, exception and device IRQ stubs/dispatch, and fatal diagnostics.
 - `src/arch/x86_64/cpu.rs` — CPUID identification and selected feature reporting.
-- `src/arch/x86_64/keyboard.rs` — raw, non-blocking PS/2-compatible scancode polling; not an input subsystem.
+- `src/arch/x86_64/keyboard.rs` — bounded IRQ and polling access to raw PS/2 scancodes.
+- `src/arch/x86_64/apic.rs` — validated single-vCPU xAPIC/I/O APIC setup and PIT timer routing.
+- `src/input.rs` — bounded SPSC UART/keyboard queues and IRQ-to-scheduler pending-event state.
+- `src/kernel_threads.rs`, `src/scheduler.rs`, and `src/time.rs` — cooperative context runtime, host-testable scheduling policy, and monotonic PIT tick arithmetic.
 - `src/arch/x86_64/io.rs` — narrow port-I/O wrappers.
 - `linker.ld`, `.cargo/config.toml`, `rust-toolchain.toml` — target, linker, and toolchain configuration.
 - `limine.conf`, `scripts/boot.py` — boot configuration and pinned image/emulator workflow.
@@ -98,7 +101,7 @@ Before changing boot or memory code, account for these facts:
 - Only regions classified `Usable` may enter the frame allocator. ACPI, bootloader-reclaimable, framebuffer, reserved, unknown, and other types are not free frames.
 - A `Frame` is a physical address, not a dereferenceable pointer. HHDM access is allowed only through checked full-frame token-based paths that rely on the documented Limine contract; never access arbitrary physical addresses. Do not change CR3 until a complete, reviewed transition mapping policy and ownership proof exist.
 - The kernel currently inherits Limine's page tables. Do not casually replace or mutate them: preserve the executing kernel, boot stack, `BootInfo`, request/response data, exception stacks, and mappings needed to continue execution.
-- The exception setup is fatal-only. It does not enable maskable interrupts, configure a PIC/APIC, or provide recovery. Do not call `sti` or claim interrupt support without an IRQ design and tests.
+- Exceptions remain fatal-only. The single-vCPU APIC path enables only configured, registered routes after IRQ dispatch/EOI setup and tests. Do not broaden IRQ use or add preemption without a reviewed ownership, synchronization, and validation plan.
 - The shell and VFS run in ring 0 and are not isolated or secure.
 
 For hardware changes, document assumptions about CPU mode, selectors, stacks, page permissions, interrupt state, and failure handling. Avoid new architecture mechanisms that cannot be statically reviewed or validated.
@@ -122,10 +125,11 @@ just check
 just build
 just image
 just smoke
+just input-smoke
 just verify
 ```
 
-`just test` runs host-side library tests (memory-map validation, frame allocator, VFS, and Crabshell parser). `just check` checks `x86_64-unknown-none`; `just build` links the optimized ELF. `just verify` includes formatting, host tests, target check, pinned Limine image creation, and QEMU prompt smoke test. Image/boot checks need Python, `xorriso`, QEMU, the Rust target, and network access for the first pinned Limine download; Linux/WSL also needs `cc` to build Limine's host utility.
+`just test` runs host-side library tests, including ACPI, scheduler, input-queue, paging, frame allocator, heap, VFS, and Crabshell coverage. `just check` checks `x86_64-unknown-none`; `just build` links the optimized ELF. `just verify` includes formatting, host tests, target check, pinned Limine image creation, BIOS/OVMF boot, active-map, cooperative-thread, and UART/PS/2 input QEMU smokes. Image/boot checks need Python, `xorriso`, QEMU, OVMF, the Rust target, and network access for the first pinned Limine download; Linux/WSL also needs `cc` to build Limine's host utility.
 
 For changes to `src/main.rs`, `src/boot.rs`, linker/request configuration, `src/arch/x86_64/`, `src/frame.rs`, or paging/heap code, the intended full validation is `just verify`. If the environment does not permit a check, report the exact blocker and leave the corresponding roadmap criterion pending.
 

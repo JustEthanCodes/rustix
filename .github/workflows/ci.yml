@@ -18,7 +18,7 @@ jobs:
       - name: Install image and emulator tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y build-essential just python-is-python3 qemu-system-x86 xorriso
+          sudo apt-get install --no-install-recommends -y build-essential just ovmf python-is-python3 qemu-system-x86 xorriso
 
       - name: Run Rust checks and boot smoke test
         run: just verify

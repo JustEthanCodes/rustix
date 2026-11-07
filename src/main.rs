@@ -4,17 +4,30 @@
 #[cfg(any(
     all(feature = "inject-page-fault", feature = "inject-invalid-opcode"),
     all(feature = "inject-page-fault", feature = "probe-hhdm-frame"),
-    all(feature = "inject-invalid-opcode", feature = "probe-hhdm-frame")
+    all(feature = "inject-invalid-opcode", feature = "probe-hhdm-frame"),
+    all(feature = "probe-kernel-threads", feature = "inject-page-fault"),
+    all(feature = "probe-kernel-threads", feature = "inject-invalid-opcode"),
+    all(feature = "probe-kernel-threads", feature = "probe-hhdm-frame"),
+    all(feature = "probe-kernel-threads", feature = "probe-active-mapping")
 ))]
 compile_error!("opt-in QEMU diagnostic features are mutually exclusive");
 
 mod arch;
 mod boot;
+mod kernel_threads;
 mod shell;
 
+use core::hint::spin_loop;
 use core::panic::PanicInfo;
+use rustix_kernel::time::{AtomicTickCounter, PitRate};
 use rustix_kernel::vfs::RamFs;
 
+const LOCAL_APIC_VIRTUAL_ADDRESS: u64 = 0xffff_c100_0000_0000;
+const IO_APIC_VIRTUAL_ADDRESS: u64 = LOCAL_APIC_VIRTUAL_ADDRESS + rustix_kernel::paging::PAGE_SIZE;
+const KERNEL_HEAP_GROWTH_VIRTUAL_BASE: u64 = 0xffff_c200_0000_0000;
+const KERNEL_HEAP_GROWTH_MAX_PAGES: usize = 256;
+
+static BOOTSTRAP_TIMER_TICKS: AtomicTickCounter = AtomicTickCounter::new();
 static mut RAM_FILESYSTEM: RamFs = RamFs::new();
 
 #[global_allocator]
@@ -135,13 +148,179 @@ unsafe impl rustix_kernel::paging::CandidatePageTableMemory for LimineHhdmCandid
         // range; this writes one entry without creating a Rust reference.
         unsafe { entry.write_volatile(value) };
     }
+
+    unsafe fn invalidate_page(&mut self, virtual_address: u64) {
+        // SAFETY: Active mapping callers provide the current virtual page and run
+        // at CPL 0 with exclusive local page-table ownership.
+        unsafe {
+            core::arch::asm!(
+                "invlpg [{}]",
+                in(reg) virtual_address,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+}
+
+struct KernelHeapMappingContext {
+    candidate: *mut (),
+    allocator: *mut rustix_kernel::frame::FrameAllocator,
+    cpu_info: *const arch::x86_64::cpu::CpuInfo,
+}
+
+unsafe fn map_kernel_heap_pages(
+    opaque_context: *mut (),
+    first_page: usize,
+    page_count: usize,
+) -> bool {
+    use rustix_kernel::paging::{
+        validate_mapping_range, CachePolicy, CandidatePageTables, EffectiveMemoryType, MtrrState,
+        PagePermissions, PatLayout, PAGE_SIZE,
+    };
+
+    if page_count == 0
+        || first_page
+            .checked_add(page_count)
+            .is_none_or(|end| end > KERNEL_HEAP_GROWTH_MAX_PAGES)
+    {
+        return false;
+    }
+
+    // SAFETY: The caller configures this callback only after the active root,
+    // allocator, CPU snapshot, and local context are all live. The boot path is
+    // single-vCPU and never returns from the stack containing that context.
+    let state = unsafe { &mut *opaque_context.cast::<KernelHeapMappingContext>() };
+    // SAFETY: These pointers refer to the retained local candidate and BootInfo
+    // members. The callback is synchronous and never stores a derived reference.
+    let candidate = unsafe {
+        &mut *state
+            .candidate
+            .cast::<CandidatePageTables<'static, LimineHhdmCandidateMemory<'static>>>()
+    };
+    // SAFETY: The frame allocator and CPU snapshot remain owned by retained
+    // BootInfo; this callback runs on the sole CPU with the heap lock held.
+    let allocator = unsafe { &mut *state.allocator };
+    // SAFETY: The CPU snapshot is immutable and remains live with BootInfo.
+    let cpu_info = unsafe { &*state.cpu_info };
+
+    let flags: u64;
+    // SAFETY: The callback runs at CPL 0; save IF before disabling local IRQs
+    // while the active page tables and allocator are mutated.
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    let result = (|| {
+        let physical_width = cpu_info.physical_address_bits?;
+        let pat = PatLayout::from_msr_value(cpu_info.pat_msr_value?).ok()?;
+        let mtrrs = match &cpu_info.mtrr {
+            MtrrState::Captured(registers) => registers.validated_layout(physical_width).ok()?,
+            _ => return None,
+        };
+        let permissions = PagePermissions {
+            writable: true,
+            executable: false,
+            user_accessible: false,
+        };
+        let mut mapped = 0usize;
+        for page in first_page..first_page + page_count {
+            let virtual_address = KERNEL_HEAP_GROWTH_VIRTUAL_BASE
+                .checked_add((page as u64).checked_mul(PAGE_SIZE)?)?;
+            let frame = match allocator.allocate() {
+                Some(frame) => frame,
+                None => {
+                    rollback_kernel_heap_pages(candidate, allocator, first_page, mapped);
+                    return None;
+                }
+            };
+            let mapping = match validate_mapping_range(
+                virtual_address,
+                frame.address(),
+                PAGE_SIZE,
+                permissions,
+                Some(physical_width),
+                cpu_info.active_linear_address_bits,
+            ) {
+                Ok(mapping) => mapping,
+                Err(_) => {
+                    deallocate_kernel_heap_frame(allocator, frame);
+                    rollback_kernel_heap_pages(candidate, allocator, first_page, mapped);
+                    return None;
+                }
+            };
+            let attributes = match mapping.select_cache_attributes(
+                CachePolicy::WriteBack,
+                pat,
+                &mtrrs,
+                cpu_info.normal_caching,
+            ) {
+                Ok(attributes) if attributes.effective_type() == EffectiveMemoryType::WriteBack => {
+                    attributes
+                }
+                _ => {
+                    deallocate_kernel_heap_frame(allocator, frame);
+                    rollback_kernel_heap_pages(candidate, allocator, first_page, mapped);
+                    return None;
+                }
+            };
+            // SAFETY: IF is clear, the current candidate owns the active root,
+            // and the allocator-issued frame is mapped RW/NX with local TLB
+            // invalidation before its token becomes page-table-owned.
+            if let Err(failure) =
+                unsafe { candidate.map_owned_page_active(allocator, frame, mapping, attributes) }
+            {
+                deallocate_kernel_heap_frame(allocator, failure.frame);
+                rollback_kernel_heap_pages(candidate, allocator, first_page, mapped);
+                return None;
+            }
+            mapped += 1;
+        }
+        Some(())
+    })()
+    .is_some();
+    if flags & (1 << 9) != 0 {
+        // SAFETY: The mapping transaction is complete or fully rolled back.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    }
+    result
+}
+
+fn rollback_kernel_heap_pages(
+    candidate: &mut rustix_kernel::paging::CandidatePageTables<
+        'static,
+        LimineHhdmCandidateMemory<'static>,
+    >,
+    allocator: &mut rustix_kernel::frame::FrameAllocator,
+    first_page: usize,
+    mapped_pages: usize,
+) {
+    use rustix_kernel::paging::PAGE_SIZE;
+
+    for page in (first_page..first_page + mapped_pages).rev() {
+        let virtual_address = KERNEL_HEAP_GROWTH_VIRTUAL_BASE + page as u64 * PAGE_SIZE;
+        // SAFETY: The pages belong to this transaction in the current active
+        // root; unmapping invalidates their TLB entries before token return.
+        let frame = unsafe { candidate.unmap_owned_page_active(virtual_address) }
+            .unwrap_or_else(|_| halt_forever());
+        deallocate_kernel_heap_frame(allocator, frame);
+    }
+}
+
+fn deallocate_kernel_heap_frame(
+    allocator: &mut rustix_kernel::frame::FrameAllocator,
+    frame: rustix_kernel::frame::Frame,
+) {
+    if allocator.deallocate(frame).is_err() {
+        halt_forever();
+    }
 }
 
 // Error payloads provide boot diagnostics through the derived `Debug` output.
 #[allow(dead_code)]
 #[derive(Debug)]
 enum AcpiMappingError {
-    InvalidAcpiSpan(rustix_kernel::memory::AcpiSpanError),
+    InvalidAcpiSpan {
+        physical_start: u64,
+        length: usize,
+        error: rustix_kernel::memory::AcpiSpanError,
+    },
     InvalidMapping(rustix_kernel::paging::MappingError),
     CandidateMap(
         rustix_kernel::paging::CandidateMapErrorKind<rustix_kernel::memory::HhdmAddressError>,
@@ -195,9 +374,12 @@ impl CandidateAcpiReader<'_, '_, '_> {
         if output.is_empty() {
             return Ok(());
         }
-        let length = u64::try_from(output.len()).map_err(|_| {
-            AcpiMappingError::InvalidAcpiSpan(rustix_kernel::memory::AcpiSpanError::AddressOverflow)
-        })?;
+        let length =
+            u64::try_from(output.len()).map_err(|_| AcpiMappingError::InvalidAcpiSpan {
+                physical_start,
+                length: output.len(),
+                error: rustix_kernel::memory::AcpiSpanError::AddressOverflow,
+            })?;
         let span = if allow_legacy_rsdp {
             self.memory_map.validate_rsdp_span(
                 physical_start,
@@ -211,7 +393,11 @@ impl CandidateAcpiReader<'_, '_, '_> {
                 Some(self.physical_address_bits),
             )
         }
-        .map_err(AcpiMappingError::InvalidAcpiSpan)?;
+        .map_err(|error| AcpiMappingError::InvalidAcpiSpan {
+            physical_start,
+            length: output.len(),
+            error,
+        })?;
         let permissions = PagePermissions {
             writable: false,
             executable: false,
@@ -220,9 +406,11 @@ impl CandidateAcpiReader<'_, '_, '_> {
         let mut copied = 0usize;
         while copied < output.len() {
             let current_physical = physical_start.checked_add(copied as u64).ok_or(
-                AcpiMappingError::InvalidAcpiSpan(
-                    rustix_kernel::memory::AcpiSpanError::AddressOverflow,
-                ),
+                AcpiMappingError::InvalidAcpiSpan {
+                    physical_start,
+                    length: output.len(),
+                    error: rustix_kernel::memory::AcpiSpanError::AddressOverflow,
+                },
             )?;
             let physical_page = current_physical & !(PAGE_SIZE - 1);
             let page_offset = current_physical - physical_page;
@@ -360,7 +548,7 @@ pub extern "C" fn rustix_start(entry_rsp: u64) -> ! {
 
 fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
     use rustix_kernel::paging::{
-        encode_cr3_value, CandidatePageTables, PageWalkConfig, PageWalkOutcome,
+        encode_cr3_value, CandidatePageTables, PageWalkConfig, PageWalkOutcome, PAGE_SIZE,
     };
 
     let physical_address_bits = match boot_info.cpu_info.physical_address_bits {
@@ -565,11 +753,27 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
             Err(error) => kprintln!("ACPI MADT unavailable: {:?}", error),
         }
     }
+    let apic_virtual_addresses = match boot_info.acpi_madt.as_ref() {
+        Some(madt) => match map_bootstrap_apic_pages(
+            &mut candidate,
+            &mut boot_info.frame_allocator,
+            &boot_info.cpu_info,
+            madt,
+        ) {
+            Ok(addresses) => Some(addresses),
+            Err(error) => {
+                kprintln!("APIC MMIO mappings unavailable: {}", error);
+                None
+            }
+        },
+        None => None,
+    };
     // SAFETY: The candidate is a complete clone of every present inherited
     // hierarchy entry, with all referenced intermediate tables owned and the
     // critical code/data/stack paths compared before this point. The inherited
     // root's paging mode, address widths, PAT/MTRR state, and low CR3 mode are
-    // preserved; interrupts are disabled from bootstrap initialization onward.
+    // preserved; interrupts remain disabled through this transition and are enabled
+    // later only after the selected APIC routes and handlers are ready.
     let global_tlb_flushed = unsafe { arch::x86_64::cpu::write_cr3_with_global_flush(new_cr3) };
     if global_tlb_flushed {
         kprintln!("page-table transition: global TLB flushed via CR4.PGE toggle");
@@ -610,20 +814,576 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
         candidate_root,
         candidate.table_count()
     );
+
+    #[cfg(feature = "probe-active-mapping")]
+    {
+        if let Err(error) = probe_active_mapping(
+            &mut candidate,
+            &mut boot_info.frame_allocator,
+            &boot_info.cpu_info,
+        ) {
+            kprintln!("active mapping probe failed: {}", error);
+            halt_forever();
+        }
+        kprintln!("active mapping probe passed: mapped, accessed, unmapped, reclaimed frame");
+    }
+
+    let mut vector_allocator = rustix_kernel::irq::InterruptVectorAllocator::new();
+    let mut timer_vector = None;
+    let mut timer_verified = false;
+    if let (Some(madt), Some((local_apic_virtual, io_apic_virtual))) =
+        (boot_info.acpi_madt.as_ref(), apic_virtual_addresses)
+    {
+        if let Some(vector) = vector_allocator.allocate() {
+            let vector_number = vector.number();
+            timer_vector = Some(vector);
+            // SAFETY: Boot is single-core with IF=0. The cloned root is active,
+            // and these virtual addresses were validated supervisor RW/NX/UC
+            // mappings of the exact MADT-described APIC pages.
+            match unsafe {
+                arch::x86_64::apic::initialize(
+                    madt,
+                    local_apic_virtual,
+                    io_apic_virtual,
+                    arch::x86_64::cpu::bootstrap_apic_id(),
+                )
+            } {
+                Err(error) => kprintln!(
+                    "APIC initialization failed; IRQs remain disabled: {:?}",
+                    error
+                ),
+                Ok(()) => {
+                    // SAFETY: APIC initialization masked every route, including
+                    // PIT IRQ0; the handler is ready before the route is armed.
+                    match unsafe {
+                        arch::x86_64::interrupts::register_irq_handler(
+                            vector_number,
+                            bootstrap_timer_irq,
+                        )
+                    } {
+                        Err(error) => {
+                            kprintln!("timer IRQ handler registration failed: {:?}", error)
+                        }
+                        Ok(()) => match PitRate::for_frequency(100) {
+                            Err(error) => kprintln!("PIT rate selection failed: {:?}", error),
+                            Ok(rate) => {
+                                // SAFETY: The source remains masked through
+                                // configuration and the ISR is already registered.
+                                let configured = unsafe {
+                                    arch::x86_64::apic::configure_pit_timer(
+                                        vector_number,
+                                        rate.divisor(),
+                                    )
+                                };
+                                match configured {
+                                    Err(error) => {
+                                        kprintln!("PIT configuration failed: {:?}", error)
+                                    }
+                                    Ok(()) => {
+                                        // SAFETY: Only the validated IRQ0 route is
+                                        // unmasked after its handler is installed.
+                                        match unsafe { arch::x86_64::apic::unmask_pit_timer() } {
+                                            Err(error) => {
+                                                kprintln!("PIT route unmask failed: {:?}", error)
+                                            }
+                                            Ok(()) => {
+                                                // SAFETY: IDT/APIC/EOI/handler are
+                                                // ready, every other route is masked,
+                                                // and this ISR neither allocates nor
+                                                // touches non-atomic shared state.
+                                                unsafe {
+                                                    core::arch::asm!(
+                                                        "sti",
+                                                        options(nomem, nostack)
+                                                    );
+                                                }
+                                                let target =
+                                                    BOOTSTRAP_TIMER_TICKS.ticks().saturating_add(3);
+                                                let mut observed = false;
+                                                for _ in 0..100_000_000 {
+                                                    if BOOTSTRAP_TIMER_TICKS.ticks() >= target {
+                                                        observed = true;
+                                                        break;
+                                                    }
+                                                    spin_loop();
+                                                }
+                                                if observed {
+                                                    timer_verified = true;
+                                                    kprintln!("timer IRQ path passed: 3 ticks, EOI acknowledged");
+                                                } else {
+                                                    // SAFETY: Stop the sole unmasked
+                                                    // source before continuing without
+                                                    // a verified runtime clock.
+                                                    unsafe {
+                                                        core::arch::asm!(
+                                                            "cli",
+                                                            options(nomem, nostack)
+                                                        );
+                                                        let _ =
+                                                            arch::x86_64::apic::mask_pit_timer();
+                                                    }
+                                                    kprintln!("timer IRQ validation timed out; interrupts disabled");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        } else {
+            kprintln!("no device IRQ vector available; interrupts remain disabled");
+        }
+    } else {
+        kprintln!("validated MADT/APIC mappings unavailable; polling mode retained");
+    }
+    let input_irq_flags: u64;
+    // SAFETY: Route setup and callback registration require IF=0.
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) input_irq_flags) };
+    let input_setup = if timer_verified {
+        boot_info
+            .acpi_madt
+            .as_ref()
+            .map(|madt| configure_input_irqs(madt, &mut vector_allocator))
+            .unwrap_or_default()
+    } else {
+        InputIrqSetup::default()
+    };
+    if input_irq_flags & (1 << 9) != 0 {
+        // SAFETY: Device handlers and masked-first routes are initialized.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    }
+    let _keep_vector_allocator_and_token_live = (
+        vector_allocator,
+        timer_vector,
+        input_setup.uart_vector,
+        input_setup.keyboard_vector,
+    );
+    let mut heap_mapping_context = KernelHeapMappingContext {
+        candidate: core::ptr::addr_of_mut!(candidate).cast(),
+        allocator: core::ptr::addr_of_mut!(boot_info.frame_allocator),
+        cpu_info: core::ptr::addr_of!(boot_info.cpu_info),
+    };
+    for page in 0..KERNEL_HEAP_GROWTH_MAX_PAGES {
+        let address = KERNEL_HEAP_GROWTH_VIRTUAL_BASE + page as u64 * PAGE_SIZE;
+        if !matches!(
+            candidate.walk(address),
+            Ok(PageWalkOutcome::NotPresent { .. })
+        ) {
+            kprintln!(
+                "frame-backed heap virtual range is already mapped at {:#x}",
+                address
+            );
+            halt_forever();
+        }
+    }
+    // SAFETY: The full virtual range is confirmed unmapped and exclusively
+    // reserved. Candidate, allocator, CPU snapshot, and context remain live on
+    // this non-returning boot path; the callback is transactional and nonallocating.
+    if let Err(error) = unsafe {
+        KERNEL_HEAP.initialize_frame_backed_region(
+            KERNEL_HEAP_GROWTH_VIRTUAL_BASE as usize,
+            KERNEL_HEAP_GROWTH_MAX_PAGES,
+            core::ptr::addr_of_mut!(heap_mapping_context).cast(),
+            map_kernel_heap_pages,
+        )
+    } {
+        kprintln!("frame-backed heap setup failed: {:?}", error);
+        halt_forever();
+    }
+    kprintln!(
+        "frame-backed heap configured: {} KiB maximum, demand-mapped",
+        KERNEL_HEAP_GROWTH_MAX_PAGES * PAGE_SIZE as usize / 1024
+    );
+    #[cfg(feature = "probe-kernel-threads")]
+    if timer_verified {
+        if let Err(error) = kernel_threads::smoke(
+            &mut candidate,
+            &mut boot_info.frame_allocator,
+            &boot_info.cpu_info,
+            &BOOTSTRAP_TIMER_TICKS,
+        ) {
+            kprintln!("cooperative thread probe failed: {}", error);
+            halt_forever();
+        }
+    }
     probe_kernel_heap();
 
     // Keep the candidate and its frame tokens alive for as long as this root is
     // active. The shell runs forever and does not return to this stack frame.
-    // SAFETY: The bootstrap is single-core, interrupts remain disabled, and the
-    // shell is the only filesystem owner.
+    // SAFETY: The bootstrap remains single-core. If enabled, the timer handler
+    // touches only its atomic counter and APIC EOI; the shell owns the filesystem.
     let filesystem = unsafe { &mut *core::ptr::addr_of_mut!(RAM_FILESYSTEM) };
     match filesystem.seed_defaults() {
-        Ok(home) => shell::run(filesystem, home, boot_info),
+        Ok(home) if input_setup.uart_ready && timer_verified => {
+            let mut shell_context = ShellThreadContext {
+                filesystem: core::ptr::addr_of_mut!(*filesystem),
+                cwd: home,
+                memory_map: core::ptr::addr_of!(boot_info.memory_map),
+                frame_allocator: core::ptr::addr_of!(boot_info.frame_allocator),
+            };
+            // SAFETY: The active root, candidate tokens, allocator, BootInfo,
+            // filesystem, and callback context remain live on this non-returning
+            // single-vCPU path. The allocator pointer stays raw between calls.
+            kernel_threads::run_shell(
+                &mut candidate,
+                core::ptr::addr_of_mut!(boot_info.frame_allocator),
+                &boot_info.cpu_info,
+                &BOOTSTRAP_TIMER_TICKS,
+                shell_thread_entry,
+                core::ptr::addr_of_mut!(shell_context) as usize,
+            )
+        }
+        Ok(home) => shell::run(
+            filesystem,
+            home,
+            &boot_info.memory_map,
+            core::ptr::addr_of!(boot_info.frame_allocator),
+            core::ptr::null_mut(),
+        ),
         Err(error) => {
             kprintln!("RAM filesystem initialization failed: {:?}", error);
             halt_forever()
         }
     }
+}
+
+extern "C" fn bootstrap_timer_irq() {
+    BOOTSTRAP_TIMER_TICKS.tick();
+    arch::x86_64::apic::end_of_interrupt();
+}
+
+#[derive(Default)]
+struct InputIrqSetup {
+    uart_vector: Option<rustix_kernel::irq::InterruptVector>,
+    keyboard_vector: Option<rustix_kernel::irq::InterruptVector>,
+    uart_ready: bool,
+    keyboard_ready: bool,
+}
+
+fn configure_input_irqs(
+    madt: &rustix_kernel::acpi::Madt,
+    vectors: &mut rustix_kernel::irq::InterruptVectorAllocator,
+) -> InputIrqSetup {
+    let mut setup = InputIrqSetup::default();
+    if let Some((vector, route_ready)) =
+        configure_one_input_irq(madt, vectors, 4, arch::x86_64::serial::irq_handler)
+    {
+        let vector_number = vector.number();
+        setup.uart_vector = Some(vector);
+        if route_ready && arch::x86_64::serial::enable_receive_interrupts() {
+            // SAFETY: The UART handler is installed, COM1 is initialized, and
+            // only its previously masked MADT route is being unmasked.
+            setup.uart_ready =
+                unsafe { arch::x86_64::apic::unmask_isa_irq(4, vector_number).is_ok() };
+            if !setup.uart_ready {
+                arch::x86_64::serial::disable_receive_interrupts();
+            }
+        }
+    }
+
+    if let Some((vector, route_ready)) =
+        configure_one_input_irq(madt, vectors, 1, arch::x86_64::keyboard::irq_handler)
+    {
+        let vector_number = vector.number();
+        setup.keyboard_vector = Some(vector);
+        if route_ready && arch::x86_64::keyboard::initialize_interrupts() {
+            // SAFETY: The bounded PS/2 controller setup succeeded and its
+            // registered IRQ handler is ready before unmasking the route.
+            setup.keyboard_ready =
+                unsafe { arch::x86_64::apic::unmask_isa_irq(1, vector_number).is_ok() };
+        }
+    }
+    kprintln!(
+        "interrupt-driven input: UART RX {}, PS/2 raw scancodes {}",
+        if setup.uart_ready {
+            "ready"
+        } else {
+            "unavailable"
+        },
+        if setup.keyboard_ready {
+            "ready"
+        } else {
+            "unavailable"
+        }
+    );
+    setup
+}
+
+fn configure_one_input_irq(
+    madt: &rustix_kernel::acpi::Madt,
+    vectors: &mut rustix_kernel::irq::InterruptVectorAllocator,
+    isa_irq: u8,
+    handler: arch::x86_64::interrupts::IrqHandler,
+) -> Option<(rustix_kernel::irq::InterruptVector, bool)> {
+    let vector = vectors.allocate()?;
+    let vector_number = vector.number();
+    // SAFETY: This function is called with IF=0. The device route is masked
+    // until both the APIC redirection and its callback are installed.
+    if unsafe { arch::x86_64::interrupts::register_irq_handler(vector_number, handler) }.is_err() {
+        let _ = vectors.release(vector);
+        return None;
+    }
+    // SAFETY: `madt` is the validated owned table used for APIC initialization;
+    // its route is kept masked until the device and handler are ready.
+    if unsafe { arch::x86_64::apic::configure_isa_irq(madt, isa_irq, vector_number) }.is_err() {
+        kprintln!(
+            "ISA IRQ{} route configuration failed; source remains masked",
+            isa_irq
+        );
+        return Some((vector, false));
+    }
+    Some((vector, true))
+}
+
+struct ShellThreadContext {
+    filesystem: *mut RamFs,
+    cwd: usize,
+    memory_map: *const rustix_kernel::memory::MemoryMap,
+    frame_allocator: *const rustix_kernel::frame::FrameAllocator,
+}
+
+extern "C" fn shell_thread_entry(runtime: *mut (), context_address: usize) {
+    // SAFETY: `activate_cloned_page_tables_and_run` keeps this local context,
+    // the static filesystem, and boot metadata live for the non-returning runtime.
+    let context = unsafe { &mut *(context_address as *mut ShellThreadContext) };
+    // SAFETY: This is the sole shell thread and owns the mutable filesystem.
+    let filesystem = unsafe { &mut *context.filesystem };
+    // SAFETY: The memory map is immutable and retained with BootInfo. The frame
+    // allocator is passed as a raw pointer so no shared reference to BootInfo's
+    // allocator field remains live while heap growth mutates it.
+    let memory_map = unsafe { &*context.memory_map };
+    shell::run(
+        filesystem,
+        context.cwd,
+        memory_map,
+        context.frame_allocator,
+        runtime,
+    )
+}
+
+#[cfg(feature = "probe-active-mapping")]
+fn probe_active_mapping<'memory, 'map>(
+    candidate: &mut rustix_kernel::paging::CandidatePageTables<
+        'memory,
+        LimineHhdmCandidateMemory<'map>,
+    >,
+    allocator: &mut rustix_kernel::frame::FrameAllocator,
+    cpu_info: &arch::x86_64::cpu::CpuInfo,
+) -> Result<(), &'static str> {
+    use rustix_kernel::paging::{
+        validate_mapping_range, CachePolicy, MtrrState, PagePermissions, PageWalkOutcome,
+        PatLayout, PAGE_SIZE,
+    };
+
+    const PROBE_VIRTUAL_ADDRESS: u64 = 0xffff_c300_0000_0000;
+    let physical_address_bits = cpu_info
+        .physical_address_bits
+        .ok_or("unknown physical width")?;
+    let frame = allocator.allocate().ok_or("no frame available")?;
+    let physical_address = frame.address();
+    let permissions = PagePermissions {
+        writable: true,
+        executable: false,
+        user_accessible: false,
+    };
+    let mapping_result = validate_mapping_range(
+        PROBE_VIRTUAL_ADDRESS,
+        physical_address,
+        PAGE_SIZE,
+        permissions,
+        Some(physical_address_bits),
+        cpu_info.active_linear_address_bits,
+    );
+    let mapping = match mapping_result {
+        Ok(mapping) => mapping,
+        Err(_) => {
+            let _ = allocator.deallocate(frame);
+            return Err("mapping range rejected");
+        }
+    };
+    let pat_value = match cpu_info.pat_msr_value {
+        Some(value) => value,
+        None => {
+            let _ = allocator.deallocate(frame);
+            return Err("PAT unavailable");
+        }
+    };
+    let pat = match PatLayout::from_msr_value(pat_value) {
+        Ok(pat) => pat,
+        Err(_) => {
+            let _ = allocator.deallocate(frame);
+            return Err("PAT state invalid");
+        }
+    };
+    let cache_layout = match &cpu_info.mtrr {
+        MtrrState::Captured(registers) => match registers.validated_layout(physical_address_bits) {
+            Ok(layout) => layout,
+            Err(_) => {
+                let _ = allocator.deallocate(frame);
+                return Err("MTRR state invalid");
+            }
+        },
+        _ => {
+            let _ = allocator.deallocate(frame);
+            return Err("MTRR state unavailable");
+        }
+    };
+    let attributes = match mapping.select_cache_attributes(
+        CachePolicy::WriteBack,
+        pat,
+        &cache_layout,
+        cpu_info.normal_caching,
+    ) {
+        Ok(attributes) => attributes,
+        Err(_) => {
+            let _ = allocator.deallocate(frame);
+            return Err("frame has no uniform write-back policy");
+        }
+    };
+    if !matches!(
+        candidate.walk(PROBE_VIRTUAL_ADDRESS),
+        Ok(PageWalkOutcome::NotPresent { .. })
+    ) {
+        let _ = allocator.deallocate(frame);
+        return Err("probe virtual address is not unmapped");
+    }
+
+    // SAFETY: The active cloned root is current, bootstrap runs on one CPU,
+    // interrupts are still disabled, and the backend performs `invlpg` before
+    // returning. The mapping is backed by this allocator-issued frame token.
+    if let Err(failure) =
+        unsafe { candidate.map_owned_page_active(allocator, frame, mapping, attributes) }
+    {
+        let _ = allocator.deallocate(failure.frame);
+        return Err("active frame mapping rejected");
+    }
+
+    let translation_matches = matches!(
+        candidate.walk(PROBE_VIRTUAL_ADDRESS),
+        Ok(PageWalkOutcome::Mapped(translation))
+            if translation.physical_address == physical_address
+                && translation.permissions == permissions
+                && translation.pat_index == attributes.pat_index()
+    );
+    let mut access_matches = false;
+    if translation_matches {
+        let pointer = PROBE_VIRTUAL_ADDRESS as *mut u64;
+        // SAFETY: The active mapping was verified as supervisor RW/NX for this
+        // allocator-owned page, and the accesses stay within its first word.
+        unsafe {
+            pointer.write_volatile(0x5255_5354_4958_4d41);
+            access_matches = pointer.read_volatile() == 0x5255_5354_4958_4d41;
+            pointer.write_volatile(0);
+        }
+    }
+    // SAFETY: Same active-root/IF=0 invariants as the map above. This invalidates
+    // the translation before returning the frame token to the allocator.
+    let frame = unsafe { candidate.unmap_owned_page_active(PROBE_VIRTUAL_ADDRESS) }
+        .map_err(|_| "active frame unmap failed")?;
+    if !matches!(
+        candidate.walk(PROBE_VIRTUAL_ADDRESS),
+        Ok(PageWalkOutcome::NotPresent { .. })
+    ) {
+        let _ = allocator.deallocate(frame);
+        return Err("active mapping remained present after unmap");
+    }
+    allocator
+        .deallocate(frame)
+        .map_err(|_| "active mapping frame could not be reclaimed")?;
+    if !translation_matches || !access_matches {
+        return Err("active frame translation or access did not verify");
+    }
+    Ok(())
+}
+
+fn map_bootstrap_apic_pages<'memory, 'map>(
+    candidate: &mut rustix_kernel::paging::CandidatePageTables<
+        'memory,
+        LimineHhdmCandidateMemory<'map>,
+    >,
+    allocator: &mut rustix_kernel::frame::FrameAllocator,
+    cpu_info: &arch::x86_64::cpu::CpuInfo,
+    madt: &rustix_kernel::acpi::Madt,
+) -> Result<(u64, u64), &'static str> {
+    use rustix_kernel::paging::{
+        validate_mapping_range, CachePolicy, EffectiveMemoryType, MtrrState, PagePermissions,
+        PageWalkOutcome, PatLayout, PAGE_SIZE,
+    };
+
+    let physical_address_bits = cpu_info
+        .physical_address_bits
+        .ok_or("unknown physical width")?;
+    let pat_value = cpu_info.pat_msr_value.ok_or("PAT unavailable")?;
+    let pat = PatLayout::from_msr_value(pat_value).map_err(|_| "invalid PAT state")?;
+    let cache_layout = match &cpu_info.mtrr {
+        MtrrState::Captured(registers) => registers
+            .validated_layout(physical_address_bits)
+            .map_err(|_| "invalid MTRR state")?,
+        _ => return Err("MTRR state unavailable"),
+    };
+    let mut io_apics = madt.io_apics();
+    let io_apic = io_apics.next().ok_or("MADT has no I/O APIC")?;
+    if io_apics.next().is_some() {
+        return Err("multiple I/O APICs are unsupported by bootstrap routing");
+    }
+
+    let pages = [
+        (LOCAL_APIC_VIRTUAL_ADDRESS, madt.local_apic_address),
+        (IO_APIC_VIRTUAL_ADDRESS, u64::from(io_apic.physical_address)),
+    ];
+    let permissions = PagePermissions {
+        writable: true,
+        executable: false,
+        user_accessible: false,
+    };
+    for (virtual_address, physical_address) in pages {
+        if !matches!(
+            candidate.walk(virtual_address),
+            Ok(PageWalkOutcome::NotPresent { .. })
+        ) {
+            return Err("reserved APIC virtual address is not unmapped");
+        }
+        let mapping = validate_mapping_range(
+            virtual_address,
+            physical_address,
+            PAGE_SIZE,
+            permissions,
+            Some(physical_address_bits),
+            cpu_info.active_linear_address_bits,
+        )
+        .map_err(|_| "APIC mapping range rejected")?;
+        let attributes = mapping
+            .select_cache_attributes(
+                CachePolicy::Uncacheable,
+                pat,
+                &cache_layout,
+                cpu_info.normal_caching,
+            )
+            .map_err(|_| "APIC page has no uniform UC cache policy")?;
+        if attributes.effective_type() != EffectiveMemoryType::Uncacheable {
+            return Err("APIC page is not effectively uncacheable");
+        }
+        // SAFETY: Both physical addresses come from the copied MADT, are used
+        // only as device registers, and will be mapped with the validated UC
+        // policy. The API enforces supervisor RW/NX mappings and non-ownership.
+        unsafe {
+            candidate
+                .map_mmio_page(allocator, mapping, attributes)
+                .map_err(|_| "APIC candidate mapping failed")?;
+        }
+        match candidate.walk(virtual_address) {
+            Ok(PageWalkOutcome::Mapped(translation))
+                if translation.physical_address == physical_address
+                    && translation.page_size == PAGE_SIZE
+                    && translation.permissions == permissions
+                    && translation.pat_index == attributes.pat_index() => {}
+            _ => return Err("APIC candidate mapping did not verify"),
+        }
+    }
+    Ok((LOCAL_APIC_VIRTUAL_ADDRESS, IO_APIC_VIRTUAL_ADDRESS))
 }
 
 // Error payloads provide boot diagnostics through the derived `Debug` output.
@@ -809,6 +1569,7 @@ fn harden_kernel_hhdm_aliases(
 
 fn probe_kernel_heap() {
     use core::alloc::{GlobalAlloc, Layout};
+    use rustix_kernel::paging::PAGE_SIZE;
 
     let full_layout = match Layout::from_size_align(rustix_kernel::heap::KERNEL_HEAP_CAPACITY, 1) {
         Ok(layout) => layout,
@@ -827,16 +1588,20 @@ fn probe_kernel_heap() {
         kprintln!("kernel heap probe failed: full-arena allocation was rejected");
         halt_forever();
     }
-    let small_layout = Layout::new::<u8>();
-    // SAFETY: The heap lock serializes this valid nonzero allocation request.
-    let exhausted = unsafe { KERNEL_HEAP.alloc(small_layout) };
+    let oversized_layout =
+        match Layout::from_size_align(KERNEL_HEAP_GROWTH_MAX_PAGES * PAGE_SIZE as usize + 1, 1) {
+            Ok(layout) => layout,
+            Err(_) => halt_forever(),
+        };
+    // SAFETY: The request is larger than either bounded arena and must fail.
+    let exhausted = unsafe { KERNEL_HEAP.alloc(oversized_layout) };
     if !exhausted.is_null() {
         // SAFETY: Both pointers are live allocations with their original layouts.
         unsafe {
-            KERNEL_HEAP.dealloc(exhausted, small_layout);
+            KERNEL_HEAP.dealloc(exhausted, oversized_layout);
             KERNEL_HEAP.dealloc(full_arena, full_layout);
         }
-        kprintln!("kernel heap probe failed: exhaustion was not deterministic");
+        kprintln!("kernel heap probe failed: bounded growth exhaustion was not deterministic");
         halt_forever();
     }
     // SAFETY: `full_arena` is the complete live allocation created above.
@@ -887,7 +1652,61 @@ fn probe_kernel_heap() {
     }
     // SAFETY: The reused allocation is live and has the same layout.
     unsafe { KERNEL_HEAP.dealloc(reused, layout) };
-    kprintln!("kernel heap probe passed: alignment, reuse, deterministic exhaustion");
+
+    let growth_layout = match Layout::from_size_align(
+        rustix_kernel::heap::KERNEL_HEAP_CAPACITY + PAGE_SIZE as usize,
+        64,
+    ) {
+        Ok(layout) => layout,
+        Err(_) => halt_forever(),
+    };
+    // SAFETY: This request is larger than the bootstrap arena, so it must use
+    // the configured frame-backed range and remain within its fixed limit.
+    let growth = unsafe { KERNEL_HEAP.alloc(growth_layout) };
+    let growth_end = KERNEL_HEAP_GROWTH_VIRTUAL_BASE as usize
+        + KERNEL_HEAP_GROWTH_MAX_PAGES * PAGE_SIZE as usize;
+    if growth.is_null()
+        || (growth as usize) < KERNEL_HEAP_GROWTH_VIRTUAL_BASE as usize
+        || (growth as usize)
+            .checked_add(growth_layout.size())
+            .is_none_or(|end| end > growth_end)
+        || growth as usize % growth_layout.align() != 0
+    {
+        if !growth.is_null() {
+            // SAFETY: `growth` was returned for `growth_layout`.
+            unsafe { KERNEL_HEAP.dealloc(growth, growth_layout) };
+        }
+        kprintln!("kernel heap probe failed: frame-backed allocation was rejected or invalid");
+        halt_forever();
+    }
+    // SAFETY: The committed pages cover the complete live allocation.
+    unsafe {
+        growth.write(0x5a);
+        growth.add(growth_layout.size() - 1).write(0xa5);
+    }
+    // SAFETY: Both offsets are within the live allocation.
+    if unsafe { growth.read_volatile() } != 0x5a
+        || unsafe { growth.add(growth_layout.size() - 1).read_volatile() } != 0xa5
+    {
+        // SAFETY: The allocation is still live with its original layout.
+        unsafe { KERNEL_HEAP.dealloc(growth, growth_layout) };
+        kprintln!("kernel heap probe failed: frame-backed data did not round-trip");
+        halt_forever();
+    }
+    // SAFETY: Return the exact growth allocation and then require first-fit reuse.
+    unsafe { KERNEL_HEAP.dealloc(growth, growth_layout) };
+    let growth_reused = unsafe { KERNEL_HEAP.alloc(growth_layout) };
+    if growth_reused != growth {
+        if !growth_reused.is_null() {
+            // SAFETY: The pointer is live with `growth_layout`.
+            unsafe { KERNEL_HEAP.dealloc(growth_reused, growth_layout) };
+        }
+        kprintln!("kernel heap probe failed: frame-backed space was not reused");
+        halt_forever();
+    }
+    // SAFETY: Release the reused allocation with its original layout.
+    unsafe { KERNEL_HEAP.dealloc(growth_reused, growth_layout) };
+    kprintln!("kernel heap probe passed: bootstrap exhaustion, frame-backed growth, reuse");
 }
 
 #[cfg(feature = "probe-hhdm-frame")]
@@ -1272,16 +2091,7 @@ fn candidate_span_matches_source(
                 return false;
             }
         };
-        // The CPU may update Accessed/Dirty in the active hierarchy after the
-        // clone; they are hardware tracking state, not translation policy.
-        let hardware_tracking_bits = (1 << 5) | (1 << 6);
-        if source_translation.physical_address != candidate_translation.physical_address
-            || source_translation.leaf_physical_base != candidate_translation.leaf_physical_base
-            || source_translation.page_size != candidate_translation.page_size
-            || source_translation.permissions != candidate_translation.permissions
-            || source_translation.pat_index != candidate_translation.pat_index
-            || source_translation.raw_leaf_entry & !hardware_tracking_bits
-                != candidate_translation.raw_leaf_entry & !hardware_tracking_bits
+        if !source_translation.same_effective_mapping(candidate_translation)
             || candidate_translation.physical_address != expected_physical
         {
             kprintln!(

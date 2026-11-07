@@ -15,6 +15,8 @@ default = []
 inject-page-fault = []
 inject-invalid-opcode = []
 probe-hhdm-frame = []
+probe-active-mapping = []
+probe-kernel-threads = []
 
 [dependencies]
 crabshell = { path = "crates/crabshell" }

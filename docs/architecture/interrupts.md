@@ -2,14 +2,10 @@
 
 ## Current implementation
 
-`src/arch/x86_64/interrupts.rs` installs the bootstrap GDT, TSS, and IDT gates for architectural exception vectors 0–31. Exceptions are fatal-only. Bootstrap leaves maskable interrupts disabled; there is no PIC/APIC initialization, IRQ entry/dispatch, acknowledgement, or return path.
+`src/arch/x86_64/interrupts.rs` installs the bootstrap GDT, TSS, exception gates for vectors 0–31, device IRQ stubs, and the APIC spurious-vector gate. Exceptions remain fatal-only. Maskable interrupts start disabled and are enabled only after the validated APIC route, registered handler, and acknowledgement path are ready.
 
-`src/irq.rs` provides a host-tested, allocation-free token allocator for device vectors `0x20..=0xef`. Exception vectors `0x00..=0x1f` and the upper range `0xf0..=0xff` are reserved. Allocation is bounded and deterministic; releasing an invalid token returns it without changing allocator state. The caller must maintain one allocator per CPU vector namespace and return tokens to their originating allocator.
+`src/irq.rs` provides a host-tested, allocation-free token allocator for device vectors `0x20..=0xef`; exception vectors and the reserved upper range are excluded. `rustix_irq_dispatch` invokes the registered handler, returns for the APIC spurious vector without EOI, and halts on unregistered/unexpected vectors. Device handlers own their EOI. Vector registration is performed with IF clear before the corresponding I/O APIC source is unmasked.
 
-The allocator only reserves numbers. It does not install IDT entries or establish that a controller is configured to deliver a vector. Future IRQ registration must couple vector-token ownership with a valid interrupt gate and controller route; sources must remain masked until dispatch and end-of-interrupt handling are ready. Do not enable interrupts as a side effect of installing gates.
+The initial hardware target is single-vCPU QEMU `q35`: validated ACPI/MADT topology, local APIC and I/O APIC, masked legacy PIC routing, MADT-resolved ISA routes, and a periodic 8254 PIT tick near 100 Hz. OVMF smokes validate PIT delivery/EOI and UART/keyboard IRQ delivery. Host tests cover vector ownership and PIT/time arithmetic; they do not replace privileged QEMU coverage.
 
-## Required IRQ path
-
-The initial hardware target remains one-vCPU QEMU `q35`: validated ACPI/MADT topology, local APIC and I/O APIC setup, legacy PIC masking, IRQ-specific interrupt entry/return, vector ownership, masking/unmasking, EOI, spurious and unexpected IRQ policy, and the PIT tick. A controller route may be unmasked only after its gate, handler, and acknowledgement path are installed and validated. Host tests can check vector and routing policy; QEMU is required for privileged entry, MMIO/port-I/O, delivery, acknowledgement, and timing behavior.
-
-The fixed kernel heap remains forbidden in IRQ and exception context. Until IRQ-safe synchronization and bounded work are established, handlers must not allocate, block, log via unbounded paths, or take locks that interrupted code can hold.
+The scheduler is cooperative and single-vCPU; timer IRQs only update the atomic tick counter and acknowledge the APIC. IRQ and exception handlers are bounded, allocation-free, and do not block or schedule. The global heap is explicitly not IRQ-safe. Timer preemption, SMP, and the IRQ-safe locking rules needed before either remain future work.

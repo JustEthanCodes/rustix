@@ -4,17 +4,25 @@ use crabshell::{parse, Command, ParseError, MAX_LINE_LENGTH};
 use rustix_kernel::vfs::{EntryKind, FsError, RamFs, MAX_PATH_CAPACITY};
 
 use crate::arch::x86_64::serial;
-use crate::boot::BootInfo;
+use rustix_kernel::frame::FrameAllocator;
+use rustix_kernel::memory::MemoryMap;
 
 /// Run Crabshell forever on the bootstrap CPU.
-pub fn run(filesystem: &mut RamFs, mut cwd: usize, boot_info: &BootInfo) -> ! {
+pub fn run(
+    filesystem: &mut RamFs,
+    mut cwd: usize,
+    memory_map: &MemoryMap,
+    frame_allocator: *const FrameAllocator,
+    runtime: *mut (),
+) -> ! {
     crate::kprintln!("crabshell: ready (volatile RAM filesystem)");
     print_motd(filesystem, cwd);
 
     let mut input = [0u8; MAX_LINE_LENGTH];
+    let mut reported_input_wait = false;
     loop {
         print_prompt(filesystem, cwd);
-        let length = read_line(&mut input);
+        let length = read_line(&mut input, runtime, &mut reported_input_wait);
         if length == 0 {
             continue;
         }
@@ -28,7 +36,9 @@ pub fn run(filesystem: &mut RamFs, mut cwd: usize, boot_info: &BootInfo) -> ! {
         };
 
         match parse(line) {
-            Ok(Some(command)) => execute(command, filesystem, &mut cwd, boot_info),
+            Ok(Some(command)) => {
+                execute(command, filesystem, &mut cwd, memory_map, frame_allocator)
+            }
             Ok(None) => {}
             Err(error) => print_parse_error(error),
         }
@@ -46,12 +56,36 @@ fn print_prompt(filesystem: &RamFs, cwd: usize) {
     }
 }
 
-fn read_line(input: &mut [u8; MAX_LINE_LENGTH]) -> usize {
+fn read_line(
+    input: &mut [u8; MAX_LINE_LENGTH],
+    runtime: *mut (),
+    reported_input_wait: &mut bool,
+) -> usize {
     let mut length = 0;
     loop {
-        let Some(byte) = serial::try_read_byte() else {
-            core::hint::spin_loop();
-            continue;
+        let byte = match serial::try_read_byte() {
+            Some(byte) => byte,
+            None => {
+                if let Some(scancode) = crate::arch::x86_64::keyboard::try_read_irq_scancode() {
+                    if scancode & 0x80 == 0 {
+                        serial::print(format_args!(
+                            "\r\nPS/2 raw scancode IRQ: {:#04x}\r\n",
+                            scancode
+                        ));
+                    }
+                    continue;
+                }
+                if runtime.is_null() {
+                    core::hint::spin_loop();
+                } else {
+                    if !*reported_input_wait {
+                        crate::kprintln!("kernel shell thread runtime: cooperative input wait");
+                        *reported_input_wait = true;
+                    }
+                    crate::kernel_threads::wait_for_input(runtime);
+                }
+                continue;
+            }
         };
 
         match byte {
@@ -78,7 +112,13 @@ fn read_line(input: &mut [u8; MAX_LINE_LENGTH]) -> usize {
     }
 }
 
-fn execute(command: Command<'_>, filesystem: &mut RamFs, cwd: &mut usize, boot_info: &BootInfo) {
+fn execute(
+    command: Command<'_>,
+    filesystem: &mut RamFs,
+    cwd: &mut usize,
+    memory_map: &MemoryMap,
+    frame_allocator: *const FrameAllocator,
+) {
     match command {
         Command::Help => print_help(),
         Command::Clear => serial::print(format_args!("\x1b[2J\x1b[H")),
@@ -93,9 +133,12 @@ fn execute(command: Command<'_>, filesystem: &mut RamFs, cwd: &mut usize, boot_i
             }
         }
         Command::Meminfo => {
-            let managed = boot_info.frame_allocator.managed_frames();
-            let free = boot_info.frame_allocator.free_frames();
-            crate::kprintln!("usable RAM: {} bytes", boot_info.memory_map.usable_bytes());
+            // SAFETY: The sole shell thread reads frame counts on the bootstrap
+            // CPU; the allocator is never mutated from an IRQ or another thread.
+            let allocator = unsafe { &*frame_allocator };
+            let managed = allocator.managed_frames();
+            let free = allocator.free_frames();
+            crate::kprintln!("usable RAM: {} bytes", memory_map.usable_bytes());
             crate::kprintln!(
                 "physical frames: {} managed, {} free, {} allocated",
                 managed,

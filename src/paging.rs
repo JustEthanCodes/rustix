@@ -195,6 +195,24 @@ pub struct PageTranslation {
     pub raw_leaf_entry: u64,
 }
 
+impl PageTranslation {
+    /// Compare effective mapping policy while allowing equivalent large-page splits.
+    ///
+    /// Physical address, permissions, PAT index, global/software flags, and
+    /// other stable leaf attributes must match. Leaf size, physical base, and
+    /// hardware-maintained accessed/dirty bits may differ after a page split.
+    pub const fn same_effective_mapping(self, other: Self) -> bool {
+        const IGNORED_LEAF_BITS: u64 = PTE_ADDRESS_FIELD_MASK | (1 << 5) | (1 << 6) | (1 << 7);
+
+        self.physical_address == other.physical_address
+            && self.permissions.writable == other.permissions.writable
+            && self.permissions.executable == other.permissions.executable
+            && self.permissions.user_accessible == other.permissions.user_accessible
+            && self.pat_index == other.pat_index
+            && self.raw_leaf_entry & !IGNORED_LEAF_BITS == other.raw_leaf_entry & !IGNORED_LEAF_BITS
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageWalkOutcome {
     NotPresent { level: PageLevel },
@@ -1424,6 +1442,13 @@ pub unsafe trait CandidatePageTableMemory {
     /// `table` must have been returned by this backend's `prepare_table`, and
     /// `index` must be less than 512.
     unsafe fn write_entry(&mut self, table: Self::PreparedTable, index: u16, value: u64);
+
+    /// Invalidate the local translation for a virtual page in the active root.
+    ///
+    /// # Safety
+    /// The candidate root using this backend must be active on the current CPU,
+    /// and the caller must serialize mapping changes against all page-table users.
+    unsafe fn invalidate_page(&mut self, virtual_address: u64);
 }
 
 struct CandidateTable<P: Copy> {
@@ -1434,13 +1459,23 @@ struct CandidateTable<P: Copy> {
 enum CandidateMappingBacking {
     Owned(Frame),
     BorrowedAcpi { physical_address: u64 },
+    BorrowedMmio { physical_address: u64 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateMappingKind {
+    Owned,
+    Acpi,
+    Mmio,
 }
 
 impl CandidateMappingBacking {
     const fn physical_address(&self) -> u64 {
         match self {
             Self::Owned(frame) => frame.address(),
-            Self::BorrowedAcpi { physical_address } => *physical_address,
+            Self::BorrowedAcpi { physical_address } | Self::BorrowedMmio { physical_address } => {
+                *physical_address
+            }
         }
     }
 }
@@ -1489,6 +1524,7 @@ pub enum CandidateCloneError<ReaderError, MemoryError> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum CandidateMapErrorKind<E> {
     Active,
+    Inactive,
     Releasing,
     InvalidConfiguration,
     InvalidMapping,
@@ -1526,6 +1562,7 @@ pub struct CandidateBorrowedMapFailure<E> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum CandidateUnmapError<E> {
     Active,
+    Inactive,
     Releasing,
     InvalidConfiguration,
     InvalidVirtualAddress,
@@ -2009,7 +2046,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
         cache_attributes: SelectedCacheAttributes,
     ) -> Result<(), CandidateMapFailure<M::Error>> {
         let backing = CandidateMappingBacking::Owned(frame);
-        match self.map_page_with_backing(allocator, mapping, cache_attributes, backing) {
+        match self.map_page_with_backing(allocator, mapping, cache_attributes, backing, false) {
             Ok(()) => Ok(()),
             Err(failure) => match failure.backing {
                 CandidateMappingBacking::Owned(frame) => Err(CandidateMapFailure {
@@ -2017,8 +2054,40 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                     frame,
                     rollback_retained_table_frames: failure.rollback_retained_table_frames,
                 }),
-                CandidateMappingBacking::BorrowedAcpi { .. } => {
+                CandidateMappingBacking::BorrowedAcpi { .. }
+                | CandidateMappingBacking::BorrowedMmio { .. } => {
                     unreachable!("owned map failure retains its owned frame token")
+                }
+            },
+        }
+    }
+
+    /// Add an allocator-backed leaf to this active root and invalidate its local TLB entry.
+    ///
+    /// # Safety
+    /// This candidate must be the current CR3 root on the current CPU. The caller
+    /// must keep maskable interrupts disabled and serialize all page-table users
+    /// until the operation returns. The memory backend must implement local TLB
+    /// invalidation, and no other CPU may use this root.
+    pub unsafe fn map_owned_page_active(
+        &mut self,
+        allocator: &mut FrameAllocator,
+        frame: Frame,
+        mapping: ValidatedMappingRange,
+        cache_attributes: SelectedCacheAttributes,
+    ) -> Result<(), CandidateMapFailure<M::Error>> {
+        let backing = CandidateMappingBacking::Owned(frame);
+        match self.map_page_with_backing(allocator, mapping, cache_attributes, backing, true) {
+            Ok(()) => Ok(()),
+            Err(failure) => match failure.backing {
+                CandidateMappingBacking::Owned(frame) => Err(CandidateMapFailure {
+                    cause: failure.cause,
+                    frame,
+                    rollback_retained_table_frames: failure.rollback_retained_table_frames,
+                }),
+                CandidateMappingBacking::BorrowedAcpi { .. }
+                | CandidateMappingBacking::BorrowedMmio { .. } => {
+                    unreachable!("owned active-map failure retains its frame token")
                 }
             },
         }
@@ -2050,7 +2119,46 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
         let backing = CandidateMappingBacking::BorrowedAcpi {
             physical_address: mapping.physical_start,
         };
-        self.map_page_with_backing(allocator, mapping, cache_attributes, backing)
+        self.map_page_with_backing(allocator, mapping, cache_attributes, backing, false)
+            .map_err(|failure| CandidateBorrowedMapFailure {
+                cause: failure.cause,
+                rollback_retained_table_frames: failure.rollback_retained_table_frames,
+            })
+    }
+
+    /// Map one explicit device-register page without transferring frame ownership.
+    /// The page is supervisor, writable, NX, and must use UC effective memory type.
+    ///
+    /// # Safety
+    /// `mapping.physical_start` must be an assigned device-register page, not
+    /// ordinary RAM or an unverified physical address. The caller must derive it
+    /// from validated platform/device data and keep the cache policy consistent
+    /// with every alias. The candidate must remain inactive until the mapping is
+    /// installed; this method never makes an active mapping or invalidates TLBs.
+    pub unsafe fn map_mmio_page(
+        &mut self,
+        allocator: &mut FrameAllocator,
+        mapping: ValidatedMappingRange,
+        cache_attributes: SelectedCacheAttributes,
+    ) -> Result<(), CandidateBorrowedMapFailure<M::Error>> {
+        if mapping.length() != PAGE_SIZE
+            || mapping.physical_start & (PAGE_SIZE - 1) != 0
+            || mapping.physical_start.checked_add(PAGE_SIZE) != Some(mapping.physical_end)
+            || mapping.physical_address_bits != self.config.physical_address_bits
+            || !mapping.permissions.writable
+            || mapping.permissions.executable
+            || mapping.permissions.user_accessible
+            || cache_attributes.effective_type() != EffectiveMemoryType::Uncacheable
+        {
+            return Err(CandidateBorrowedMapFailure {
+                cause: CandidateMapErrorKind::InvalidMapping,
+                rollback_retained_table_frames: 0,
+            });
+        }
+        let backing = CandidateMappingBacking::BorrowedMmio {
+            physical_address: mapping.physical_start,
+        };
+        self.map_page_with_backing(allocator, mapping, cache_attributes, backing, false)
             .map_err(|failure| CandidateBorrowedMapFailure {
                 cause: failure.cause,
                 rollback_retained_table_frames: failure.rollback_retained_table_frames,
@@ -2063,6 +2171,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
         mapping: ValidatedMappingRange,
         cache_attributes: SelectedCacheAttributes,
         backing: CandidateMappingBacking,
+        active_operation: bool,
     ) -> Result<(), CandidateMapInternalFailure<M::Error>> {
         macro_rules! fail {
             ($cause:expr, $retained:expr) => {
@@ -2074,8 +2183,15 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
             };
         }
 
-        if self.active {
-            fail!(CandidateMapErrorKind::Active, 0);
+        if self.active != active_operation {
+            fail!(
+                if self.active {
+                    CandidateMapErrorKind::Active
+                } else {
+                    CandidateMapErrorKind::Inactive
+                },
+                0
+            );
         }
         if self.releasing {
             fail!(CandidateMapErrorKind::Releasing, 0);
@@ -2307,6 +2423,11 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                 leaf_entry,
             )
         };
+        if active_operation {
+            // SAFETY: The active-map API requires this root to be active and
+            // serializes local page-table users until this invalidation completes.
+            unsafe { self.memory.invalidate_page(mapping.virtual_start) };
+        }
         self.mappings[mapping_slot] = Some(CandidateMapping {
             virtual_address: mapping.virtual_start,
             backing,
@@ -2319,10 +2440,15 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
     fn unmap_candidate_page(
         &mut self,
         virtual_address: u64,
-        expect_owned: bool,
+        expected_kind: CandidateMappingKind,
+        active_operation: bool,
     ) -> Result<CandidateMappingBacking, CandidateUnmapError<M::Error>> {
-        if self.active {
-            return Err(CandidateUnmapError::Active);
+        if self.active != active_operation {
+            return Err(if self.active {
+                CandidateUnmapError::Active
+            } else {
+                CandidateUnmapError::Inactive
+            });
         }
         if self.releasing {
             return Err(CandidateUnmapError::Releasing);
@@ -2344,14 +2470,24 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                     .is_some_and(|mapping| mapping.virtual_address == virtual_address)
             })
             .ok_or(CandidateUnmapError::NotMapped)?;
-        let is_owned = matches!(
-            self.mappings[mapping_slot]
-                .as_ref()
-                .expect("mapping slot validated")
-                .backing,
-            CandidateMappingBacking::Owned(_)
+        let backing = &self.mappings[mapping_slot]
+            .as_ref()
+            .expect("mapping slot validated")
+            .backing;
+        let kind_matches = matches!(
+            (expected_kind, backing),
+            (
+                CandidateMappingKind::Owned,
+                CandidateMappingBacking::Owned(_)
+            ) | (
+                CandidateMappingKind::Acpi,
+                CandidateMappingBacking::BorrowedAcpi { .. }
+            ) | (
+                CandidateMappingKind::Mmio,
+                CandidateMappingBacking::BorrowedMmio { .. }
+            )
         );
-        if is_owned != expect_owned {
+        if !kind_matches {
             return Err(CandidateUnmapError::OwnershipMismatch);
         }
 
@@ -2381,6 +2517,12 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                 // SAFETY: `prepared` belongs to this candidate-owned table and
                 // `indexes[depth]` was derived from the aligned virtual address.
                 unsafe { self.memory.write_entry(prepared, indexes[depth], 0) };
+                if active_operation {
+                    // SAFETY: The active-unmap API requires this root to be
+                    // current and serializes local page-table users. Invalidate
+                    // before ownership of the mapped frame can be returned.
+                    unsafe { self.memory.invalidate_page(virtual_address) };
+                }
                 let mapping = self.mappings[mapping_slot]
                     .take()
                     .expect("mapping slot validated");
@@ -2418,10 +2560,31 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
         &mut self,
         virtual_address: u64,
     ) -> Result<Frame, CandidateUnmapError<M::Error>> {
-        match self.unmap_candidate_page(virtual_address, true)? {
+        match self.unmap_candidate_page(virtual_address, CandidateMappingKind::Owned, false)? {
             CandidateMappingBacking::Owned(frame) => Ok(frame),
-            CandidateMappingBacking::BorrowedAcpi { .. } => {
+            CandidateMappingBacking::BorrowedAcpi { .. }
+            | CandidateMappingBacking::BorrowedMmio { .. } => {
                 unreachable!("unmap_candidate_page checked the expected owned backing")
+            }
+        }
+    }
+
+    /// Remove one active owned mapping, invalidate its local translation, then return its frame.
+    ///
+    /// # Safety
+    /// This candidate must be the current CR3 root on the current CPU. The caller
+    /// must keep maskable interrupts disabled and serialize page-table users
+    /// until the returned frame is safely reused. The backend must invalidate the
+    /// local TLB entry before this method returns; no other CPU may use this root.
+    pub unsafe fn unmap_owned_page_active(
+        &mut self,
+        virtual_address: u64,
+    ) -> Result<Frame, CandidateUnmapError<M::Error>> {
+        match self.unmap_candidate_page(virtual_address, CandidateMappingKind::Owned, true)? {
+            CandidateMappingBacking::Owned(frame) => Ok(frame),
+            CandidateMappingBacking::BorrowedAcpi { .. }
+            | CandidateMappingBacking::BorrowedMmio { .. } => {
+                unreachable!("active unmap checked owned backing")
             }
         }
     }
@@ -2431,10 +2594,23 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
         &mut self,
         virtual_address: u64,
     ) -> Result<(), CandidateUnmapError<M::Error>> {
-        match self.unmap_candidate_page(virtual_address, false)? {
+        match self.unmap_candidate_page(virtual_address, CandidateMappingKind::Acpi, false)? {
             CandidateMappingBacking::BorrowedAcpi { .. } => Ok(()),
-            CandidateMappingBacking::Owned(_) => {
-                unreachable!("unmap_candidate_page checked the expected borrowed backing")
+            CandidateMappingBacking::Owned(_) | CandidateMappingBacking::BorrowedMmio { .. } => {
+                unreachable!("unmap_candidate_page checked the expected ACPI backing")
+            }
+        }
+    }
+
+    /// Remove one inactive MMIO mapping without returning or freeing its page.
+    pub fn unmap_mmio_page(
+        &mut self,
+        virtual_address: u64,
+    ) -> Result<(), CandidateUnmapError<M::Error>> {
+        match self.unmap_candidate_page(virtual_address, CandidateMappingKind::Mmio, false)? {
+            CandidateMappingBacking::BorrowedMmio { .. } => Ok(()),
+            CandidateMappingBacking::Owned(_) | CandidateMappingBacking::BorrowedAcpi { .. } => {
+                unreachable!("unmap_candidate_page checked the expected MMIO backing")
             }
         }
     }
@@ -2487,7 +2663,8 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                         });
                     }
                 }
-                CandidateMappingBacking::BorrowedAcpi { .. } => {}
+                CandidateMappingBacking::BorrowedAcpi { .. }
+                | CandidateMappingBacking::BorrowedMmio { .. } => {}
             }
             self.mapping_count -= 1;
         }
@@ -2763,8 +2940,8 @@ mod tests {
         MappingError, MtrrError, MtrrLayout, MtrrMemoryType, MtrrRegisterPair, MtrrRegisters,
         MtrrState, PageLevel, PagePermissions, PageTableEntryError, PageTableReader,
         PageTranslation, PageWalkConfig, PageWalkError, PageWalkOutcome, PatLayout,
-        ValidatedMappingRange, VariableMtrr, MAX_CANDIDATE_PAGE_TABLE_PAGES,
-        MAX_CAPTURED_VARIABLE_MTRRS, PAGE_SIZE,
+        ValidatedMappingRange, VariableMtrr, MAX_CANDIDATE_MAPPINGS,
+        MAX_CANDIDATE_PAGE_TABLE_PAGES, MAX_CAPTURED_VARIABLE_MTRRS, PAGE_SIZE,
     };
     use core::cell::Cell;
 
@@ -2820,6 +2997,12 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CandidateTestEvent {
+        PageWrite { table: u64, index: u16, value: u64 },
+        Invalidate { virtual_address: u64 },
+    }
+
     #[derive(Clone, Copy)]
     struct CandidateTestPage {
         physical: u64,
@@ -2846,6 +3029,11 @@ mod tests {
         prepare_count: usize,
         fail_prepare_at: Option<usize>,
         foreign_child: Option<(u16, u64)>,
+        invalidated_pages: [u64; MAX_CANDIDATE_MAPPINGS],
+        invalidation_count: usize,
+        event_log: [Option<CandidateTestEvent>; 16],
+        event_count: usize,
+        record_events: bool,
     }
 
     impl CandidateTestMemory {
@@ -2856,6 +3044,11 @@ mod tests {
                 prepare_count: 0,
                 fail_prepare_at: None,
                 foreign_child: None,
+                invalidated_pages: [0; MAX_CANDIDATE_MAPPINGS],
+                invalidation_count: 0,
+                event_log: [None; 16],
+                event_count: 0,
+                record_events: false,
             }
         }
 
@@ -2938,6 +3131,24 @@ mod tests {
                 .entries
                 .get_mut(usize::from(index))
                 .expect("candidate checked the test table index") = value;
+            if self.record_events {
+                self.event_log[self.event_count] = Some(CandidateTestEvent::PageWrite {
+                    table,
+                    index,
+                    value,
+                });
+                self.event_count += 1;
+            }
+        }
+
+        unsafe fn invalidate_page(&mut self, virtual_address: u64) {
+            self.invalidated_pages[self.invalidation_count] = virtual_address;
+            self.invalidation_count += 1;
+            if self.record_events {
+                self.event_log[self.event_count] =
+                    Some(CandidateTestEvent::Invalidate { virtual_address });
+                self.event_count += 1;
+            }
         }
     }
 
@@ -3138,6 +3349,48 @@ mod tests {
                 raw_leaf_entry: 0x8000 | 0b111 | (1 << 3) | (1 << 7),
             })
         );
+    }
+
+    #[test]
+    fn effective_mapping_comparison_allows_equivalent_large_page_splits() {
+        let permissions = PagePermissions {
+            writable: true,
+            executable: true,
+            user_accessible: false,
+        };
+        let large = PageTranslation {
+            physical_address: 0x20_1234,
+            leaf_physical_base: 0x20_0000,
+            page_size: 1 << 21,
+            permissions,
+            pat_index: 0,
+            raw_leaf_entry: 0x20_0000 | 0x83 | (1 << 5) | (1 << 6),
+        };
+        let split = PageTranslation {
+            physical_address: 0x20_1234,
+            leaf_physical_base: 0x20_1000,
+            page_size: PAGE_SIZE,
+            permissions,
+            pat_index: 0,
+            raw_leaf_entry: 0x20_1000 | 0x3,
+        };
+        assert!(large.same_effective_mapping(split));
+
+        let changed_global_attribute = PageTranslation {
+            raw_leaf_entry: split.raw_leaf_entry | (1 << 8),
+            ..split
+        };
+        assert!(!large.same_effective_mapping(changed_global_attribute));
+        let changed_cache_type = PageTranslation {
+            pat_index: 1,
+            ..split
+        };
+        assert!(!large.same_effective_mapping(changed_cache_type));
+        let changed_physical_page = PageTranslation {
+            physical_address: split.physical_address + PAGE_SIZE,
+            ..split
+        };
+        assert!(!large.same_effective_mapping(changed_physical_page));
     }
 
     #[test]
@@ -4291,6 +4544,71 @@ mod tests {
     }
 
     #[test]
+    fn active_owned_mapping_invalidates_before_returning_frame_ownership() {
+        let mut allocator = candidate_allocator(8);
+        let mut memory = CandidateTestMemory::new();
+        let mut candidate =
+            CandidatePageTables::new(&mut allocator, &mut memory, four_level_walk_config())
+                .unwrap();
+        let frame = allocator.allocate().unwrap();
+        let physical_address = frame.address();
+        let virtual_address = 0xffff_9000_0000_1000;
+        let (mapping, attributes) = candidate_mapping(
+            &frame,
+            virtual_address,
+            PagePermissions {
+                writable: true,
+                executable: false,
+                user_accessible: false,
+            },
+        );
+        candidate.memory.record_events = true;
+        // SAFETY: The host backend records invalidations and no hardware CR3 is
+        // changed; this tests active API state and ownership ordering only.
+        unsafe { candidate.mark_active() };
+        // SAFETY: Synthetic active-root ownership is established above, and the
+        // backend's invalidation operation records this leaf address.
+        unsafe {
+            candidate
+                .map_owned_page_active(&mut allocator, frame, mapping, attributes)
+                .unwrap();
+        }
+        assert_eq!(candidate.memory.invalidation_count, 1);
+        assert_eq!(candidate.memory.invalidated_pages[0], virtual_address);
+        assert!(matches!(
+            candidate.memory.event_log[3],
+            Some(CandidateTestEvent::PageWrite { value, .. }) if value & 1 != 0
+        ));
+        assert_eq!(
+            candidate.memory.event_log[4],
+            Some(CandidateTestEvent::Invalidate { virtual_address })
+        );
+        assert!(matches!(
+            candidate.walk(virtual_address),
+            Ok(PageWalkOutcome::Mapped(translation))
+                if translation.physical_address == physical_address
+        ));
+
+        // SAFETY: The synthetic root remains the candidate's current test root;
+        // unmap invalidates the address before the frame token is returned.
+        let frame = unsafe { candidate.unmap_owned_page_active(virtual_address) }.unwrap();
+        assert_eq!(candidate.memory.invalidation_count, 2);
+        assert_eq!(candidate.memory.invalidated_pages[1], virtual_address);
+        assert!(matches!(
+            candidate.memory.event_log[5],
+            Some(CandidateTestEvent::PageWrite { value: 0, .. })
+        ));
+        assert_eq!(
+            candidate.memory.event_log[6],
+            Some(CandidateTestEvent::Invalidate { virtual_address })
+        );
+        allocator.deallocate(frame).unwrap();
+        // SAFETY: No real CPU installed this host-test candidate in CR3.
+        unsafe { candidate.mark_inactive() };
+        candidate.release(&mut allocator).unwrap();
+    }
+
+    #[test]
     fn candidate_clone_preserves_inherited_entries_and_shared_tables() {
         let total_frames = 8;
         let mut allocator = candidate_allocator(total_frames);
@@ -4611,6 +4929,65 @@ mod tests {
         candidate
             .map_acpi_page(&mut allocator, span, mapping, attributes)
             .unwrap();
+        candidate.release(&mut allocator).unwrap();
+        assert_eq!(allocator.free_frames(), total_frames as u64);
+    }
+
+    #[test]
+    fn candidate_page_tables_map_explicit_uncacheable_mmio_without_frame_ownership() {
+        let total_frames = 8;
+        let mut allocator = candidate_allocator(total_frames);
+        let mut memory = CandidateTestMemory::new();
+        let mut candidate =
+            CandidatePageTables::new(&mut allocator, &mut memory, four_level_walk_config())
+                .unwrap();
+        let mmio_physical = 0xfee0_0000;
+        let virtual_address = 0xffff_d000_0000_0000;
+        let permissions = PagePermissions {
+            writable: true,
+            executable: false,
+            user_accessible: false,
+        };
+        let mapping = validate_mapping_range(
+            virtual_address,
+            mmio_physical,
+            PAGE_SIZE,
+            permissions,
+            Some(40),
+            48,
+        )
+        .unwrap();
+        let attributes = super::SelectedCacheAttributes {
+            physical_start: mmio_physical,
+            physical_end: mmio_physical + PAGE_SIZE,
+            pat_index: 3,
+            effective_type: EffectiveMemoryType::Uncacheable,
+        };
+        let before = allocator.free_frames();
+        // SAFETY: The synthetic test treats this as a device page and never
+        // dereferences it; the API's range, permissions, and UC requirements apply.
+        unsafe {
+            candidate
+                .map_mmio_page(&mut allocator, mapping, attributes)
+                .unwrap()
+        };
+        assert_eq!(candidate.mapping_count(), 1);
+        assert_eq!(allocator.free_frames(), before - 3);
+        let translation = match candidate.walk(virtual_address).unwrap() {
+            PageWalkOutcome::Mapped(translation) => translation,
+            PageWalkOutcome::NotPresent { .. } => panic!("MMIO mapping disappeared"),
+        };
+        assert_eq!(translation.physical_address, mmio_physical);
+        assert_eq!(translation.permissions, permissions);
+        assert_eq!(translation.pat_index, 3);
+        assert_eq!(translation.raw_leaf_entry & (1 << 63), 1 << 63);
+
+        assert_eq!(
+            candidate.unmap_mmio_page(virtual_address + PAGE_SIZE),
+            Err(CandidateUnmapError::NotMapped)
+        );
+        candidate.unmap_mmio_page(virtual_address).unwrap();
+        assert_eq!(candidate.mapping_count(), 0);
         candidate.release(&mut allocator).unwrap();
         assert_eq!(allocator.free_frames(), total_frames as u64);
     }

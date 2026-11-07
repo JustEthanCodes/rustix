@@ -11,10 +11,10 @@ This roadmap describes an incremental path from the current bare-metal kernel to
 
 ## Current status
 
-- **Milestone 0: local exit criteria met from a clean detached worktree; hosted CI pending.** On 2026-10-16, `just verify` passed in WSL2 Ubuntu 24.04 from both the working tree and a clean detached worktree with an empty `target` directory. The clean run downloaded and compiled the pinned Limine host utility, formatted and tested the workspace, checked and built the target, created the image, and passed the 20-second QEMU prompt smoke test. Hosted CI has not been observed.
+- **Milestone 0: local exit criteria met from a clean detached worktree; hosted CI observed.** On 2026-10-16, `just verify` passed in WSL2 Ubuntu 24.04 from both the working tree and a clean detached worktree with an empty `target` directory. On 2026-11-06, GitHub Actions run [#5](https://github.com/JustEthanCodes/rustix/actions/runs/42288095710) completed successfully on `dev` at `770f9c742dd07a00f6b53274ea05a1eca010d146`; its `kernel-and-boot-smoke` job ran `just verify`. This verifies hosted CI on that remote commit, not today’s uncommitted changes.
 - **Milestone 1: validation criteria met for the current Limine path.** The bounded boot snapshot, memory-range classification, and CPUID reporting were covered by host tests and QEMU reporting; the Limine pointer-readability trust boundary remains explicit.
-- **Milestone 2: local exit criteria met on 2026-10-24; hosted CI and physical-hardware validation remain pending.** The boot path owns and activates a clone of Limine's reachable page-table hierarchy, preserves inherited mappings, hardens kernel HHDM aliases to R/NX or RW/NX while retaining PAT attributes, invalidates stale translations on CR3 transitions, and retains table-frame tokens. `just verify`, `just frame-smoke`, and `just fault-smoke` passed after final review; QEMU exercised the active-PCID/CR3 invalidation path with CR4.PGE clear. The PGE-toggle path is statically reviewed but was not exercised by this QEMU configuration. The bounded heap does not grow from frames; broad mapping policy, reclamation, IRQ-safe allocation, and physical-hardware validation remain outside this milestone's completed scope.
-- **Milestone 3: implementation started; no runtime IRQ/timer/scheduler path yet.** Host-tested ACPI parsing/traversal, RSDP metadata capture, ACPI span authorization, a boot-only temporary ACPI reader that copies MADT data, a borrowed read-only/NX mapping primitive, and IRQ vector allocation are present. The physical reader and CR3 round-trip are not yet QEMU-validated; APIC routing, IRQ dispatch/acknowledgement, PIT ticks, wait queues, and kernel threads remain planned. **Milestones 4 and later: planned.** There is no userspace, syscall ABI, persistent filesystem, GUI, or networking stack.
+- **Milestone 2: local exit criteria met on 2026-10-24; hosted CI observed, physical-hardware validation pending.** The boot path owns and activates a clone of Limine's reachable page-table hierarchy, preserves inherited mappings, hardens kernel HHDM aliases to R/NX or RW/NX while retaining PAT attributes, invalidates stale translations on CR3 transitions, and retains table-frame tokens. `just verify`, `just frame-smoke`, and `just fault-smoke` passed after final review; QEMU exercised the active-PCID/CR3 invalidation path with CR4.PGE clear. The PGE-toggle path is statically reviewed but was not exercised by this QEMU configuration. The successful 2026-11-06 hosted `just verify` run covers the published Milestone 2 state, but not today's uncommitted changes. Broad mapping policy, reclamation, IRQ-safe allocation, and physical-hardware validation remain outside this milestone's completed scope.
+- **Milestone 3: local exit criteria met on 2026-11-07; hosted CI and physical-hardware validation remain pending.** `just verify` passed with 127 host tests, the `x86_64-unknown-none` check, BIOS and OVMF boot smokes, active-map/TLB invalidation, cooperative thread/wait-queue tests, and UART/PS/2 input wakeup. OVMF validated MADT/APIC routing, PIT ticks and EOI, guarded cooperative stacks, frame-backed heap growth, and shell input without busy-polling. Timer preemption, IRQ-safe locking for future preemption, and SMP remain deferred. See the evidence and limits below. **Milestones 4 and later: planned.** There is no userspace, syscall ABI, persistent filesystem, GUI, or networking stack.
 
 ## Dependency path
 
@@ -32,7 +32,7 @@ Some device-driver work can proceed in parallel after the core ownership, lockin
 
 ---
 
-## Milestone 0 — repeatable Rust kernel boot (local exit criteria met)
+## Milestone 0 — repeatable Rust kernel boot (DONE)
 
 ### Implementation present
 
@@ -50,15 +50,15 @@ Some device-driver work can proceed in parallel after the core ownership, lockin
 - [x] The pinned image built and the bounded QEMU smoke test reached the Crabshell prompt in WSL2 Ubuntu 24.04 on 2026-10-16.
 - [x] A separate interactive QEMU session exercised `help`, `ls`, `meminfo`, directory navigation, and file create/write/append/read/copy/move/remove operations; `cp` replaced an existing destination, `rmdir` refused a nonempty directory, and unsupported `memtest` was rejected as expected.
 - [x] Repeat verification from a clean detached worktree with an empty `target` directory and uncached build/tool state; fresh Limine download/host-tool compilation, image creation, and QEMU prompt smoke test all passed on 2026-10-16.
-- [ ] Observe the hosted CI workflow; it has not yet been run or verified.
+- [x] Observe the hosted CI workflow; GitHub Actions run #5 completed successfully on the published `dev` commit on 2026-11-06 (see run #5 above).
 
 The QEMU serial log showed the startup banner, HHDM offset, validated memory-map summary, frame counts, CPUID report, and initial prompt. The interactive command check is a focused manual test, not exhaustive shell coverage or a persistence test. `cat` returned `hello Rustix from QEMU`, `cp` replaced an existing destination with source data, `rmdir` refused a nonempty directory, and `pwd` returned to `/home/rustix` after cleanup. If a future smoke test fails, preserve `target/rustix-qemu-serial.log` as failure evidence.
 
-**Exit criteria:** met locally. A clean detached worktree with uncached build/tool state built the image, reached `_start`, reported the expected startup state, and reached the Crabshell prompt in the automated QEMU test. Hosted CI remains unobserved, but is tracked separately from the local exit criteria.
+**Exit criteria:** met locally. A clean detached worktree with uncached build/tool state built the image, reached `_start`, reported the expected startup state, and reached the Crabshell prompt in the automated QEMU test. Hosted CI was also observed passing on the published commit noted above; it does not imply that later uncommitted changes passed CI.
 
 ---
 
-## Milestone 1 — validated boot state and machine diagnostics (current Limine path validated)
+## Milestone 1 — validated boot state and machine diagnostics (DONE)
 
 ### Source work present
 
@@ -73,15 +73,16 @@ The QEMU serial log showed the startup banner, HHDM offset, validated memory-map
 ### Remaining proof and polish
 
 - [x] Host tests cover malformed and boundary memory-map values, including empty input, capacity, zero length, overflow, overlap, adjacency, and unknown types.
-- [ ] Add serial/report formatting tests if output formatting is separated into a host-testable pure helper.
 - [x] Build and boot the image with the current request-section/linker layout; the QEMU serial log showed the boot metadata and CPUID report.
-- [ ] Revisit loader pointer validation before introducing another boot source: numeric checks cannot prove non-null response data is mapped and readable.
+- [x] Review and document the Limine pointer-readability trust boundary: numeric checks cannot prove non-null response data is mapped and readable; repeat this review before adding another boot source.
 
-**Exit criteria:** met for the current Limine path. Host tests and QEMU metadata/reporting were observed in the 2026-10-16 WSL2 `just verify` run, including the clean detached-worktree verification. The loader readability trust boundary remains documented and must be reconsidered before adding another boot source.
+Serial/report formatting remains inline in kernel output, so there is no host-testable pure formatter to test. Extracting one and adding formatting tests is optional polish, not an unmet exit criterion.
+
+**Exit criteria:** met for the current Limine path. Host tests and QEMU metadata/reporting were observed in the 2026-10-16 WSL2 `just verify` run, including the clean detached-worktree verification. The pointer-readability trust boundary remains documented and must be reconsidered before adding another boot source.
 
 ---
 
-## Milestone 2 — memory ownership, paging, heap, and exceptions (local exit criteria met)
+## Milestone 2 — memory ownership, paging, heap, and exceptions (DONE)
 
 This milestone establishes a safe basis for future allocation and kernel services. HHDM access is limited to checked full-frame token paths that rely on Limine's documented contract. The boot path clones the complete reachable inherited hierarchy and activates it only after validating the requested stack span, kernel segments, candidate-root HHDM alias, and kernel-image HHDM permissions.
 
@@ -133,31 +134,32 @@ This milestone establishes a safe basis for future allocation and kernel service
 - [x] Add QEMU fault-injection tests for a controlled page fault and invalid opcode. `just fault-smoke` verifies vector diagnostics, the exact CR2 address, no shell prompt or return marker, and that QEMU remains halted until its timeout; it then restores the default release kernel and ISO.
 - [x] Boot the descriptor setup and both tested exception paths in QEMU. These checks cover only the injected page fault and invalid opcode, not all vectors or physical hardware.
 
-**Exit criteria:** met locally on 2026-10-24. `just verify`, `just frame-smoke`, and `just fault-smoke` passed after final review, covering host tests, the target build, active cloned-root boot, frame and candidate-map probes, heap behavior, and fatal page-fault/invalid-opcode diagnostics. The QEMU configuration reported CR4.PGE clear and exercised the CR3 reload path; the PGE-toggle global-TLB path is statically reviewed but was not exercised in QEMU. The active hierarchy preserves Limine's complete reachable mapping graph and hardens the kernel-image HHDM aliases; it is not a clean-room address-space policy, does not reclaim the old root or leaf frames, and has no general active mapping service. Hosted CI and physical-hardware validation remain pending and are not claimed by this local exit status.
+**Exit criteria:** met locally on 2026-10-24. `just verify`, `just frame-smoke`, and `just fault-smoke` passed after final review, covering host tests, the target build, active cloned-root boot, frame and candidate-map probes, heap behavior, and fatal page-fault/invalid-opcode diagnostics. The QEMU configuration reported CR4.PGE clear and exercised the CR3 reload path; the PGE-toggle global-TLB path is statically reviewed but was not exercised in QEMU. The active hierarchy preserves Limine's complete reachable mapping graph and hardens the kernel-image HHDM aliases; it is not a clean-room address-space policy, does not reclaim the old root or leaf frames, and has no general active mapping service. Hosted CI passed on the published `dev` state on 2026-11-06; physical-hardware validation remains pending, and the hosted run does not cover today's uncommitted changes.
 
 ---
 
-## Milestone 3 — IRQs, time, and kernel scheduling
+## Milestone 3 — IRQs, time, and kernel scheduling (local exit criteria met)
 
 Do not enable interrupts as a side effect of installing exception gates. IRQ delivery needs its own controller, acknowledgement, masking, ownership, and synchronization design.
 
-### Planned work
+### Implementation and remaining work
 
-The current source slices add host-tested, allocation-free RSDP/SDT and bounded RSDT/XSDT traversal plus xAPIC MADT parsing in `src/acpi.rs`, a fixed-capacity device-vector allocator in `src/irq.rs`, and a Limine RSDP request that records its physical address only after validating Limine's zero-valued supported-revision marker and metadata-checking the initial 20-byte span plus its full page-rounded mapping extent against ACPI map regions. `CandidatePageTables` provides an inactive-only read-only/NX borrowed ACPI-page mapping primitive, and the boot path uses temporary CR3 switches through this reader to copy MADT data into `BootInfo`. These new privileged mapping/CR3 operations still lack QEMU validation; APIC initialization, IDT IRQ dispatch, and IRQ delivery are not implemented. The items below remain pending until their complete behavior and validation criteria are met.
+The current source includes host-tested bounded ACPI parsing and span authorization, a boot-only read-only/NX ACPI reader that copies MADT data into owned state, xAPIC/I/O APIC routing, allocated IRQ dispatch and acknowledgement, a PIT timer, a cooperative scheduler, guarded thread stacks, bounded frame-backed heap growth, and interrupt-driven UART/PS/2 queues. On 2026-11-07, `just verify` passed on the final integrated tree, including active mapping/TLB, cooperative thread, and UART/PS/2 input QEMU smokes. The work-item boxes record source work and observed evidence; deferred timer preemption and SMP are not part of the completed single-vCPU cooperative slice.
 
-- [ ] Use the existing QEMU `q35` machine with one vCPU as the first IRQ target. Use the local APIC and I/O APIC described by ACPI MADT, keep the legacy 8259 PIC masked, and do not enable both routing paths.
-- [ ] Add a bounded ACPI table reader before MADT/APIC setup. Request the RSDP from Limine; map only table spans covered by validated ACPI memory-map regions, read-only and NX, with checked lengths, signatures, checksums, and fixed capacity. Copy the required MADT/FADT data into owned kernel state before releasing any ACPI mapping. Do not use the HHDM or the frame allocator to access arbitrary ACPI physical addresses.
-- [ ] Parse MADT topology and interrupt-source overrides for the selected QEMU machine. Use FADT power-control data only where needed; treat HPET as an optional timer source, and defer MCFG/PCI parsing to Milestone 5.
-- [ ] Add IRQ vector allocation, controller masking/unmasking, end-of-interrupt acknowledgement, spurious-interrupt handling, and a policy for unexpected IRQs.
-- [ ] Use a periodic 8254 PIT tick, initially about 100 Hz and routed through the I/O APIC according to the MADT, as the first scheduler timer. Add a verified monotonic counter and test interval arithmetic and drift; keep wall-clock time separate and define behavior when its RTC/platform source is unavailable or invalid.
-- [ ] Establish interrupt-safe lock primitives and rules for code callable from normal, exception, and IRQ contexts. Add bounded wait queues and sleep/wakeup semantics so threads can block without busy-polling.
-- [ ] Add a general active kernel mapping service with transactional map/unmap, owned table frames, TLB invalidation before a mapped frame token is returned, explicit permissions/cache policy, and rollback. Map ordinary RAM only with allocator-issued `Frame` tokens. Keep ACPI reads in the bounded read-only path above; require explicit physical ranges and cache policy for later MMIO mappings.
-- [ ] Before scheduler/process/VFS workloads need general dynamic allocation, extend the fixed 256 KiB/128-record bootstrap heap with a bounded, frame-backed heap that grows in 4 KiB pages inside a documented virtual range. Choose its maximum after workload estimates and tests. Allocation failure must be explicit; do not leave partially updated mappings or allocator state.
-- [ ] Forbid heap allocation in IRQ/exception contexts. Define allocator synchronization and exhaustion handling before preemption; use fallible allocation where possible and a controlled fatal path only for operations that cannot recover.
-- [ ] Keep Limine bootloader-reclaimable memory, ACPI memory, the active boot stack, and the inherited old page-table root reserved during this milestone. Do not return these regions to the frame allocator; later reclamation requires an owned stack and proof that no live references remain, plus an explicit retained-memory budget.
-- [ ] Add single-vCPU cooperative kernel threads first: define lifecycle, owned stacks and guard policy, yield/sleep/wakeup behavior, and context-switch tests. Do not enable timer preemption in this initial scheduler slice.
-- [ ] Add timer-driven preemption only after lock, stack, timer, wait-queue, and interrupt-return invariants have deterministic tests. Keep SMP as a separate sub-milestone after per-CPU state, TLB shootdown, and lock semantics exist.
-- [ ] Add interrupt-driven UART and PS/2 input paths with bounded ring buffers and thread wakeups after the IRQ and wait-queue foundations are tested; retain polling as an early boot and recovery path.
+- [x] Use the existing single-vCPU QEMU `q35` configuration with the local APIC and MADT-described I/O APIC; keep legacy PIC routing masked. OVMF smokes observed timer and device IRQ delivery.
+- [x] Read bounded ACPI tables through the validated read-only/NX path. The reader checks table bounds/signatures/checksums and copies the required MADT data into owned state; host tests cover malformed tables and span authorization, and OVMF reports the copied MADT.
+- [x] Parse the selected machine's MADT topology and interrupt-source overrides. Host parser tests and OVMF boot cover the data used by APIC routing; FADT/HPET/MCFG work remains limited to this milestone's needs.
+- [x] Add fixed-capacity IRQ vector ownership, masked-first controller routes, dispatch, spurious/unexpected-vector handling, and EOI. OVMF observed timer IRQ delivery and acknowledgement; input routes are also tested.
+- [x] Route an approximately 100 Hz 8254 PIT through the I/O APIC and maintain atomic monotonic ticks. Host tests cover divisor and elapsed-time arithmetic, including fractional-tick rounding drift; OVMF verifies live timer delivery and EOI. Wall-clock time remains separate and is not provided.
+- [x] Add bounded wait queues, cooperative sleep/wakeup, and event handoff; host scheduler tests and OVMF `thread-smoke` cover wakeup and timed sleep.
+- [ ] Establish IRQ-safe lock primitives and broader context-specific locking rules before enabling timer preemption; the current heap is not IRQ-safe.
+- [x] Implement owned-frame active map/unmap with explicit mapping/cache policy, transactional rollback, and local TLB invalidation. Host tests cover failure rollback; `active-map-smoke` passed live mapping, access, invalidation, and reclamation in QEMU.
+- [x] Extend the 256 KiB bootstrap heap with a bounded 1 MiB frame-backed, demand-mapped region. Host tests cover growth, reuse, and failed growth; `thread-smoke` observed bootstrap exhaustion, growth, and reuse.
+- [x] Keep allocator operations out of IRQ/exception handlers; handlers use bounded, allocation-free work, and the heap contract explicitly forbids IRQ-context allocation. Exhaustion is fallible at the allocator boundary. The heap is not IRQ-safe; timer preemption remains disabled.
+- [x] Keep bootloader-reclaimable and ACPI memory, the active bootstrap stack, and Limine's inherited page-table root reserved; the active cloned root retains its owned table frames and does not reclaim the old root or inherited leaf frames.
+- [x] Add single-vCPU cooperative threads with owned guarded stacks, lifecycle, yield, event wait/wakeup, timed sleep, and context-switch tests. The OVMF thread smoke passed these paths.
+- [ ] Add timer-driven preemption only after locking, stack, timer, wait-queue, and interrupt-return invariants have deterministic tests. SMP remains a separate later sub-milestone.
+- [x] Implement interrupt-driven UART RX and PS/2 raw-scancode queues with bounded buffers and scheduler event wakeups; preserve polling fallback. OVMF `input-smoke` sends a shell command over UART and verifies a PS/2 make scancode after the shell blocks for input.
 
 **Exit criteria:** the single-vCPU QEMU `q35` configuration validates the selected APIC routing, PIT tick, and IRQ acknowledgement; host/QEMU tests cover ACPI bounds and malformed tables, mapping rollback/TLB behavior, heap exhaustion, wait-queue wakeups, and cooperative context switching. Interrupt-driven input is tested without busy-polling, and no heap allocation occurs in IRQ/exception context. No `sti` before the design and tests are ready.
 

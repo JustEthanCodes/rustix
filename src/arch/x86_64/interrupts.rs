@@ -1,12 +1,19 @@
-//! Bootstrap GDT, TSS, and fatal exception diagnostics for x86_64.
+//! Bootstrap GDT, TSS, and interrupt entry for x86_64.
 //!
-//! Hardware interrupts remain disabled. This installs exception gates only; it
-//! does not initialize a PIC/APIC, enable IRQs, or provide recoverable faults.
+//! Bootstrap installs exception and device-IRQ gates with maskable interrupts
+//! disabled. APIC setup, route masking, handler registration, and explicit `sti`
+//! are owned by the boot path; exceptions remain fatal-only.
 
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
 
 const EXCEPTION_COUNT: usize = 32;
+const IRQ_FIRST_VECTOR: usize = 0x20;
+const IRQ_LAST_VECTOR: usize = 0xef;
+const IRQ_VECTOR_COUNT: usize = IRQ_LAST_VECTOR - IRQ_FIRST_VECTOR + 1;
+const APIC_SPURIOUS_VECTOR: usize = 0xff;
+const IRQ_STUB_COUNT: usize = IRQ_VECTOR_COUNT + 1;
+const _: [(); 208] = [(); IRQ_VECTOR_COUNT];
 const KERNEL_CODE_SELECTOR: u16 = 0x08;
 const STACK_SIZE: usize = 16 * 1024;
 const TSS_DESCRIPTOR_TYPE: u64 = 0x89;
@@ -103,6 +110,19 @@ static mut IDT: IdtTable = IdtTable([IdtEntry::MISSING; 256]);
 static mut TSS: TaskStateSegment = TaskStateSegment::EMPTY;
 static mut RING0_STACK: Stack = Stack([0; STACK_SIZE]);
 static mut DOUBLE_FAULT_STACK: Stack = Stack([0; STACK_SIZE]);
+static mut IRQ_HANDLERS: [Option<IrqHandler>; 256] = [None; 256];
+
+/// A device interrupt callback. The callback is responsible for issuing EOI.
+pub type IrqHandler = extern "C" fn();
+
+/// Reasons an IRQ callback could not be registered.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IrqRegistrationError {
+    InvalidVector,
+    InterruptsEnabled,
+    AlreadyRegistered,
+}
 
 #[repr(C)]
 pub(crate) struct ExceptionContext {
@@ -132,13 +152,19 @@ const _: [(); 16] = [(); size_of::<IdtEntry>()];
 const _: [(); 4096] = [(); size_of::<IdtTable>()];
 const _: [(); 104] = [(); size_of::<TaskStateSegment>()];
 const _: [(); 160] = [(); size_of::<ExceptionContext>()];
+const _: [(); 120] = [(); core::mem::offset_of!(ExceptionContext, vector)];
+const _: [(); 128] = [(); core::mem::offset_of!(ExceptionContext, error_code)];
+const _: [(); 136] = [(); core::mem::offset_of!(ExceptionContext, rip)];
+const _: [(); 144] = [(); core::mem::offset_of!(ExceptionContext, cs)];
+const _: [(); 152] = [(); core::mem::offset_of!(ExceptionContext, rflags)];
 
 extern "C" {
     static exception_stub_table: [usize; EXCEPTION_COUNT];
+    static irq_stub_table: [usize; IRQ_STUB_COUNT];
     fn rustix_load_gdt(descriptor_table_pointer: *const DescriptorTablePointer);
 }
 
-/// Install a private kernel GDT/TSS and exception gates for vectors 0–31.
+/// Install a private kernel GDT/TSS, exception gates, and device IRQ gates.
 ///
 /// The bootstrap runs with maskable interrupts disabled. This routine leaves
 /// them disabled and does not modify CR3 or the inherited page-table hierarchy.
@@ -212,12 +238,108 @@ unsafe fn initialize_idt() {
         }
     }
 
+    let irq_stubs = core::ptr::addr_of!(irq_stub_table).cast::<usize>();
+    for vector in IRQ_FIRST_VECTOR..=IRQ_LAST_VECTOR {
+        // SAFETY: The assembly table contains one stub for each allocated vector.
+        let handler = unsafe { irq_stubs.add(vector - IRQ_FIRST_VECTOR).read() } as u64;
+        // SAFETY: `vector` is bounded by the statically allocated 256-entry IDT.
+        unsafe {
+            idt_entries
+                .add(vector)
+                .write(IdtEntry::interrupt_gate(handler, 0));
+        }
+    }
+    // SAFETY: The final table entry is the dedicated 0xff spurious-IRQ stub.
+    let spurious_handler = unsafe { irq_stubs.add(IRQ_VECTOR_COUNT).read() } as u64;
+    // SAFETY: The APIC spurious vector is a valid IDT index.
+    unsafe {
+        idt_entries
+            .add(APIC_SPURIOUS_VECTOR)
+            .write(IdtEntry::interrupt_gate(spurious_handler, 0));
+    }
+
     let idtr = DescriptorTablePointer {
         limit: (size_of::<IdtTable>() - 1) as u16,
         base: core::ptr::addr_of!(IDT) as u64,
     };
     // SAFETY: Every architectural exception gate is initialized in static storage.
     unsafe { asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags)) };
+}
+
+/// Register one callback for an allocated device IRQ vector.
+///
+/// # Safety
+///
+/// The caller must keep the IRQ source masked while registering and ensure it
+/// is masked whenever this callback is dispatched. The caller must serialize
+/// registration against IRQ dispatch on every CPU. `handler` must not allocate,
+/// format output, block, or unwind; it runs with IF disabled and owns the EOI.
+/// The source must remain masked until all handler state is ready.
+#[allow(dead_code)]
+pub unsafe fn register_irq_handler(
+    vector: u8,
+    handler: IrqHandler,
+) -> Result<(), IrqRegistrationError> {
+    let vector = vector as usize;
+    if !(IRQ_FIRST_VECTOR..=IRQ_LAST_VECTOR).contains(&vector) {
+        return Err(IrqRegistrationError::InvalidVector);
+    }
+
+    let flags: u64;
+    // SAFETY: This reads RFLAGS at CPL 0; the temporary push/pop is balanced.
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
+    }
+    if flags & (1 << 9) != 0 {
+        return Err(IrqRegistrationError::InterruptsEnabled);
+    }
+
+    // SAFETY: The API contract requires registration to be serialized with IRQ
+    // dispatch, and the vector has been checked against the table bounds.
+    let slot = unsafe {
+        core::ptr::addr_of_mut!(IRQ_HANDLERS)
+            .cast::<Option<IrqHandler>>()
+            .add(vector)
+    };
+    // SAFETY: `slot` points into the initialized static callback table.
+    if unsafe { slot.read() }.is_some() {
+        return Err(IrqRegistrationError::AlreadyRegistered);
+    }
+    // SAFETY: Registration is serialized by the caller's masking/IF contract.
+    unsafe { slot.write(Some(handler)) };
+    Ok(())
+}
+
+/// Device IRQ target called by the normalized assembly stubs.
+#[no_mangle]
+pub extern "C" fn rustix_irq_dispatch(vector: u64) {
+    if vector == APIC_SPURIOUS_VECTOR as u64 {
+        return;
+    }
+
+    if !(IRQ_FIRST_VECTOR as u64..=IRQ_LAST_VECTOR as u64).contains(&vector) {
+        fatal_irq_halt();
+    }
+
+    // SAFETY: Interrupt gates clear IF, and registration's safety contract
+    // serializes writes against this read. No mutable reference is created.
+    let handler = unsafe {
+        core::ptr::addr_of!(IRQ_HANDLERS)
+            .cast::<Option<IrqHandler>>()
+            .add(vector as usize)
+            .read()
+    };
+    match handler {
+        Some(handler) => handler(),
+        None => fatal_irq_halt(),
+    }
+}
+
+fn fatal_irq_halt() -> ! {
+    loop {
+        // SAFETY: Unknown device interrupts are fatal and must not be retried.
+        unsafe { asm!("cli; hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Fatal exception target called by the assembly stubs.
@@ -422,5 +544,79 @@ exception_stub_table:
     .quad rustix_exception_20, rustix_exception_21, rustix_exception_22, rustix_exception_23
     .quad rustix_exception_24, rustix_exception_25, rustix_exception_26, rustix_exception_27
     .quad rustix_exception_28, rustix_exception_29, rustix_exception_30, rustix_exception_31
+
+    .section .text
+    # Each IRQ entry is exactly 12 bytes: push synthetic error code, push its
+    # vector as imm32, then a rel32 jump to the shared GPR-saving entry.
+    .macro RUSTIX_IRQ_STUB vector
+    .byte 0x6a, 0
+    .byte 0x68
+    .long \vector
+    .byte 0xe9
+    .long rustix_irq_common - . - 4
+    .endm
+
+    .global rustix_irq_stub_start
+rustix_irq_stub_start:
+    .set irq_vector, 0x20
+    .rept 208
+    RUSTIX_IRQ_STUB irq_vector
+    .set irq_vector, irq_vector + 1
+    .endr
+    .global rustix_irq_spurious_stub
+rustix_irq_spurious_stub:
+    RUSTIX_IRQ_STUB 0xff
+
+    rustix_irq_common:
+    cld
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    mov edi, dword ptr [rsp + 120]
+    mov rbx, rsp
+    and rsp, -16
+    call rustix_irq_dispatch
+    mov rsp, rbx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
+    iretq
+
+    .section .rodata
+    .align 8
+    .global irq_stub_table
+irq_stub_table:
+    .set irq_vector, 0x20
+    .rept 208
+    .quad rustix_irq_stub_start + ((irq_vector - 0x20) * 12)
+    .set irq_vector, irq_vector + 1
+    .endr
+    .quad rustix_irq_spurious_stub
+
     "#
 );

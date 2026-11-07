@@ -32,13 +32,29 @@ debug-run: debug-image
 image: build
     python scripts/boot.py image
 
-# Boot the ISO in QEMU and verify Crabshell's prompt within 20 seconds.
+# Boot the ISO in QEMU's default BIOS mode and verify Crabshell's prompt.
 smoke: image
     python scripts/boot.py smoke
+
+# Boot the ISO with OVMF and verify ACPI MADT, CR3 transition, and prompt.
+uefi-smoke: image
+    python scripts/boot.py uefi-smoke
+
+# Probe active owned-page mappings and TLB invalidation in QEMU, then restore the default image.
+active-map-smoke:
+    python scripts/boot.py active-map-smoke
 
 # Probe checked HHDM access, inherited mappings, and an inactive candidate root in QEMU.
 frame-smoke:
     python scripts/boot.py frame-smoke
+
+# Exercise cooperative thread switching and wait queues in OVMF, then restore the default image.
+thread-smoke:
+    python scripts/boot.py thread-smoke
+
+# Exercise UART and PS/2 IRQ input waking the cooperative shell in OVMF.
+input-smoke: image
+    python scripts/boot.py input-smoke
 
 # Inject controlled exceptions in QEMU, then restore the default release image.
 fault-smoke:
@@ -52,5 +68,5 @@ run: image
 test:
     cargo test --workspace --lib
 
-# Run formatting, host tests, target checks, image creation, and QEMU smoke test.
-verify: fmt test check smoke
+# Run formatting, host tests, target checks, and the Milestone 3 QEMU smoke suite.
+verify: fmt test check smoke uefi-smoke active-map-smoke thread-smoke input-smoke

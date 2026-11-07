@@ -105,6 +105,13 @@ pub fn identify() -> CpuInfo {
     }
 }
 
+/// Return the bootstrap processor's legacy xAPIC ID from CPUID leaf 1.
+///
+/// Callers must separately verify that the CPU and platform support xAPIC.
+pub fn bootstrap_apic_id() -> u8 {
+    (__cpuid(1).ebx >> 24) as u8
+}
+
 /// Read the current raw CR3 value without changing page-table state.
 pub fn read_cr3_raw() -> u64 {
     let cr3: u64;
