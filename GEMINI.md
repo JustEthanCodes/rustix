@@ -105,3 +105,9 @@ Image and boot checks need Python 3, `xorriso`, QEMU, the Rust target, and netwo
 - `docs/architecture/drivers.md` — implemented drivers and limitations.
 - `docs/security.md` — unsafe boundaries and security requirements.
 - `docs/development/building.md` and `docs/development/testing.md` — build/test workflows and evidence policy.
+
+
+<!-- entire-agent:begin -->
+Read .entire/agent-guide.md for this repository's workflow, source inspection, and verification guidance.
+@.entire/agent-guide.md
+<!-- entire-agent:end -->
