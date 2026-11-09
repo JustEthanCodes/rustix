@@ -1646,7 +1646,7 @@ fn probe_kernel_heap() {
     unsafe { KERNEL_HEAP.dealloc(allocation.as_ptr(), layout) };
     // SAFETY: The previous allocation was returned; first-fit should reuse it.
     let reused = unsafe { KERNEL_HEAP.alloc(layout) };
-    if reused != allocation {
+    if reused != allocation.as_ptr() {
         if !reused.is_null() {
             // SAFETY: `reused` is a live allocation with `layout`.
             unsafe { KERNEL_HEAP.dealloc(reused, layout) };
@@ -1667,40 +1667,54 @@ fn probe_kernel_heap() {
     // SAFETY: This request is larger than the bootstrap arena, so it must use
     // the configured frame-backed range and remain within its fixed limit.
     let growth = unsafe { KERNEL_HEAP.alloc(growth_layout) };
+    let Some(growth) = core::ptr::NonNull::new(growth) else {
+        kprintln!("kernel heap probe failed: frame-backed allocation was rejected");
+        halt_forever();
+    };
+    let growth_address = growth.as_ptr() as usize;
     let growth_end = KERNEL_HEAP_GROWTH_VIRTUAL_BASE as usize
         + KERNEL_HEAP_GROWTH_MAX_PAGES * PAGE_SIZE as usize;
-    if growth.is_null()
-        || (growth as usize) < KERNEL_HEAP_GROWTH_VIRTUAL_BASE as usize
-        || (growth as usize)
+    if growth_address < KERNEL_HEAP_GROWTH_VIRTUAL_BASE as usize
+        || growth_address
             .checked_add(growth_layout.size())
             .is_none_or(|end| end > growth_end)
-        || growth as usize % growth_layout.align() != 0
+        || growth_address % growth_layout.align() != 0
     {
-        if !growth.is_null() {
-            // SAFETY: `growth` was returned for `growth_layout`.
-            unsafe { KERNEL_HEAP.dealloc(growth, growth_layout) };
-        }
-        kprintln!("kernel heap probe failed: frame-backed allocation was rejected or invalid");
+        // SAFETY: `growth` is the live allocation returned for `growth_layout`.
+        unsafe { KERNEL_HEAP.dealloc(growth.as_ptr(), growth_layout) };
+        kprintln!("kernel heap probe failed: frame-backed allocation was invalid");
         halt_forever();
     }
-    // SAFETY: The committed pages cover the complete live allocation.
-    unsafe {
-        growth.write(0x5a);
-        growth.add(growth_layout.size() - 1).write(0xa5);
-    }
-    // SAFETY: Both offsets are within the live allocation.
-    if unsafe { growth.read_volatile() } != 0x5a
-        || unsafe { growth.add(growth_layout.size() - 1).read_volatile() } != 0xa5
+    // SAFETY: GlobalAlloc returned a live allocation, and the checks above keep
+    // its complete extent inside the reserved range. The heap mapper commits all
+    // pages covering the allocation before returning it. MaybeUninit permits the
+    // backing frames to be uninitialized when the mutable view is created.
+    let growth_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            growth.as_ptr().cast::<core::mem::MaybeUninit<u8>>(),
+            growth_layout.size(),
+        )
+    };
+    let last_byte = growth_layout.size() - 1;
+    growth_bytes[0].write(0x5a);
+    growth_bytes[last_byte].write(0xa5);
+    // SAFETY: Both slots were initialized immediately above and are within the
+    // validated live allocation. Reading through the references retains the
+    // allocation's validity proof for the volatile access.
+    let first_byte = unsafe { growth_bytes[0].assume_init_ref() };
+    let last_byte = unsafe { growth_bytes[last_byte].assume_init_ref() };
+    if unsafe { core::ptr::read_volatile(first_byte) } != 0x5a
+        || unsafe { core::ptr::read_volatile(last_byte) } != 0xa5
     {
         // SAFETY: The allocation is still live with its original layout.
-        unsafe { KERNEL_HEAP.dealloc(growth, growth_layout) };
+        unsafe { KERNEL_HEAP.dealloc(growth.as_ptr(), growth_layout) };
         kprintln!("kernel heap probe failed: frame-backed data did not round-trip");
         halt_forever();
     }
     // SAFETY: Return the exact growth allocation and then require first-fit reuse.
-    unsafe { KERNEL_HEAP.dealloc(growth, growth_layout) };
+    unsafe { KERNEL_HEAP.dealloc(growth.as_ptr(), growth_layout) };
     let growth_reused = unsafe { KERNEL_HEAP.alloc(growth_layout) };
-    if growth_reused != growth {
+    if growth_reused != growth.as_ptr() {
         if !growth_reused.is_null() {
             // SAFETY: The pointer is live with `growth_layout`.
             unsafe { KERNEL_HEAP.dealloc(growth_reused, growth_layout) };
