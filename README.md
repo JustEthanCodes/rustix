@@ -1,5 +1,8 @@
 # Rustix
 
+> [!Note]
+> **Yes**. This project is pretty much 100% AI coded. If you don't like or support AI, feel free to leave. 
+
 Rustix (Rust-unix) is an experimental, 64-bit, Unix-like operating system whose kernel is written in Rust. This repository builds the kernel itself; Limine is used only as the external boot protocol/loader, not as a substitute for a Rustix kernel.
 
 Rustix now boots into **Crabshell**, a small kernel-mode shell on the COM1 serial terminal. It includes basic navigation and file commands backed by a fixed-capacity RAM filesystem. The filesystem is volatile and reset at every boot; this is an early kernel shell, not a userspace process or POSIX shell. The command parser lives in a separate, allocation-free `crabshell` crate so a future GUI terminal can reuse it. Scheduling, process isolation, persistent storage, a syscall ABI, networking, and userspace are still future work. See [`docs/roadmap/README.md`](docs/roadmap/README.md) for the staged plan.
