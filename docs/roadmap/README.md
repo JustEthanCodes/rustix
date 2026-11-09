@@ -14,7 +14,7 @@ This roadmap describes an incremental path from the current bare-metal kernel to
 - **Milestone 0: local exit criteria met from a clean detached worktree; hosted CI observed.** On 2026-10-16, `just verify` passed in WSL2 Ubuntu 24.04 from both the working tree and a clean detached worktree with an empty `target` directory. On 2026-11-06, GitHub Actions run [#5](https://github.com/JustEthanCodes/rustix/actions/runs/42288095710) completed successfully on `dev` at `770f9c742dd07a00f6b53274ea05a1eca010d146`; its `kernel-and-boot-smoke` job ran `just verify`. This verifies hosted CI on that remote commit, not today’s uncommitted changes.
 - **Milestone 1: validation criteria met for the current Limine path.** The bounded boot snapshot, memory-range classification, and CPUID reporting were covered by host tests and QEMU reporting; the Limine pointer-readability trust boundary remains explicit.
 - **Milestone 2: local exit criteria met on 2026-10-24; hosted CI observed, physical-hardware validation pending.** The boot path owns and activates a clone of Limine's reachable page-table hierarchy, preserves inherited mappings, hardens kernel HHDM aliases to R/NX or RW/NX while retaining PAT attributes, invalidates stale translations on CR3 transitions, and retains table-frame tokens. `just verify`, `just frame-smoke`, and `just fault-smoke` passed after final review; QEMU exercised the active-PCID/CR3 invalidation path with CR4.PGE clear. The PGE-toggle path is statically reviewed but was not exercised by this QEMU configuration. The successful 2026-11-06 hosted `just verify` run covers the published Milestone 2 state, but not today's uncommitted changes. Broad mapping policy, reclamation, IRQ-safe allocation, and physical-hardware validation remain outside this milestone's completed scope.
-- **Milestone 3: local exit criteria met on 2026-11-07; hosted CI and physical-hardware validation remain pending.** `just verify` passed with 127 host tests, the `x86_64-unknown-none` check, BIOS and OVMF boot smokes, active-map/TLB invalidation, cooperative thread/wait-queue tests, and UART/PS/2 input wakeup. OVMF validated MADT/APIC routing, PIT ticks and EOI, guarded cooperative stacks, frame-backed heap growth, and shell input without busy-polling. Timer preemption, IRQ-safe locking for future preemption, and SMP remain deferred. See the evidence and limits below. **Milestones 4 and later: planned.** There is no userspace, syscall ABI, persistent filesystem, GUI, or networking stack.
+- **Milestone 3: local exit criteria met on 2026-11-07; hosted CI and physical-hardware validation remain pending.** `just verify` passed with 127 host tests, the `x86_64-unknown-none` check, BIOS and OVMF boot smokes, active-map/TLB invalidation, cooperative thread/wait-queue tests, and UART/PS/2 input wakeup. OVMF validated MADT/APIC routing, PIT ticks and EOI, guarded cooperative stacks, frame-backed heap growth, and shell input without busy-polling. Timer preemption, IRQ-safe locking for future preemption, and SMP remain deferred. See the evidence and limits below. **Milestones 4 and later: planned.** There is no ARM64 platform support, userspace, syscall ABI, persistent filesystem, GUI, or networking stack.
 
 ## Dependency path
 
@@ -281,7 +281,24 @@ The planned filesystem layout is illustrated below. This is a directory-layout p
 
 ---
 
-## Milestone 7 — graphical console and GUI (long-term)
+## Milestone 7 — ARM64 (AArch64) platform support (long-term)
+
+The current implementation targets x86_64. Add ARM64 as a separate platform backend without weakening the existing x86_64 path or implying feature parity. Start with one documented emulator configuration and expand only when its boot, memory, interrupt, and device contracts are validated.
+
+### Planned work
+
+- [ ] Select and document the initial AArch64 execution environment, firmware/boot protocol, Rust target, linker layout, entry state, and supported CPU/platform assumptions. Use QEMU `virt` as the first repeatable emulator target.
+- [ ] Add an isolated AArch64 architecture backend and target-specific build/boot configuration; preserve the working x86_64 target and share code only where the architecture-independent contract is clear.
+- [ ] Establish a minimal boot path with bounded serial diagnostics and validated boot metadata, kernel-image bounds, stack state, and usable-memory ownership. Reject unsupported or malformed handoff state visibly.
+- [ ] Implement the architecture-specific exception/vector setup, translation-table and cache-maintenance operations, timer, and interrupt-controller path required by the kernel's supported runtime. Keep privileged instructions and raw MMIO access narrow and documented.
+- [ ] Adapt the existing kernel services incrementally to explicit architecture interfaces. Keep features unavailable on AArch64 disabled rather than silently approximating their behavior.
+- [ ] Add host tests for architecture-independent policy and repeatable AArch64 QEMU tests for boot, diagnostics, memory setup, and configured interrupt/timer behavior. Track physical-hardware validation separately.
+
+**Exit criteria:** the documented AArch64 QEMU target boots the Rustix kernel through a validated platform initialization path, runs the explicitly supported kernel services with integration evidence, and leaves the existing x86_64 validation path passing. This milestone does not claim userspace or full feature parity across architectures.
+
+---
+
+## Milestone 8 — graphical console and GUI (long-term)
 
 A GUI is intentionally downstream of stable memory management, interrupts/input, process isolation, drivers, and userspace. Keep Crabshell's parser independent so a graphical terminal frontend can reuse it.
 
@@ -300,7 +317,7 @@ A GUI is intentionally downstream of stable memory management, interrupts/input,
 
 ---
 
-## Milestone 8 — networking (long-term, after drivers and process isolation)
+## Milestone 9 — networking (long-term, after drivers and process isolation)
 
 Networking is not implied by the current device drivers. The initial target should be a tightly scoped virtual-device path with clear ownership and bounded buffers.
 
@@ -317,7 +334,7 @@ Networking is not implied by the current device drivers. The initial target shou
 
 ---
 
-## Milestone 9 — installation, updates, and physical security (long-term)
+## Milestone 10 — installation, updates, and physical security (long-term)
 
 This milestone depends on persistent storage. Local installation and update workflows can precede networking; remote update-server integration additionally depends on the networking and GUI milestones. Recovery media by itself is not protection against physical attackers.
 
