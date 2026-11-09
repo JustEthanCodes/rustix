@@ -1627,19 +1627,23 @@ fn probe_kernel_heap() {
         kprintln!("kernel heap probe failed: aligned allocation was rejected or misaligned");
         halt_forever();
     }
+    let Some(allocation) = core::ptr::NonNull::new(allocation) else {
+        kprintln!("kernel heap probe failed: aligned allocation was unexpectedly null");
+        halt_forever();
+    };
     // SAFETY: The allocator returned `layout.size()` writable bytes.
-    unsafe { core::ptr::write_bytes(allocation, 0xa5, layout.size()) };
+    unsafe { core::ptr::write_bytes(allocation.as_ptr(), 0xa5, layout.size()) };
     for index in 0..layout.size() {
         // SAFETY: `index` remains inside the live allocation.
-        if unsafe { allocation.add(index).read_volatile() } != 0xa5 {
+        if unsafe { allocation.as_ptr().add(index).read_volatile() } != 0xa5 {
             // SAFETY: The allocation is still live with its original layout.
-            unsafe { KERNEL_HEAP.dealloc(allocation, layout) };
+            unsafe { KERNEL_HEAP.dealloc(allocation.as_ptr(), layout) };
             kprintln!("kernel heap probe failed: allocation data did not round-trip");
             halt_forever();
         }
     }
     // SAFETY: The allocation is live and the original layout is supplied.
-    unsafe { KERNEL_HEAP.dealloc(allocation, layout) };
+    unsafe { KERNEL_HEAP.dealloc(allocation.as_ptr(), layout) };
     // SAFETY: The previous allocation was returned; first-fit should reuse it.
     let reused = unsafe { KERNEL_HEAP.alloc(layout) };
     if reused != allocation {
