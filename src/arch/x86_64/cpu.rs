@@ -7,7 +7,22 @@ use rustix_kernel::paging::{capture_mtrr_registers, MtrrState};
 const IA32_EFER: u32 = 0xc000_0080;
 const IA32_PAT: u32 = 0x0000_0277;
 const EFER_NXE: u64 = 1 << 11;
+const CR0_MP: u64 = 1 << 1;
+const CR0_EM: u64 = 1 << 2;
+const CR0_TS: u64 = 1 << 3;
+const CR0_NE: u64 = 1 << 5;
 const CR4_PGE: u64 = 1 << 7;
+const CR4_OSFXSR: u64 = 1 << 9;
+const CR4_OSXMMEXCPT: u64 = 1 << 10;
+const CR4_OSXSAVE: u64 = 1 << 18;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuStateError {
+    X87Unavailable,
+    FxsaveUnavailable,
+    SseUnavailable,
+    Sse2Unavailable,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuInfo {
@@ -28,6 +43,37 @@ pub struct CpuInfo {
     pub max_linear_address_bits: Option<u8>,
     pub active_linear_address_bits: u8,
     pub pcid_enabled: bool,
+}
+
+/// Enable the x87/SSE state required by the x86_64 kernel ABI and FXSAVE contexts.
+///
+/// AVX/XSAVE state is intentionally disabled; any future target feature change
+/// must extend the context-switch save format before it can be enabled.
+pub fn initialize_fpu_state() -> Result<(), CpuStateError> {
+    let features = __cpuid(1).edx;
+    if features & (1 << 0) == 0 {
+        return Err(CpuStateError::X87Unavailable);
+    }
+    if features & (1 << 24) == 0 {
+        return Err(CpuStateError::FxsaveUnavailable);
+    }
+    if features & (1 << 25) == 0 {
+        return Err(CpuStateError::SseUnavailable);
+    }
+    if features & (1 << 26) == 0 {
+        return Err(CpuStateError::Sse2Unavailable);
+    }
+
+    let cr0 = (read_cr0_raw() | CR0_MP | CR0_NE) & !(CR0_EM | CR0_TS);
+    // SAFETY: This only enables the architectural x87 state and native error
+    // reporting, clearing EM/TS so the kernel can use its required FP state.
+    unsafe { write_cr0_raw(cr0) };
+
+    let cr4 = (read_cr4_raw() | CR4_OSFXSR | CR4_OSXMMEXCPT) & !CR4_OSXSAVE;
+    // SAFETY: Preserve all existing CR4 controls except enabling OS support for
+    // FXSAVE/SSE and disabling XSAVE/AVX until that state is explicitly managed.
+    unsafe { write_cr4_raw(cr4) };
+    Ok(())
 }
 
 /// Read CPUID identity, selected feature bits, and supported read-only MSR state.
@@ -199,12 +245,22 @@ fn read_cr4_raw() -> u64 {
     cr4
 }
 
-/// Write CR4 while preserving the caller's complete control-register value.
+/// Write CR4 while preserving all control bits except those explicitly changed by
+/// the caller.
 ///
 /// # Safety
 /// `value` must be a valid CR4 value for the current CPU and execution mode.
 unsafe fn write_cr4_raw(value: u64) {
-    // SAFETY: The caller validates the value by preserving the current CR4
-    // state and changing only the architectural PGE bit.
+    // SAFETY: The caller validates the value by preserving current CR4 state and changing
+    // only documented architectural feature bits.
     unsafe { asm!("mov cr4, {}", in(reg) value, options(nostack, preserves_flags)) };
+}
+
+/// Write CR0 while preserving the caller's documented execution-mode controls.
+///
+/// # Safety
+/// `value` must be valid for the current CPU and execution mode.
+unsafe fn write_cr0_raw(value: u64) {
+    // SAFETY: The caller changes only the x87 emulation/task and native-error bits.
+    unsafe { asm!("mov cr0, {}", in(reg) value, options(nostack, preserves_flags)) };
 }

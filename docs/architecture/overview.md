@@ -14,7 +14,7 @@ Unix-like is a compatibility direction. It does **not** mean the current kernel 
 4. The separately packaged `crabshell` `no_std` crate parses commands without allocation or dependence on kernel I/O, making that layer reusable by a future graphical frontend.
 5. The kernel library contains checked memory accounting, bounded ACPI/IRQ/time/input/scheduler policies, heap tests, and the bounded VFS implementation, covered by host-side tests.
 
-The shell and filesystem run in kernel mode. Files exist only in RAM and disappear at reboot. Bootstrap exceptions remain fatal-only; selected timer/UART/PS/2 IRQ routes are enabled after APIC, IDT, and handler setup. The single-vCPU scheduler is cooperative, not preemptive. The active page tables are an owned clone of Limine's reachable hierarchy, with bounded active mapping and a global heap consisting of a 256 KiB BSS arena plus up to 1 MiB of frame-backed growth. There is no clean-room address-space policy, general-purpose MMIO/mapping policy, frame reclamation, timer preemption, SMP, user/kernel isolation, syscall ABI, on-disk filesystem, network stack, or userspace process.
+The shell and filesystem run in kernel mode. Files exist only in RAM and disappear at reboot. Bootstrap exceptions remain fatal-only; selected timer/UART/PS/2 IRQ routes are enabled after APIC, IDT, and handler setup. The single-vCPU scheduler supports cooperative waits/yields and PIT-driven preemption; IRQ-safe locking protects the global heap, while IRQ/exception allocation remains prohibited. Timer context switches preserve x87/SSE state with per-context FXSAVE areas. The active page tables are an owned clone of Limine's reachable hierarchy, with bounded active mapping and a global heap consisting of a 256 KiB BSS arena plus up to 1 MiB of frame-backed growth. There is no clean-room address-space policy, general-purpose MMIO/mapping policy, frame reclamation, SMP, user/kernel isolation, syscall ABI, on-disk filesystem, network stack, or userspace process.
 
 ## Intended layers (planned)
 
@@ -43,6 +43,6 @@ The diagram is a target decomposition, not a claim that those layers are impleme
 
 ## Boot and CPU assumptions
 
-The current target is x86_64, with a 4 KiB page-oriented linker layout and no red zone. Limine performs the initial platform setup required by its protocol. Rustix must not assume that receiving a memory-map response means it owns the loader's page tables or can overwrite reserved regions. The bootstrap enables only validated single-vCPU APIC routes after their handlers and EOI paths are ready; it does not start application processors or enable timer preemption.
+The current target is x86_64, with a 4 KiB page-oriented linker layout and no red zone. Limine performs the initial platform setup required by its protocol. Rustix must not assume that receiving a memory-map response means it owns the loader's page tables or can overwrite reserved regions. The bootstrap enables only validated single-vCPU APIC routes after their handlers and EOI paths are ready; it does not start application processors. Timer preemption is enabled only after the scheduler runtime is live.
 
 See [Boot protocol](boot.md), [Memory management](memory.md), [x86_64 drivers](drivers.md), [Crabshell](crabshell.md), and [the roadmap](../roadmap/README.md) for subsystem boundaries and planned acceptance criteria.

@@ -48,7 +48,7 @@ active-map-smoke:
 frame-smoke:
     python scripts/boot.py frame-smoke
 
-# Exercise cooperative thread switching and wait queues in OVMF, then restore the default image.
+# Exercise IRQ-safe locking, cooperative waits, timer preemption, and FPU state in OVMF.
 thread-smoke:
     python scripts/boot.py thread-smoke
 

@@ -5,15 +5,15 @@
 //! its own fixed allocation table and a caller-supplied transactional mapper.
 //! Growth is bounded; allocation fails when either arena or metadata is full.
 //!
-//! The global wrapper serializes access with a spin lock. Allocation is not
-//! permitted from interrupt or exception context: an interrupt that preempts a
-//! lock holder could otherwise deadlock. IRQ handlers must remain allocation-free.
+//! The global wrapper serializes access with an IRQ-save spin lock. The lock
+//! prevents a local interrupt from re-entering a held allocator lock; allocation
+//! remains forbidden in IRQ/exception context to keep handlers bounded and
+//! allocation-free.
 
+use crate::sync::{IrqSpinLock, IrqSpinLockGuard};
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
-use core::hint::spin_loop;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Fixed capacity of the initial BSS-backed kernel heap.
 pub const KERNEL_HEAP_CAPACITY: usize = 256 * 1024;
@@ -327,14 +327,13 @@ pub enum FrameHeapInitError {
 /// the lifetime of allocations. The growth callback must map the complete page
 /// range transactionally and must not allocate or call this heap recursively.
 pub struct LockedHeap<const HEAP_SIZE: usize, const MAX_ALLOCATIONS: usize> {
-    locked: AtomicBool,
+    lock: IrqSpinLock<()>,
     heap: UnsafeCell<FixedHeap<HEAP_SIZE, MAX_ALLOCATIONS>>,
     growth: UnsafeCell<FrameBackedHeap<MAX_ALLOCATIONS>>,
 }
 
-// SAFETY: `heap` is accessed mutably only while the Acquire/Release spin lock
-// is held. The allocator is not IRQ-safe; callers must follow the module's
-// interrupt-context restriction.
+// SAFETY: `heap` and `growth` are accessed mutably only while the IRQ-save
+// spin lock is held. Allocation remains prohibited in interrupt context.
 unsafe impl<const HEAP_SIZE: usize, const MAX_ALLOCATIONS: usize> Sync
     for LockedHeap<HEAP_SIZE, MAX_ALLOCATIONS>
 {
@@ -344,7 +343,7 @@ impl<const HEAP_SIZE: usize, const MAX_ALLOCATIONS: usize> LockedHeap<HEAP_SIZE,
     /// Construct an empty allocator. The backing arena is zero-initialized BSS.
     pub const fn new() -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            lock: IrqSpinLock::new(()),
             heap: UnsafeCell::new(FixedHeap::new()),
             growth: UnsafeCell::new(FrameBackedHeap::new()),
         }
@@ -371,27 +370,8 @@ impl<const HEAP_SIZE: usize, const MAX_ALLOCATIONS: usize> LockedHeap<HEAP_SIZE,
         growth.configure(base, capacity_pages, context, map_pages)
     }
 
-    fn acquire(&self) -> HeapLock<'_> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            spin_loop();
-        }
-        HeapLock {
-            locked: &self.locked,
-        }
-    }
-}
-
-struct HeapLock<'a> {
-    locked: &'a AtomicBool,
-}
-
-impl Drop for HeapLock<'_> {
-    fn drop(&mut self) {
-        self.locked.store(false, Ordering::Release);
+    fn acquire(&self) -> IrqSpinLockGuard<'_, ()> {
+        self.lock.lock()
     }
 }
 

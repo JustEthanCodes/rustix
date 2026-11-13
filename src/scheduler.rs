@@ -1,8 +1,9 @@
-//! Fixed-capacity policy state for single-vCPU cooperative threads.
+//! Fixed-capacity policy state for single-vCPU kernel threads.
 //!
-//! This module does not own stacks, switch CPU contexts, access hardware, or
-//! synchronize against interrupts. One owner on one CPU must serialize every
-//! call. A thread is either ready, the sole running thread, blocked on exactly
+//! This module does not own stacks, switch CPU contexts, or access hardware.
+//! Its caller must serialize every call, including against timer IRQs (the
+//! runtime does so by disabling local interrupts around policy mutations). A
+//! thread is either ready, the sole running thread, blocked on exactly
 //! one live wait queue, or exited. Exited slots remain occupied until `reap`.
 //! Dispatch scans slots in deterministic round-robin order; waiters are woken
 //! in FIFO order. All storage is inline and bounded by the const capacities.
@@ -189,6 +190,12 @@ impl<const THREADS: usize, const QUEUES: usize, const WAITERS: usize>
 
     /// Cooperatively yield the running thread and dispatch the next ready one.
     pub fn yield_current(&mut self) -> Result<ThreadId, SchedulerError> {
+        self.preempt_current()
+    }
+
+    /// Put the running thread at the end of the round-robin turn and select the
+    /// next ready thread. Timer-driven preemption uses the same policy transition.
+    pub fn preempt_current(&mut self) -> Result<ThreadId, SchedulerError> {
         let current = self.current.ok_or(SchedulerError::NoCurrentThread)?;
         let slot = self.thread_slot_mut(current)?;
         if slot.state != Some(ThreadState::Running) {
@@ -445,6 +452,21 @@ mod tests {
         let replacement = scheduler.create_thread().unwrap();
         assert_ne!(replacement, third);
         assert_eq!(scheduler.state(replacement), Ok(ThreadState::Ready));
+    }
+
+    #[test]
+    fn timer_preemption_rotates_running_thread_and_keeps_both_ready() {
+        let mut scheduler = TestScheduler::new();
+        let first = scheduler.create_thread().unwrap();
+        let second = scheduler.create_thread().unwrap();
+
+        assert_eq!(scheduler.dispatch(), Ok(Some(first)));
+        assert_eq!(scheduler.preempt_current(), Ok(second));
+        assert_eq!(scheduler.state(first), Ok(ThreadState::Ready));
+        assert_eq!(scheduler.state(second), Ok(ThreadState::Running));
+        assert_eq!(scheduler.preempt_current(), Ok(first));
+        assert_eq!(scheduler.state(second), Ok(ThreadState::Ready));
+        assert_eq!(scheduler.state(first), Ok(ThreadState::Running));
     }
 
     #[test]

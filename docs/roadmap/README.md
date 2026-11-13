@@ -14,7 +14,7 @@ This roadmap describes an incremental path from the current bare-metal kernel to
 - **Milestone 0: local exit criteria met from a clean detached worktree; hosted CI observed.** On 2026-10-16, `just verify` passed in WSL2 Ubuntu 24.04 from both the working tree and a clean detached worktree with an empty `target` directory. On 2026-11-06, GitHub Actions run [#5](https://github.com/JustEthanCodes/rustix/actions/runs/42288095710) completed successfully on `dev` at `770f9c742dd07a00f6b53274ea05a1eca010d146`; its `kernel-and-boot-smoke` job ran `just verify`. This verifies hosted CI on that remote commit, not today’s uncommitted changes.
 - **Milestone 1: validation criteria met for the current Limine path.** The bounded boot snapshot, memory-range classification, and CPUID reporting were covered by host tests and QEMU reporting; the Limine pointer-readability trust boundary remains explicit.
 - **Milestone 2: local exit criteria met on 2026-10-24; hosted CI observed, physical-hardware validation pending.** The boot path owns and activates a clone of Limine's reachable page-table hierarchy, preserves inherited mappings, hardens kernel HHDM aliases to R/NX or RW/NX while retaining PAT attributes, invalidates stale translations on CR3 transitions, and retains table-frame tokens. `just verify`, `just frame-smoke`, and `just fault-smoke` passed after final review; QEMU exercised the active-PCID/CR3 invalidation path with CR4.PGE clear. The PGE-toggle path is statically reviewed but was not exercised by this QEMU configuration. The successful 2026-11-06 hosted `just verify` run covers the published Milestone 2 state, but not today's uncommitted changes. Broad mapping policy, reclamation, IRQ-safe allocation, and physical-hardware validation remain outside this milestone's completed scope.
-- **Milestone 3: local exit criteria met on 2026-11-07; hosted CI and physical-hardware validation remain pending.** `just verify` passed with 127 host tests, the `x86_64-unknown-none` check, BIOS and OVMF boot smokes, active-map/TLB invalidation, cooperative thread/wait-queue tests, and UART/PS/2 input wakeup. OVMF validated MADT/APIC routing, PIT ticks and EOI, guarded cooperative stacks, frame-backed heap growth, and shell input without busy-polling. Timer preemption, IRQ-safe locking for future preemption, and SMP remain deferred. See the evidence and limits below. **Milestones 4 and later: planned.** There is no ARM64 platform support, userspace, syscall ABI, persistent filesystem, GUI, or networking stack.
+- **Milestone 3: single-vCPU exit criteria met locally on 2026-11-13; hosted CI and physical-hardware validation remain pending.** `just verify` passed with 130 host tests, target check/build, BIOS and OVMF boot smokes, active-map/TLB invalidation, IRQ-save lock checks, timer preemption of non-yielding workers with x87/SSE state preservation, cooperative wait/input behavior, and UART/PS/2 IRQ wakeup. SMP and physical-hardware validation remain deferred. See the evidence and limits below. **Milestones 4 and later: planned.** There is no ARM64 platform support, userspace, syscall ABI, persistent filesystem, GUI, or networking stack.
 
 ## Dependency path
 
@@ -22,9 +22,11 @@ This roadmap describes an incremental path from the current bare-metal kernel to
 Reliable boot
     -> validated boot state
     -> owned mappings + frame allocation + heap + fault diagnostics
-    -> timer/IRQ model + scheduler
+    -> timer/IRQ model + scheduler + IRQ-safe locking + timer preemption
     -> isolated processes + syscall ABI
-    -> VFS/storage + userland utilities
+    -> M5a PCI/DMA + block I/O + read-only/basic VFS
+    -> M5b writable filesystem + permissions + platform services
+    -> userland utilities
     -> graphical terminal and other optional services
 ```
 
@@ -138,13 +140,15 @@ This milestone establishes a safe basis for future allocation and kernel service
 
 ---
 
-## Milestone 3 — IRQs, time, and kernel scheduling (local exit criteria met)
+## Milestone 3 — IRQs, time, and kernel scheduling (DONE locally; single-vCPU, SMP deferred)
 
 Do not enable interrupts as a side effect of installing exception gates. IRQ delivery needs its own controller, acknowledgement, masking, ownership, and synchronization design.
 
 ### Implementation and remaining work
 
-The current source includes host-tested bounded ACPI parsing and span authorization, a boot-only read-only/NX ACPI reader that copies MADT data into owned state, xAPIC/I/O APIC routing, allocated IRQ dispatch and acknowledgement, a PIT timer, a cooperative scheduler, guarded thread stacks, bounded frame-backed heap growth, and interrupt-driven UART/PS/2 queues. On 2026-11-07, `just verify` passed on the final integrated tree, including active mapping/TLB, cooperative thread, and UART/PS/2 input QEMU smokes. The work-item boxes record source work and observed evidence; deferred timer preemption and SMP are not part of the completed single-vCPU cooperative slice.
+The current source includes host-tested bounded ACPI parsing and span authorization, a boot-only read-only/NX ACPI reader that copies MADT data into owned state, xAPIC/I/O APIC routing, allocated IRQ dispatch and acknowledgement, a PIT timer, a single-vCPU scheduler with cooperative waits and timer preemption, guarded thread stacks, bounded frame-backed heap growth, and interrupt-driven UART/PS/2 queues. `IrqSpinLock` saves/disables local interrupts and restores the prior IF state; the heap uses it, while scheduler mutations are serialized by local interrupt masking. Timer IRQ assembly saves x87/SSE state before Rust dispatch, and context switches preserve per-context FXSAVE state; AVX/XSAVE remains disabled. On 2026-11-13, `just verify` passed with 130 host tests and BIOS/OVMF coverage for active mapping, timer preemption/FPU state, locks, cooperative waits, and input. SMP is not part of this completed single-vCPU slice.
+
+**Ring 3 prerequisite gate:** the single-vCPU IRQ-safe locking and timer-preemption prerequisites in this milestone are now implemented and validated. This only establishes scheduler progress and local interrupt-safe locking; it does not provide user/kernel isolation, safe syscall entry/return, per-process kernel stacks, or any other Milestone 4 guarantee.
 
 - [x] Use the existing single-vCPU QEMU `q35` configuration with the local APIC and MADT-described I/O APIC; keep legacy PIC routing masked. OVMF smokes observed timer and device IRQ delivery.
 - [x] Read bounded ACPI tables through the validated read-only/NX path. The reader checks table bounds/signatures/checksums and copies the required MADT data into owned state; host tests cover malformed tables and span authorization, and OVMF reports the copied MADT.
@@ -152,26 +156,27 @@ The current source includes host-tested bounded ACPI parsing and span authorizat
 - [x] Add fixed-capacity IRQ vector ownership, masked-first controller routes, dispatch, spurious/unexpected-vector handling, and EOI. OVMF observed timer IRQ delivery and acknowledgement; input routes are also tested.
 - [x] Route an approximately 100 Hz 8254 PIT through the I/O APIC and maintain atomic monotonic ticks. Host tests cover divisor and elapsed-time arithmetic, including fractional-tick rounding drift; OVMF verifies live timer delivery and EOI. Wall-clock time remains separate and is not provided.
 - [x] Add bounded wait queues, cooperative sleep/wakeup, and event handoff; host scheduler tests and OVMF `thread-smoke` cover wakeup and timed sleep.
-- [ ] Establish IRQ-safe lock primitives and broader context-specific locking rules before enabling timer preemption; the current heap is not IRQ-safe.
+- [x] Establish IRQ-safe lock primitives and broader context-specific locking rules before enabling timer preemption. `src/sync.rs` provides an IRQ-save spin lock that restores the prior RFLAGS.IF state; the heap uses it, while scheduler policy changes mask local interrupts and do not hold a lock across context switches. IRQ handlers remain allocation-free and do not acquire the heap lock. Host tests and the OVMF thread smoke validate lock operations and both enabled/disabled IF restoration.
 - [x] Implement owned-frame active map/unmap with explicit mapping/cache policy, transactional rollback, and local TLB invalidation. Host tests cover failure rollback; `active-map-smoke` passed live mapping, access, invalidation, and reclamation in QEMU.
 - [x] Extend the 256 KiB bootstrap heap with a bounded 1 MiB frame-backed, demand-mapped region. Host tests cover growth, reuse, and failed growth; `thread-smoke` observed bootstrap exhaustion, growth, and reuse.
-- [x] Keep allocator operations out of IRQ/exception handlers; handlers use bounded, allocation-free work, and the heap contract explicitly forbids IRQ-context allocation. Exhaustion is fallible at the allocator boundary. The heap is not IRQ-safe; timer preemption remains disabled.
+- [x] Keep allocator operations out of IRQ/exception handlers; handlers use bounded, allocation-free work, and the heap contract explicitly forbids IRQ-context allocation. The IRQ-save heap lock prevents local interrupt reentrancy, but does not make allocation appropriate in handlers. Exhaustion is fallible at the allocator boundary.
 - [x] Keep bootloader-reclaimable and ACPI memory, the active bootstrap stack, and Limine's inherited page-table root reserved; the active cloned root retains its owned table frames and does not reclaim the old root or inherited leaf frames.
 - [x] Add single-vCPU cooperative threads with owned guarded stacks, lifecycle, yield, event wait/wakeup, timed sleep, and context-switch tests. The OVMF thread smoke passed these paths.
-- [ ] Add timer-driven preemption only after locking, stack, timer, wait-queue, and interrupt-return invariants have deterministic tests. SMP remains a separate later sub-milestone.
+- [x] Add single-vCPU PIT timer-driven preemption after locking, stack, timer, wait-queue, and interrupt-return invariants have deterministic tests. The OVMF `thread-smoke` verifies two non-yielding workers both run, checks x87/SSE state survives asynchronous preemption, and validates the IRQ-save lock's IF behavior. Timer EOI is issued before a context switch; IRQ/exception handlers remain bounded and allocation-free. SMP remains a separate later sub-milestone.
 - [x] Implement interrupt-driven UART RX and PS/2 raw-scancode queues with bounded buffers and scheduler event wakeups; preserve polling fallback. OVMF `input-smoke` sends a shell command over UART and verifies a PS/2 make scancode after the shell blocks for input.
 
-**Exit criteria:** the single-vCPU QEMU `q35` configuration validates the selected APIC routing, PIT tick, and IRQ acknowledgement; host/QEMU tests cover ACPI bounds and malformed tables, mapping rollback/TLB behavior, heap exhaustion, wait-queue wakeups, and cooperative context switching. Interrupt-driven input is tested without busy-polling, and no heap allocation occurs in IRQ/exception context. No `sti` before the design and tests are ready.
+**Exit criteria:** met locally for the single-vCPU scope. `just verify` passed on 2026-11-13, covering host tests, target check/build, BIOS/OVMF boot, APIC routing/PIT EOI, active mapping/TLB behavior, guarded stacks, cooperative waits, non-yielding timer preemption, FPU-state preservation, IRQ-save lock IF restoration, and UART/PS/2 wakeups. IRQ/exception handlers remain allocation-free. SMP, physical-hardware validation, and userspace are still out of scope.
 
 ---
 
 ## Milestone 4 — isolated processes and syscall ABI
 
-Userspace begins only after page tables, exception handling, scheduling, and controlled memory allocation are trustworthy. The syscall ABI is a product interface and must not emerge accidentally from internal functions.
+Userspace begins only after page tables, exception handling, scheduling, and controlled memory allocation are trustworthy. The syscall ABI is a product interface and must not emerge accidentally from internal functions. Milestone 3's single-vCPU IRQ-safe locking and timer-preemption gate is locally validated; this enables scheduler progress but does not by itself make user code isolated or safe. SMP remains outside this milestone.
 
 ### Planned work
 
-- [ ] Decide and document the x86_64 user-entry/syscall mechanism, register convention, selector/MSR setup, per-CPU state requirements, and safe return path.
+- [ ] Decide and document the x86_64 user-entry/syscall mechanism, register convention, selector/MSR setup, per-CPU state requirements, and safe return path. If using `SYSCALL`/`SYSRET`, specify `SWAPGS` entry/exit state transitions and how exceptions/NMIs during the transition are handled; permit `SYSRET` only after software validates the user `RCX` (return RIP) and `RSP` for canonicality and user-range bounds. Reject or terminate malformed returns rather than relying on a Ring 0 `#GP`; use `IRETQ` where the return shape or flags require it.
+- [ ] Define per-process address-space construction without deep-cloning the entire kernel page-table tree for every process. Choose a validated kernel-half sharing policy (for example, shared upper-level entries backed by immutable kernel subtrees), while keeping user mappings process-private; specify table ownership/lifetime, teardown, permission invariants, and TLB invalidation before sharing any page-table levels.
 - [ ] Add user/kernel page permissions and process-owned address spaces, including teardown and TLB invalidation rules.
 - [ ] Implement copy-in/copy-out helpers that validate lengths, arithmetic, canonical ranges, permissions, and faults; never form a kernel reference directly from a user pointer.
 - [ ] Specify version discovery, stable syscall numbers, argument layouts, error encoding, partial-I/O behavior, interruption/restart, and compatibility policy before exposing calls.
@@ -179,7 +184,7 @@ Userspace begins only after page tables, exception handling, scheduling, and con
 - [ ] Load statically linked ELF64 executables with checked `PT_LOAD` bounds, alignment, permissions, and entry points; reject malformed binaries safely. Use `.bin` for command-line programs and `.app` for GUI applications as role-based filename suffixes for the same underlying format. `.app` is a Rustix single-file application suffix, not an Apple/macOS app bundle; initially require application resources to be embedded or absent.
 - [ ] Add user-mode exception handling: faults attributable to Ring 3 terminate the offending process with a reported status, while faults in kernel mode remain fatal. Test page faults, general-protection faults, invalid opcodes, and divide errors from both privilege levels.
 - [ ] Define user virtual-memory regions, stack bounds/guard behavior, and a minimal anonymous allocation interface such as `mmap`/`munmap` (or a documented equivalent) before running general user programs. Add bounds, permissions, exhaustion, and teardown tests.
-- [ ] Add a shared userspace runtime crate (for example, `librustix`) for process entry, syscall wrappers, panic handling, common I/O/formatting, and a user allocator backed by the anonymous mapping interface. Keep it separate from kernel internals and use it from independent application crates.
+- [ ] Add a small, `no_std`-friendly shared userspace runtime crate (for example, `librustix`) for process entry, syscall wrappers, panic handling, common I/O/formatting, and a user allocator backed by the anonymous mapping interface. Keep it separate from kernel internals and use it from independent application crates; initial executables remain statically linked ELF64 binaries, with application resources embedded or absent.
 - [ ] Keep the first user-visible target as a minimal `init` executable loaded from a bounded boot payload or other reproducible non-filesystem source; persistent filesystem loading and ordinary command utilities follow in Milestones 5 and 6.
 - [ ] Build adversarial tests for bad pointers, overflow, invalid mappings, user/kernel fault separation, process teardown, descriptor misuse, and failed exec.
 
@@ -193,21 +198,25 @@ A small controlled `init` process should start from a reproducible image, write 
 
 ## Milestone 5 — VFS, storage, and device ownership
 
-Keep the current RAM filesystem as a bootstrap/test implementation. Persistence and device drivers require explicit block ownership, error handling, and recovery behavior.
+Keep the current RAM filesystem as a bootstrap/test implementation. Persistence and device drivers require explicit block ownership, error handling, and recovery behavior. Split this milestone into M5a (PCI/DMA, block I/O, and a read-only/basic VFS slice) and M5b (writable storage, permissions, and platform services) so each checkpoint has a bounded validation target.
 
-### Planned work
+### M5a — PCI/DMA, block I/O, and read-only/basic VFS
 
 - [ ] Define VFS node, mount, path, metadata, and file-descriptor contracts independently of a particular disk format.
 - [ ] Preserve volatile RAMFS as a test backend and add tests for mount/path errors, capacity, partial I/O, and object lifetime.
 - [ ] Establish bounded PCI/device discovery, including checked ACPI MCFG handling where required, before adding PCI-backed devices. Keep discovery separate from individual driver policy.
 - [ ] Define DMA buffer ownership, address translation, cache synchronization, device reset, and error handling before any device can DMA into kernel memory. Scope and test the trust assumptions; do not equate PCI enumeration with safe DMA.
 - [ ] Add a narrowly scoped block-device interface with request validation, timeout/error reporting, and a QEMU-supported initial device driver (such as virtio-blk) on top of the shared PCI/DMA foundations.
-- [ ] Choose and document the first on-disk filesystem format before implementing writable storage. Specify partition discovery, byte order, block size, metadata limits, crash consistency, corruption handling, and read-only/recovery behavior.
+- [ ] Choose and document the first on-disk filesystem format before implementing writable storage. Specify partition discovery, byte order, block size, metadata limits, corruption handling, and read-only/recovery behavior; begin with a read-only mount and bounded metadata parsing.
+- [ ] Test read-only mount, lookup, and read behavior against reproducible images, including malformed metadata and I/O errors. Do not expose on-disk write operations in this slice; the volatile RAMFS remains available as a writable test backend.
+- [ ] Define file descriptors and basic process I/O semantics before exposing filesystem operations to applications.
+
+### M5b — writable filesystem, permissions, and platform services
+
 - [ ] On detected corruption, report the failure and refuse writable mounting rather than attempting automatic repair. Plan a separate offline checker/repair tool; do not repair data implicitly.
 - [ ] Define crash-safe atomic replacement or equivalent transactional behavior for critical files such as account metadata and credentials. Flush the new data before replacing the old file, and test interruption at each update stage.
 - [ ] Define explicit no-space errors and partial-write behavior. Never silently discard or overwrite existing user data to recover space.
 - [ ] Add persistent write/read/remount/reboot and failure-injection integration tests; never claim persistence from an in-memory cache alone.
-- [ ] Define file descriptors and basic process I/O semantics before exposing them to applications.
 - [ ] Define the planned top-level filesystem layout: `/home`, `/root`, `/etc`, `/usr`, `/dev`, `/proc`, `/sys`, `/tmp`, `/var`, `/run`, `/mnt`, `/media`, and `/boot`, plus `/usr/sbin`. Document that `/proc` and `/sys` are future virtual interfaces, `/dev` exposes device interfaces, `/tmp` and `/run` are volatile, and mount-point and boot-file usage depends on later storage/boot design.
 - [ ] Specify filesystem ownership and permission metadata. Support owner/group/other read, write, and execute permissions, default creation modes/umask, and the directory sticky bit. Use sticky-directory semantics for `/tmp` (mode equivalent to `01777`) and later `/home/Public/`, so users can create entries without removing or renaming another user's files.
 - [ ] Specify that `/etc` and `/usr` are root-owned and writable only by root, while normal users may read configuration and execute permitted programs. Keep readable account metadata separate from a root-only credential file containing password hashes. Reserve `/usr/Apps` for globally installed `.app` GUI applications and `/usr/bin` for globally installed `.bin` command-line tools; `/usr/sbin` is reserved for system-administration tools if needed.
@@ -215,7 +224,9 @@ Keep the current RAM filesystem as a bootstrap/test implementation. Persistence 
 - [ ] Provide wall-clock time before persistent audit logs require calendar timestamps. Keep monotonic time as the source for elapsed-time and timeout calculations; define behavior when the wall clock is unavailable or invalid.
 - [ ] Define kernel/platform shutdown and reboot operations, including filesystem flush ordering and failure behavior. Parse and validate ACPI FADT power-control data when needed; test the supported QEMU shutdown/reboot paths.
 
-**Exit criteria:** PCI discovery and the DMA ownership policy are validated for the supported QEMU device path; a reproducible image mounts a documented on-disk filesystem; filesystem tests pass across remount and reboot and fail safely on corruption, I/O errors, and exhausted space. Milestone 5 validates storage through test/integration harnesses; user-space utilities are verified in Milestone 6.
+**M5a exit criteria:** bounded PCI discovery and the DMA ownership policy are validated for the supported QEMU device path; the block driver passes bounded request, timeout, and error tests; a reproducible image mounts the documented filesystem read-only, with lookup/read tests covering malformed metadata and device errors. No writable mount is implied.
+
+**M5b exit criteria:** writable filesystem behavior is validated across remount and reboot, including crash/failure injection, corruption refusal, I/O errors, and exhausted-space behavior; permission and sticky-directory rules, CSPRNG failure behavior, wall-clock fallback, and supported ACPI shutdown/reboot paths are tested. Milestone 5 validates storage through test/integration harnesses; user-space utilities are verified in Milestone 6.
 
 ---
 
@@ -271,6 +282,7 @@ The planned filesystem layout is illustrated below. This is a directory-layout p
 - [ ] Establish normal command lookup order as `~/.bin/` before `/usr/bin/`; `sudo` must use its restricted trusted system path instead of inheriting the user's search path.
 - [ ] Port or adapt Crabshell into a userspace terminal application that uses only the documented syscall/VFS interfaces. Introduce TTY and PTY abstractions for serial and later graphical terminals so the shell does not depend on a specific device.
 - [ ] Move `cp`, `mv`, `mkdir`, and future command-line utilities into separate application crates using the shared userspace runtime and `.bin` suffix. Preinstall the initial tools in the reproducible system image. Later per-user installation copies files into `~/.bin/`; global installation into `/usr/bin/` requires root. Never silently overwrite a same-named tool; defer package management, dependency tracking, and automatic updates.
+- [ ] Track the installed image size and per-binary contributions as the static utility set grows. Keep `librustix` lean and `no_std`-friendly, avoid duplicating embedded resources across tools, and set explicit image/storage budgets before adding many separately linked utilities.
 - [ ] Add bounded pipe buffers and a minimal process-control model: foreground process groups, `SIGINT` for `Ctrl+C`, `SIGCHLD`/wait status for child exit, and a basic `kill` mechanism. Implement these before enabling pipelines, redirection, or interrupting a foreground command. Keep semantics explicit and tested rather than claiming full POSIX job control.
 - [ ] Add command-line quoting, escaping, and history only with parser tests; enable redirection and pipelines only after the corresponding descriptor, pipe, TTY/PTY, and signal semantics are implemented.
 - [ ] Defer installation of single-file GUI `.app` files into `~/Apps/` or `/usr/Apps/` to the GUI milestone. Initial installation there is copying a file and removal is deleting it; global installation requires root, and name conflicts must never silently overwrite an existing app.

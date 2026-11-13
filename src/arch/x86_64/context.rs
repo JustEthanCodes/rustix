@@ -1,8 +1,10 @@
-//! Cooperative x86_64 execution-context switching.
+//! x86_64 execution-context switching for cooperative and preempted threads.
 //!
-//! The switch preserves the SysV callee-saved general-purpose registers and
-//! stack pointer only. It does not save flags, caller-saved registers, SIMD/FPU
-//! state, control registers, or address-space state.
+//! The switch preserves the SysV callee-saved general-purpose registers, stack
+//! pointer, and x87/SSE state. It does not save flags, caller-saved general-
+//! purpose registers, control registers, or address-space state. Timer
+//! preemption uses a separate entry because the IRQ stub has already saved the
+//! interrupted task's x87/SSE state before calling Rust.
 
 core::arch::global_asm!(
     ".section .text.rustix_context_switch,\"ax\"",
@@ -14,8 +16,28 @@ core::arch::global_asm!(
     "    push r13",
     "    push r14",
     "    push r15",
+    "    fxsave64 [rdx]",
     "    mov [rdi], rsp",
     "    mov rsp, rsi",
+    "    fxrstor64 [rcx]",
+    "    pop r15",
+    "    pop r14",
+    "    pop r13",
+    "    pop r12",
+    "    pop rbp",
+    "    pop rbx",
+    "    ret",
+    ".global rustix_context_switch_from_irq",
+    "rustix_context_switch_from_irq:",
+    "    push rbx",
+    "    push rbp",
+    "    push r12",
+    "    push r13",
+    "    push r14",
+    "    push r15",
+    "    mov [rdi], rsp",
+    "    mov rsp, rsi",
+    "    fxrstor64 [rdx]",
     "    pop r15",
     "    pop r14",
     "    pop r13",
@@ -38,12 +60,31 @@ extern "C" {
     ///
     /// # Safety
     ///
-    /// Call only from ordinary cooperative thread context, never from an
-    /// interrupt or exception handler. Both contexts must run on the same CPU,
-    /// at the same privilege level, with compatible mappings and machine state.
-    /// Callers must separately preserve any FPU/SIMD or other state required by
-    /// their context policy. The trampoline used for a fresh context must not
-    /// return. No stack may be freed while it is saved or active.
+    /// Call only from ordinary thread context with local interrupts disabled.
+    /// Both contexts must run on the same CPU, at the same privilege level, with
+    /// compatible mappings and valid 16-byte-aligned FXSAVE areas. The trampoline
+    /// used for a fresh context must not return. No stack or FXSAVE area may be
+    /// freed while its context is saved or active.
     #[link_name = "rustix_context_switch"]
-    pub fn context_switch(old_rsp: *mut usize, new_rsp: *mut usize);
+    pub fn context_switch(
+        old_rsp: *mut usize,
+        new_rsp: *mut usize,
+        old_fx_state: *mut u8,
+        new_fx_state: *const u8,
+    );
+
+    /// Switch from the configured timer IRQ path after its assembly stub saved
+    /// the interrupted context's FXSAVE image. Does not save the handler's FP
+    /// scratch state into the interrupted context.
+    ///
+    /// # Safety
+    /// The same context and mapping requirements as [`context_switch`] apply.
+    /// Call only from the timer IRQ with IF clear and pass an aligned initialized
+    /// FXSAVE area for `new_fx_state`.
+    #[link_name = "rustix_context_switch_from_irq"]
+    pub fn context_switch_from_irq(
+        old_rsp: *mut usize,
+        new_rsp: *mut usize,
+        new_fx_state: *const u8,
+    );
 }

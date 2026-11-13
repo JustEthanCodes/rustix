@@ -1,12 +1,15 @@
-//! Fixed-capacity cooperative kernel-thread smoke runtime.
+//! Fixed-capacity single-vCPU kernel-thread runtime and scheduling smoke tests.
 //!
 //! Thread stacks are allocator-owned 4 KiB mappings with one unmapped lower
-//! guard page. Scheduling is single-vCPU and cooperative only; the timer IRQ
-//! never switches contexts or mutates scheduler state.
+//! guard page. Scheduler state is mutated only with local interrupts disabled.
+//! The PIT handler may preempt a running thread by suspending its own call stack
+//! on that thread's kernel stack and switching to another saved context.
 
 use crate::kprintln;
 use core::arch::asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "probe-kernel-threads")]
+use core::hint::spin_loop;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use rustix_kernel::frame::{Frame, FrameAllocator};
 
 use rustix_kernel::paging::{
@@ -26,13 +29,61 @@ const CONTEXT_COUNT: usize = MAX_THREADS + 1;
 const QUEUE_COUNT: usize = MAX_THREADS + 1;
 const _: [(); QUEUE_COUNT] = [(); MAX_THREADS + 1];
 
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct FxSaveArea([u8; 512]);
+
+impl FxSaveArea {
+    const INITIAL: Self = {
+        let mut bytes = [0; 512];
+        bytes[0] = 0x7f;
+        bytes[1] = 0x03;
+        bytes[24] = 0x80;
+        bytes[25] = 0x1f;
+        Self(bytes)
+    };
+}
+
+const _: [(); 512] = [(); core::mem::size_of::<FxSaveArea>()];
+const _: [(); 16] = [(); core::mem::align_of::<FxSaveArea>()];
+
 static THREAD_TEST_TRACE: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_RUNTIME: AtomicPtr<KernelThreadRuntime> = AtomicPtr::new(core::ptr::null_mut());
+static mut BOOTSTRAP_FX_STATE: FxSaveArea = FxSaveArea::INITIAL;
+#[export_name = "rustix_active_fpu_state_pointer"]
+static mut ACTIVE_FX_STATE_POINTER: *mut FxSaveArea = core::ptr::null_mut();
+
+/// Initialize the IRQ assembly's FXSAVE destination before any IRQ route is armed.
+pub(crate) fn initialize_fpu_context() {
+    // SAFETY: Bootstrap runs with IF clear and this pointer is published before
+    // the timer or device IRQ routes can be unmasked.
+    unsafe {
+        core::ptr::addr_of_mut!(ACTIVE_FX_STATE_POINTER)
+            .write(core::ptr::addr_of_mut!(BOOTSTRAP_FX_STATE));
+    }
+}
+
+#[cfg(feature = "probe-kernel-threads")]
+static PREEMPTION_A_STARTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "probe-kernel-threads")]
+static PREEMPTION_B_STARTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "probe-kernel-threads")]
+static PREEMPTION_TEST_FAILED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "probe-kernel-threads")]
+static PREEMPTION_FPU_FAILED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "probe-kernel-threads")]
+const PREEMPTION_TEST_TICK_BUDGET: u64 = 8;
+#[cfg(feature = "probe-kernel-threads")]
+const PREEMPTION_PATTERN_A: [u8; 16] = [0xa1; 16];
+#[cfg(feature = "probe-kernel-threads")]
+const PREEMPTION_PATTERN_B: [u8; 16] = [0xb2; 16];
 
 type ThreadEntry = extern "C" fn(*mut (), usize);
 
 struct KernelThreadRuntime {
     policy: Scheduler<MAX_THREADS, QUEUE_COUNT, MAX_THREADS>,
     saved_rsp: [usize; CONTEXT_COUNT],
+    fx_state: [FxSaveArea; CONTEXT_COUNT],
     thread_ids: [Option<ThreadId>; MAX_THREADS],
     stack_virtual_starts: [Option<u64>; MAX_THREADS],
     entries: [Option<ThreadEntry>; MAX_THREADS],
@@ -56,6 +107,7 @@ impl KernelThreadRuntime {
         Ok(Self {
             policy,
             saved_rsp: [0; CONTEXT_COUNT],
+            fx_state: [FxSaveArea::INITIAL; CONTEXT_COUNT],
             thread_ids: [None; MAX_THREADS],
             stack_virtual_starts: [None; MAX_THREADS],
             entries: [None; MAX_THREADS],
@@ -88,8 +140,29 @@ impl KernelThreadRuntime {
         }
     }
 
+    fn wake_ready_events(&mut self) {
+        self.wake_expired();
+        if self.input_events_enabled
+            && rustix_kernel::input::INPUT_EVENT_PENDING.swap(false, Ordering::AcqRel)
+            && self.policy.wake_all(self.event_queue).is_err()
+        {
+            THREAD_TEST_TRACE.store(99, Ordering::Release);
+        }
+    }
+
     unsafe fn run_from_raw(runtime_pointer: *mut Self) {
         let initial_flags = disable_interrupts();
+        if ACTIVE_RUNTIME
+            .compare_exchange(
+                core::ptr::null_mut(),
+                runtime_pointer,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            halt_on_stack_cleanup_failure();
+        }
         let first = {
             // SAFETY: The caller supplies the live, exclusively owned runtime;
             // the temporary reference ends before the context switch.
@@ -98,7 +171,7 @@ impl KernelThreadRuntime {
                 Ok(Some(thread)) => {
                     let context = thread.slot_index() + 1;
                     runtime.current_context = context;
-                    Some(runtime.saved_rsp[context])
+                    Some((context, runtime.saved_rsp[context]))
                 }
                 Ok(None) => None,
                 Err(_) => {
@@ -107,13 +180,15 @@ impl KernelThreadRuntime {
                 }
             }
         };
-        if let Some(new_rsp) = first {
-            // SAFETY: Context zero is the active bootstrap stack; `new_rsp` is a
-            // synthetic, ABI-aligned frame on a mapped owned thread stack.
+        if let Some((new_context, new_rsp)) = first {
+            // SAFETY: Context zero is the active bootstrap stack; the selected
+            // synthetic frame and both aligned FXSAVE areas remain live.
             unsafe {
                 rustix_arch_context_switch(
                     core::ptr::addr_of_mut!((*runtime_pointer).saved_rsp[0]),
                     new_rsp as *mut usize,
+                    core::ptr::addr_of_mut!((*runtime_pointer).fx_state[0]),
+                    core::ptr::addr_of_mut!((*runtime_pointer).fx_state[new_context]),
                 );
             }
         }
@@ -121,45 +196,43 @@ impl KernelThreadRuntime {
 
         loop {
             let flags = disable_interrupts();
-            let (new_rsp, finished) = {
+            let (new_context, new_rsp, finished) = {
                 // SAFETY: No other thread runs while IF is clear. All mutable
                 // scheduler borrows end before any subsequent context switch.
                 let runtime = unsafe { &mut *runtime_pointer };
-                runtime.wake_expired();
-                if runtime.input_events_enabled
-                    && rustix_kernel::input::INPUT_EVENT_PENDING.swap(false, Ordering::AcqRel)
-                    && runtime.policy.wake_all(runtime.event_queue).is_err()
-                {
-                    THREAD_TEST_TRACE.store(99, Ordering::Release);
-                }
+                runtime.wake_ready_events();
                 if runtime.all_threads_exited() {
-                    (None, true)
+                    (None, None, true)
                 } else {
                     match runtime.policy.dispatch() {
                         Ok(Some(thread)) => {
                             let context = thread.slot_index() + 1;
                             runtime.current_context = context;
-                            (Some(runtime.saved_rsp[context]), false)
+                            (Some(context), Some(runtime.saved_rsp[context]), false)
                         }
-                        Ok(None) => (None, false),
+                        Ok(None) => (None, None, false),
                         Err(_) => {
                             THREAD_TEST_TRACE.store(99, Ordering::Release);
-                            (None, true)
+                            (None, None, true)
                         }
                     }
                 }
             };
             if finished {
+                ACTIVE_RUNTIME.store(core::ptr::null_mut(), Ordering::Release);
+                unsafe { save_bootstrap_fx_state() };
                 restore_interrupts(flags);
                 return;
             }
-            if let Some(new_rsp) = new_rsp {
+            if let (Some(new_context), Some(new_rsp)) = (new_context, new_rsp) {
                 // SAFETY: The bootstrap context is currently active and the
-                // selected thread owns a live saved stack frame.
+                // selected stack and FXSAVE area remain owned by this runtime.
                 unsafe {
                     rustix_arch_context_switch(
                         core::ptr::addr_of_mut!((*runtime_pointer).saved_rsp[0]),
                         new_rsp as *mut usize,
+                        core::ptr::addr_of_mut!((*runtime_pointer).fx_state[0]),
+                        core::ptr::addr_of_mut!((*runtime_pointer).fx_state[new_context]),
                     );
                 }
                 restore_interrupts(flags);
@@ -227,11 +300,9 @@ pub(crate) fn wait_for_input(runtime_pointer: *mut ()) {
     }
 }
 
-/// Exercise real cooperative switching, stack guards, event wakeup, and timed sleep.
+/// Exercise real switching, stack guards, event wakeup, timed sleep, and timer preemption.
 /// The caller must provide the current active root, keep this single-vCPU kernel
-/// path alive for the call, and have already enabled the verified PIT route. The
-/// timer handler only increments `ticks` and acknowledges the local APIC; all
-/// scheduler transitions happen on ordinary kernel stacks with IF controlled here.
+/// path alive for the call, and have already enabled the verified PIT route.
 #[cfg(feature = "probe-kernel-threads")]
 pub fn smoke<M: CandidatePageTableMemory>(
     candidate: &mut CandidatePageTables<'_, M>,
@@ -240,6 +311,11 @@ pub fn smoke<M: CandidatePageTableMemory>(
     ticks: &'static AtomicTickCounter,
 ) -> Result<(), &'static str> {
     THREAD_TEST_TRACE.store(0, Ordering::Release);
+    if !irq_spin_lock_preserves_interrupt_state() {
+        return Err("IRQ-save spin lock failed to mask or restore IF");
+    }
+    kprintln!("IRQ-save lock path passed: prior IF state preserved");
+
     let mut runtime = KernelThreadRuntime::new(ticks).map_err(|_| "scheduler setup failed")?;
     let runtime_pointer = core::ptr::addr_of_mut!(runtime);
 
@@ -296,7 +372,163 @@ pub fn smoke<M: CandidatePageTableMemory>(
         return Err("cooperative yield/wakeup/timed-sleep sequence failed");
     }
     kprintln!("cooperative thread path passed: yield, event wakeup, timed sleep, stack guards");
+    timer_preemption_smoke(candidate, allocator, cpu_info, ticks)
+}
+
+#[cfg(feature = "probe-kernel-threads")]
+fn irq_spin_lock_preserves_interrupt_state() -> bool {
+    use rustix_kernel::sync::IrqSpinLock;
+
+    fn interrupts_enabled() -> bool {
+        let flags: u64;
+        // SAFETY: Reading RFLAGS is non-mutating in the CPL 0 QEMU probe.
+        unsafe { asm!("pushfq", "pop {}", out(reg) flags) };
+        flags & (1 << 9) != 0
+    }
+
+    let lock = IrqSpinLock::new(());
+    let initially_enabled = interrupts_enabled();
+    let masked_while_held = {
+        let _guard = lock.lock();
+        !interrupts_enabled()
+    };
+    let restored_after_enabled = interrupts_enabled() == initially_enabled;
+
+    let flags = disable_interrupts();
+    let masked_while_already_disabled = {
+        let _guard = lock.lock();
+        !interrupts_enabled()
+    };
+    let remained_disabled_after_drop = !interrupts_enabled();
+    restore_interrupts(flags);
+
+    initially_enabled
+        && masked_while_held
+        && restored_after_enabled
+        && masked_while_already_disabled
+        && remained_disabled_after_drop
+}
+
+#[cfg(feature = "probe-kernel-threads")]
+fn timer_preemption_smoke<M: CandidatePageTableMemory>(
+    candidate: &mut CandidatePageTables<'_, M>,
+    allocator: &mut FrameAllocator,
+    cpu_info: &crate::arch::x86_64::cpu::CpuInfo,
+    ticks: &'static AtomicTickCounter,
+) -> Result<(), &'static str> {
+    PREEMPTION_A_STARTED.store(0, Ordering::Release);
+    PREEMPTION_B_STARTED.store(0, Ordering::Release);
+    PREEMPTION_TEST_FAILED.store(0, Ordering::Release);
+    PREEMPTION_FPU_FAILED.store(0, Ordering::Release);
+
+    let mut runtime =
+        KernelThreadRuntime::new(ticks).map_err(|_| "preemption scheduler setup failed")?;
+    let runtime_pointer = core::ptr::addr_of_mut!(runtime);
+    let ticks_pointer = ticks as *const AtomicTickCounter as usize;
+
+    let flags = disable_interrupts();
+    let first = spawn_thread(
+        &mut runtime,
+        candidate,
+        allocator,
+        cpu_info,
+        runtime_pointer,
+        non_yielding_preemption_worker_a,
+        ticks_pointer,
+    );
+    let second = if first.is_ok() {
+        spawn_thread(
+            &mut runtime,
+            candidate,
+            allocator,
+            cpu_info,
+            runtime_pointer,
+            non_yielding_preemption_worker_b,
+            ticks_pointer,
+        )
+    } else {
+        Err("first preemption worker stack setup failed")
+    };
+    restore_interrupts(flags);
+
+    if first.is_err() || second.is_err() {
+        cancel_unstarted_threads(&mut runtime);
+        let flags = disable_interrupts();
+        reap_exited_stacks(&mut runtime, candidate, allocator);
+        restore_interrupts(flags);
+        return Err(first
+            .err()
+            .or(second.err())
+            .unwrap_or("preemption worker setup failed"));
+    }
+
+    // Both workers busy-wait without yielding. Worker B can start only after a
+    // PIT interrupt preempts worker A. Worker A also checks that its live XMM0
+    // value survives the interrupt handler and another thread's execution.
+    unsafe { KernelThreadRuntime::run_from_raw(runtime_pointer) };
+    let passed = PREEMPTION_A_STARTED.load(Ordering::Acquire) == 1
+        && PREEMPTION_B_STARTED.load(Ordering::Acquire) == 1
+        && PREEMPTION_TEST_FAILED.load(Ordering::Acquire) == 0
+        && PREEMPTION_FPU_FAILED.load(Ordering::Acquire) == 0
+        && runtime.all_threads_exited();
+    let flags = disable_interrupts();
+    reap_exited_stacks(&mut runtime, candidate, allocator);
+    restore_interrupts(flags);
+    if !passed {
+        return Err("timer did not preempt a non-yielding thread within the tick budget");
+    }
+    kprintln!("timer preemption path passed: non-yielding workers and FPU state survived");
     Ok(())
+}
+
+#[cfg(feature = "probe-kernel-threads")]
+extern "C" fn non_yielding_preemption_worker_a(_runtime: *mut (), ticks_pointer: usize) {
+    PREEMPTION_A_STARTED.store(1, Ordering::Release);
+    let ticks = unsafe { &*(ticks_pointer as *const AtomicTickCounter) };
+    let deadline = ticks.ticks().saturating_add(PREEMPTION_TEST_TICK_BUDGET);
+    unsafe {
+        asm!(
+            "movdqu xmm0, xmmword ptr [{pattern}]",
+            pattern = in(reg) PREEMPTION_PATTERN_A.as_ptr(),
+            out("xmm0") _,
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+    while PREEMPTION_B_STARTED.load(Ordering::Acquire) == 0 {
+        if ticks.ticks() >= deadline {
+            PREEMPTION_TEST_FAILED.store(1, Ordering::Release);
+            break;
+        }
+        spin_loop();
+    }
+    let mut saved_state = core::mem::MaybeUninit::<FxSaveArea>::uninit();
+    // SAFETY: `FxSaveArea` is 16-byte aligned and exactly 512 bytes; FXSAVE
+    // writes the complete legacy x87/SSE state image before it is inspected.
+    unsafe {
+        asm!(
+            "fxsave64 [{state}]",
+            state = in(reg) saved_state.as_mut_ptr(),
+            options(nostack),
+        );
+    }
+    // SAFETY: The preceding FXSAVE initialized every byte of the state image.
+    let saved_state = unsafe { saved_state.assume_init() };
+    if saved_state.0[160..176] != PREEMPTION_PATTERN_A {
+        PREEMPTION_FPU_FAILED.store(1, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "probe-kernel-threads")]
+extern "C" fn non_yielding_preemption_worker_b(_runtime: *mut (), _ticks_pointer: usize) {
+    unsafe {
+        asm!(
+            "movdqu xmm0, xmmword ptr [{pattern}]",
+            pattern = in(reg) PREEMPTION_PATTERN_B.as_ptr(),
+            out("xmm0") _,
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+    PREEMPTION_B_STARTED.store(1, Ordering::Release);
 }
 
 fn spawn_thread<M: CandidatePageTableMemory>(
@@ -633,13 +865,17 @@ fn yield_current(runtime_pointer: *mut ()) {
             Some((
                 core::ptr::addr_of_mut!(runtime.saved_rsp[old_context]),
                 runtime.saved_rsp[next_context],
+                core::ptr::addr_of_mut!(runtime.fx_state[old_context]),
+                core::ptr::addr_of_mut!(runtime.fx_state[next_context]),
             ))
         }
     };
-    if let Some((old_rsp, new_rsp)) = switch {
-        // SAFETY: The selected contexts are cooperative same-CPU kernel stacks;
-        // temporary references to the scheduler ended before the switch.
-        unsafe { rustix_arch_context_switch(old_rsp, new_rsp as *mut usize) };
+    if let Some((old_rsp, new_rsp, old_fx_state, new_fx_state)) = switch {
+        // SAFETY: The selected contexts are same-CPU kernel stacks, and the
+        // temporary scheduler borrows end before switching their saved FPU state.
+        unsafe {
+            rustix_arch_context_switch(old_rsp, new_rsp as *mut usize, old_fx_state, new_fx_state)
+        };
     }
     restore_interrupts(flags);
 }
@@ -676,12 +912,16 @@ unsafe fn block_current(runtime_pointer: *mut KernelThreadRuntime, delay: Option
         Some((
             core::ptr::addr_of_mut!(runtime.saved_rsp[old_context]),
             runtime.saved_rsp[next_context],
+            core::ptr::addr_of_mut!(runtime.fx_state[old_context]),
+            core::ptr::addr_of_mut!(runtime.fx_state[next_context]),
         ))
     };
-    if let Some((old_rsp, new_rsp)) = switch {
-        // SAFETY: The current thread is blocked and cannot be selected until a
-        // later wake; the target is either a ready thread or the bootstrap stack.
-        unsafe { rustix_arch_context_switch(old_rsp, new_rsp as *mut usize) };
+    if let Some((old_rsp, new_rsp, old_fx_state, new_fx_state)) = switch {
+        // SAFETY: The current thread is blocked and cannot run until a later
+        // wake; both stack and FXSAVE areas remain live in the runtime.
+        unsafe {
+            rustix_arch_context_switch(old_rsp, new_rsp as *mut usize, old_fx_state, new_fx_state)
+        };
     }
     restore_interrupts(flags);
     true
@@ -689,7 +929,7 @@ unsafe fn block_current(runtime_pointer: *mut KernelThreadRuntime, delay: Option
 
 unsafe fn exit_current(runtime_pointer: *mut KernelThreadRuntime) -> ! {
     let flags = disable_interrupts();
-    let (old_rsp, new_rsp) = {
+    let (old_rsp, new_rsp, old_fx_state, new_fx_state) = {
         // SAFETY: This is the current thread's normal return path, with IF clear.
         let runtime = unsafe { &mut *runtime_pointer };
         let old_context = runtime.current_context;
@@ -700,6 +940,8 @@ unsafe fn exit_current(runtime_pointer: *mut KernelThreadRuntime) -> ! {
                 (
                     core::ptr::addr_of_mut!(runtime.saved_rsp[old_context]),
                     runtime.saved_rsp[next_context],
+                    core::ptr::addr_of_mut!(runtime.fx_state[old_context]),
+                    core::ptr::addr_of_mut!(runtime.fx_state[next_context]),
                 )
             }
             Err(_) => halt_on_stack_cleanup_failure(),
@@ -707,7 +949,9 @@ unsafe fn exit_current(runtime_pointer: *mut KernelThreadRuntime) -> ! {
     };
     // SAFETY: The exited context is never dispatched again; the target is a
     // different ready thread or the retained bootstrap stack.
-    unsafe { rustix_arch_context_switch(old_rsp, new_rsp as *mut usize) };
+    unsafe {
+        rustix_arch_context_switch(old_rsp, new_rsp as *mut usize, old_fx_state, new_fx_state)
+    };
     restore_interrupts(flags);
     halt_on_stack_cleanup_failure()
 }
@@ -728,8 +972,100 @@ fn restore_interrupts(flags: u64) {
     }
 }
 
-unsafe fn rustix_arch_context_switch(old_rsp: *mut usize, new_rsp: *mut usize) {
-    // SAFETY: The runtime maintains valid saved stack frames and distinct live
-    // contexts; all callers hold IF clear and never switch from interrupt context.
-    unsafe { crate::arch::x86_64::context::context_switch(old_rsp, new_rsp) };
+unsafe fn rustix_arch_context_switch(
+    old_rsp: *mut usize,
+    new_rsp: *mut usize,
+    old_fx_state: *mut FxSaveArea,
+    new_fx_state: *mut FxSaveArea,
+) {
+    // SAFETY: The runtime maintains valid saved stack frames and aligned state
+    // areas. Callers hold IF clear; publish the new area before it can receive IRQs.
+    unsafe { publish_fx_state(new_fx_state) };
+    // SAFETY: The context switch saves the current x87/SSE state and restores the
+    // target context's initialized/saved FXSAVE image.
+    unsafe {
+        crate::arch::x86_64::context::context_switch(
+            old_rsp,
+            new_rsp,
+            old_fx_state.cast(),
+            new_fx_state.cast(),
+        )
+    };
+}
+
+unsafe fn rustix_arch_context_switch_from_irq(
+    old_rsp: *mut usize,
+    new_rsp: *mut usize,
+    new_fx_state: *mut FxSaveArea,
+) {
+    // SAFETY: The IRQ stub already saved the interrupted task's FPU state before
+    // entering Rust. Update the return-path target before switching away.
+    unsafe { publish_fx_state(new_fx_state) };
+    // SAFETY: This is called only from the configured timer IRQ handler with IF
+    // clear; the target area's state is initialized and 16-byte aligned.
+    unsafe {
+        crate::arch::x86_64::context::context_switch_from_irq(old_rsp, new_rsp, new_fx_state.cast())
+    };
+}
+
+unsafe fn publish_fx_state(state: *mut FxSaveArea) {
+    // SAFETY: The single-vCPU runtime calls this only with IF clear; IRQ assembly
+    // reads the pointer only while executing on that same CPU.
+    unsafe { core::ptr::addr_of_mut!(ACTIVE_FX_STATE_POINTER).write(state) };
+}
+
+unsafe fn save_bootstrap_fx_state() {
+    let state = core::ptr::addr_of_mut!(BOOTSTRAP_FX_STATE);
+    // SAFETY: FXSAVE is enabled during boot, `state` is 16-byte aligned, and the
+    // caller has IF clear while the last kernel thread returns to the bootstrap.
+    unsafe { asm!("fxsave64 [{}]", in(reg) state, options(nostack)) };
+    // SAFETY: Interrupts remain disabled until the saved bootstrap area is active.
+    unsafe { publish_fx_state(state) };
+}
+
+/// Advance scheduler deadlines/events and preempt the current thread if another
+/// context is ready. Called only after the timer IRQ has sent APIC EOI.
+pub(crate) fn timer_interrupt() {
+    let runtime_pointer = ACTIVE_RUNTIME.load(Ordering::Acquire);
+    if runtime_pointer.is_null() {
+        return;
+    }
+
+    // The interrupt gate has cleared IF. Every ordinary scheduler mutation also
+    // disables IF before borrowing this runtime, so the single CPU cannot observe
+    // a partially updated scheduler state here.
+    let switch = unsafe {
+        let runtime = &mut *runtime_pointer;
+        runtime.wake_ready_events();
+        let Some(current) = runtime.policy.current() else {
+            return;
+        };
+        let old_context = runtime.current_context;
+        if old_context != current.slot_index() + 1 {
+            halt_on_stack_cleanup_failure();
+        }
+        let next = runtime
+            .policy
+            .preempt_current()
+            .unwrap_or_else(|_| halt_on_stack_cleanup_failure());
+        let next_context = next.slot_index() + 1;
+        runtime.current_context = next_context;
+        if next == current {
+            None
+        } else {
+            Some((
+                core::ptr::addr_of_mut!(runtime.saved_rsp[old_context]),
+                runtime.saved_rsp[next_context],
+                core::ptr::addr_of_mut!(runtime.fx_state[next_context]),
+            ))
+        }
+    };
+    if let Some((old_rsp, new_rsp, new_fx_state)) = switch {
+        // SAFETY: The interrupted context's FXSAVE image was written by the IRQ
+        // stub before Rust ran. This suspends the handler stack and restores the
+        // selected context; the interrupted thread later resumes through IRETQ.
+        unsafe {
+            rustix_arch_context_switch_from_irq(old_rsp, new_rsp as *mut usize, new_fx_state)
+        };
+    }
 }

@@ -584,10 +584,16 @@ rustix_irq_spurious_stub:
     push r13
     push r14
     push r15
+    # Preserve asynchronous x87/SSE state before Rust IRQ dispatch can use it.
+    mov rax, qword ptr [rip + rustix_active_fpu_state_pointer]
+    fxsave64 [rax]
     mov edi, dword ptr [rsp + 120]
     mov rbx, rsp
     and rsp, -16
     call rustix_irq_dispatch
+    # A timer switch updates the active state pointer before selecting a context.
+    mov rax, qword ptr [rip + rustix_active_fpu_state_pointer]
+    fxrstor64 [rax]
     mov rsp, rbx
     pop r15
     pop r14

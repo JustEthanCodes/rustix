@@ -13,7 +13,7 @@ Rustix keeps privileged platform access in `src/arch/x86_64/`. Device-facing rou
 | PS/2-compatible keyboard controller | [`src/arch/x86_64/keyboard.rs`](../../src/arch/x86_64/keyboard.rs) | Bounded IRQ1 drain into a raw-scancode queue, plus non-blocking polling fallback; filters auxiliary-device and controller-error bytes. |
 | Local APIC, I/O APIC, and PIT | [`src/arch/x86_64/apic.rs`](../../src/arch/x86_64/apic.rs) | One-vCPU MADT-routed IRQ delivery; PIC routes remain masked. PIT supplies the approximately 100 Hz scheduler tick. |
 
-The PS/2 driver assumes a legacy controller is present. Initialization uses bounded waits; raw scancodes are not translated, and USB HID is unsupported. UART and keyboard IRQ paths use bounded queues and notify the cooperative scheduler; polling remains available for early boot/fallback.
+The PS/2 driver assumes a legacy controller is present. Initialization uses bounded waits; raw scancodes are not translated, and USB HID is unsupported. UART and keyboard IRQ paths use bounded queues to wake tasks waiting for input; runnable threads are also subject to PIT preemption. Polling remains available for early boot/fallback.
 
 ## Driver development rules
 
@@ -25,4 +25,4 @@ The PS/2 driver assumes a legacy controller is present. Initialization uses boun
 
 ## Planned driver work
 
-`src/time.rs` provides host-tested PIT divisor selection and monotonic tick arithmetic; the x86_64 APIC driver programs the PIT and delivers live ticks. This is a monotonic tick source, not wall-clock time. Timer preemption and SMP require separately designed locking and per-CPU rules. Framebuffer/console output, PCI discovery, storage, and networking remain future drivers; no support for those devices is implied.
+`src/time.rs` provides host-tested PIT divisor selection and monotonic tick arithmetic; the x86_64 APIC driver programs the PIT and delivers live ticks. This is a monotonic tick source, not wall-clock time. Single-vCPU timer preemption is implemented with IRQ-safe locking and validated context switching; SMP still requires separately designed per-CPU and synchronization rules. Framebuffer/console output, PCI discovery, storage, and networking remain future drivers; no support for those devices is implied.

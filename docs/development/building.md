@@ -29,7 +29,7 @@ just smoke       # bounded QEMU BIOS boot to the Crabshell prompt
 just uefi-smoke      # bounded QEMU/OVMF boot; check ACPI MADT, CR3 transition, and prompt
 just active-map-smoke # probe active mapping/TLB invalidation, then restore the default image
 just frame-smoke     # probe one owned frame through the HHDM, then restore the default image
-just thread-smoke    # test cooperative switching and wait queues, then restore the default image
+just thread-smoke    # test IRQ locks, cooperative waits, timer preemption and FPU state; restores default image
 just input-smoke     # test UART/PS/2 IRQ input and shell wakeup under OVMF
 just fault-smoke     # inject page fault and invalid opcode, then restore the default image
 just run             # interactive serial shell in QEMU (Ctrl+C to stop)

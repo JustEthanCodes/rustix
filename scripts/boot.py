@@ -692,7 +692,11 @@ def thread_smoke_workflow(timeout: int) -> None:
         build_image()
         uefi_smoke_test(
             timeout,
-            ("cooperative thread path passed: yield, event wakeup, timed sleep, stack guards",),
+            (
+                            "IRQ-save lock path passed: prior IF state preserved",
+                            "cooperative thread path passed: yield, event wakeup, timed sleep, stack guards",
+                            "timer preemption path passed: non-yielding workers and FPU state survived",
+                        ),
         )
     except (BuildError, OSError, subprocess.SubprocessError) as error:
         failure = error
@@ -828,7 +832,7 @@ def main() -> int:
     )
     active_map_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
     thread_smoke = subparsers.add_parser(
-        "thread-smoke", help="test cooperative kernel threads with OVMF, then restore the default image"
+        "thread-smoke", help="test cooperative and timer-preemptive kernel threads with OVMF, then restore the default image"
     )
     thread_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
     input_smoke = subparsers.add_parser(

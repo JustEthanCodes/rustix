@@ -8,5 +8,6 @@ pub mod irq;
 pub mod memory;
 pub mod paging;
 pub mod scheduler;
+pub mod sync;
 pub mod time;
 pub mod vfs;

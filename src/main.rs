@@ -524,8 +524,16 @@ core::arch::global_asm!(
 
 #[no_mangle]
 pub extern "C" fn rustix_start(entry_rsp: u64) -> ! {
+    // Keep interrupts masked until FPU state and the IRQ save destination are ready.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
     arch::x86_64::serial::initialize();
+    if let Err(error) = arch::x86_64::cpu::initialize_fpu_state() {
+        kprintln!("required x87/SSE state unavailable: {:?}", error);
+        halt_forever();
+    }
+    kernel_threads::initialize_fpu_context();
     kprintln!("Rustix kernel: x86_64 Rust bootstrap");
+    kprintln!("x87/SSE context state enabled with FXSAVE/FXRSTOR; AVX disabled");
     arch::x86_64::interrupts::initialize();
     kprintln!("x86_64 exception diagnostics: enabled (IRQs remain disabled)");
     let mut boot_info = match boot::capture_boot_information(entry_rsp) {
@@ -1052,7 +1060,10 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
 
 extern "C" fn bootstrap_timer_irq() {
     BOOTSTRAP_TIMER_TICKS.tick();
+    // Acknowledge before a scheduling switch so the APIC does not retain an
+    // in-service timer vector while another context runs.
     arch::x86_64::apic::end_of_interrupt();
+    kernel_threads::timer_interrupt();
 }
 
 #[derive(Default)]

@@ -4,4 +4,5 @@ rustflags = [
     "-C", "link-arg=-Tlinker.ld",
     "-C", "no-redzone=yes",
     "-C", "relocation-model=static",
+    "-C", "target-feature=-avx,-avx2,-avx512f",
 ]
