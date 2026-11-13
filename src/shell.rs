@@ -22,7 +22,13 @@ pub fn run(
     let mut reported_input_wait = false;
     loop {
         print_prompt(filesystem, cwd);
-        let length = read_line(&mut input, runtime, &mut reported_input_wait);
+        let length = read_line(
+            &mut input,
+            filesystem,
+            cwd,
+            runtime,
+            &mut reported_input_wait,
+        );
         if length == 0 {
             continue;
         }
@@ -58,6 +64,8 @@ fn print_prompt(filesystem: &RamFs, cwd: usize) {
 
 fn read_line(
     input: &mut [u8; MAX_LINE_LENGTH],
+    filesystem: &RamFs,
+    cwd: usize,
     runtime: *mut (),
     reported_input_wait: &mut bool,
 ) -> usize {
@@ -67,11 +75,15 @@ fn read_line(
             Some(byte) => byte,
             None => {
                 if let Some(scancode) = crate::arch::x86_64::keyboard::try_read_irq_scancode() {
-                    if scancode & 0x80 == 0 {
+                    if scancode == 0xe0 || scancode & 0x80 == 0 {
                         serial::print(format_args!(
                             "\r\nPS/2 raw scancode IRQ: {:#04x}\r\n",
                             scancode
                         ));
+                        print_prompt(filesystem, cwd);
+                        for &byte in &input[..length] {
+                            serial::print(format_args!("{}", byte as char));
+                        }
                     }
                     continue;
                 }

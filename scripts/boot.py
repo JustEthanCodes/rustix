@@ -430,14 +430,17 @@ def input_smoke_test(timeout: int) -> None:
             raise BuildError("timed out connecting to QEMU serial/QMP sockets")
 
         def read_qmp_message(deadline: float) -> dict[str, object]:
+            connection = qmp_connection
+            if connection is None:
+                raise BuildError("QMP connection is not ready")
             while b"\n" not in qmp_buffer:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise BuildError("timed out waiting for a QMP response")
-                ready, _, _ = select.select([qmp_connection], [], [], remaining)
+                ready, _, _ = select.select([connection], [], [], remaining)
                 if not ready:
                     raise BuildError("timed out waiting for a QMP response")
-                chunk = qmp_connection.recv(4096)
+                chunk = connection.recv(4096)
                 if not chunk:
                     raise BuildError("QEMU closed its QMP connection")
                 qmp_buffer.extend(chunk)
@@ -446,10 +449,13 @@ def input_smoke_test(timeout: int) -> None:
             return json.loads(line)
 
         def qmp_execute(name: str, arguments: dict[str, object] | None = None) -> object:
+            connection = qmp_connection
+            if connection is None:
+                raise BuildError("QMP connection is not ready")
             request: dict[str, object] = {"execute": name}
             if arguments is not None:
                 request["arguments"] = arguments
-            qmp_connection.sendall(json.dumps(request).encode("ascii") + b"\n")
+            connection.sendall(json.dumps(request).encode("ascii") + b"\n")
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 response = read_qmp_message(deadline)
@@ -460,17 +466,20 @@ def input_smoke_test(timeout: int) -> None:
             raise BuildError(f"timed out executing QMP command {name}")
 
         def wait_for_serial(marker: str, deadline: float, start_at: int = 0) -> int:
+            connection = serial_connection
+            if connection is None:
+                raise BuildError("serial connection is not ready")
             encoded_marker = marker.encode("latin-1")
             while encoded_marker not in serial_output[start_at:]:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise BuildError(f"timed out waiting for serial marker {marker!r}")
-                ready, _, _ = select.select([serial_connection], [], [], min(remaining, 0.25))
+                ready, _, _ = select.select([connection], [], [], min(remaining, 0.25))
                 if not ready:
                     if process.poll() is not None:
                         raise BuildError(f"QEMU exited early with status {process.returncode}")
                     continue
-                chunk = serial_connection.recv(4096)
+                chunk = connection.recv(4096)
                 if not chunk:
                     raise BuildError("QEMU closed its serial connection")
                 serial_output.extend(chunk)
@@ -490,8 +499,22 @@ def input_smoke_test(timeout: int) -> None:
             serial_connection.sendall(b"help\r")
             offset = wait_for_serial("Crabshell commands:", deadline, offset)
             offset = wait_for_serial("root@rustix:/home/rustix# ", deadline, offset)
+            serial_connection.sendall(b"pw")
+            offset = wait_for_serial("pw", deadline, offset)
             qmp_execute("human-monitor-command", {"command-line": "sendkey a"})
-            wait_for_serial("PS/2 raw scancode IRQ: 0x1e", deadline, offset)
+            offset = wait_for_serial(
+                "PS/2 raw scancode IRQ: 0x1e\r\nroot@rustix:/home/rustix# pw",
+                deadline,
+                offset,
+            )
+            qmp_execute("human-monitor-command", {"command-line": "sendkey up"})
+            offset = wait_for_serial(
+                "PS/2 raw scancode IRQ: 0xe0\r\nroot@rustix:/home/rustix# pw",
+                deadline,
+                offset,
+            )
+            serial_connection.sendall(b"d\r")
+            wait_for_serial("/home/rustix\r\nroot@rustix:/home/rustix# ", deadline, offset)
 
             output = serial_output.decode("latin-1")
             expected = (
@@ -500,7 +523,9 @@ def input_smoke_test(timeout: int) -> None:
                 "kernel shell thread runtime: cooperative input wait",
                 "kernel heap probe passed: bootstrap exhaustion, frame-backed growth, reuse",
                 "Crabshell commands:",
-                "PS/2 raw scancode IRQ: 0x1e",
+                "PS/2 raw scancode IRQ: 0x1e\r\nroot@rustix:/home/rustix# pw",
+                "PS/2 raw scancode IRQ: 0xe0\r\nroot@rustix:/home/rustix# pw",
+                "/home/rustix\r\nroot@rustix:/home/rustix# ",
             )
             missing = [marker for marker in expected if marker not in output]
             if missing:

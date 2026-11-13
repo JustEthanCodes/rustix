@@ -5,7 +5,7 @@
 
 Rustix (Rust-unix) is an experimental, 64-bit, Unix-like operating system whose kernel is written in Rust. This repository builds the kernel itself; Limine is used only as the external boot protocol/loader, not as a substitute for a Rustix kernel.
 
-Rustix now boots into **Crabshell**, a small kernel-mode shell on the COM1 serial terminal. It includes basic navigation and file commands backed by a fixed-capacity RAM filesystem. The filesystem is volatile and reset at every boot; this is an early kernel shell, not a userspace process or POSIX shell. The command parser lives in a separate, allocation-free `crabshell` crate so a future GUI terminal can reuse it. Scheduling, process isolation, persistent storage, a syscall ABI, networking, and userspace are still future work. See [`docs/roadmap/README.md`](docs/roadmap/README.md) for the staged plan.
+Rustix now boots into **Crabshell**, a small kernel-mode shell on the COM1 serial terminal. It includes basic navigation and file commands backed by a fixed-capacity RAM filesystem. The filesystem is volatile and reset at every boot; this is an early kernel shell, not a userspace process or POSIX shell. The command parser lives in a separate, allocation-free `crabshell` crate so a future GUI terminal can reuse it. Single-vCPU cooperative waits/yields, timer preemption, and bounded UART/PS/2 IRQ input are present; process isolation, persistent storage, a syscall ABI, networking, and userspace remain future work. See [`docs/roadmap/README.md`](docs/roadmap/README.md) for the staged plan.
 
 ## Quick start
 
@@ -44,13 +44,23 @@ Try `pwd`, `ls /`, `mkdir notes`, `write notes/hello.txt "hello from Rustix"`, `
 - `src/vfs.rs` — fixed-capacity volatile RAM filesystem, with host-side tests.
 - `crates/crabshell/` — separate `no_std` command parser crate; no I/O or filesystem coupling.
 - `src/boot.rs` — mutable Limine response requests, validated owned boot snapshot, and diagnostics.
-- `src/arch/x86_64/serial.rs` — COM1 polling driver used for shell output and input.
+- `src/arch/x86_64/serial.rs` — COM1 formatted output, early polling input, and bounded IRQ RX queue.
 - `src/arch/x86_64/cpu.rs` — baseline CPUID vendor and feature reporting.
-- `src/arch/x86_64/interrupts.rs` — bootstrap GDT/TSS/IDT and fatal exception diagnostics.
-- `src/arch/x86_64/keyboard.rs` — raw, non-blocking PS/2-compatible scancode polling.
+- `src/arch/x86_64/interrupts.rs` — bootstrap GDT/TSS/IDT, fatal exception diagnostics, and IRQ entry/dispatch.
+- `src/arch/x86_64/keyboard.rs` — bounded PS/2 IRQ scancode queue and non-blocking polling fallback.
+- `src/arch/x86_64/apic.rs` — validated single-vCPU xAPIC/I/O APIC routing and PIT ticks.
+- `src/arch/x86_64/context.rs` — cooperative x86_64 context-switch assembly.
 - `src/arch/x86_64/io.rs` — narrow x86 port-I/O wrappers.
 - `src/memory.rs` — fixed-capacity validated physical-memory-map snapshot and host tests.
-- `src/frame.rs` — bounded physical frame allocator initialized from `BootInfo`; no kernel service allocates frames yet.
+- `src/frame.rs` — bounded physical frame allocator initialized from `BootInfo`; paging, heap growth, and guarded thread stacks use allocator-issued frames.
+- `src/acpi.rs` — bounded ACPI table validation and MADT parsing helpers.
+- `src/heap.rs` — fixed-capacity global heap policy and host tests.
+- `src/input.rs` — bounded SPSC input queues and IRQ-to-scheduler event signaling.
+- `src/irq.rs` — host-tested IRQ vector allocation policy.
+- `src/kernel_threads.rs` — cooperative kernel-thread runtime and guarded-stack lifecycle.
+- `src/paging.rs` — validated page-table cloning, mappings, and cache policy.
+- `src/scheduler.rs` — host-tested cooperative scheduling and wait-queue policy.
+- `src/time.rs` — PIT divisor and monotonic tick arithmetic.
 - `.cargo/config.toml`, `linker.ld` — x86_64-none code generation and ELF layout.
 - `justfile` — formatting, tests, target checks, image creation, emulator smoke test, and aggregate verification.
 - `limine.conf` — pinned boot configuration for the Rustix kernel.

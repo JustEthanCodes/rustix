@@ -277,7 +277,7 @@ unsafe fn map_kernel_heap_pages(
     .is_some();
     if flags & (1 << 9) != 0 {
         // SAFETY: The mapping transaction is complete or fully rolled back.
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        unsafe { core::arch::asm!("sti") };
     }
     result
 }
@@ -961,7 +961,7 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
     };
     if input_irq_flags & (1 << 9) != 0 {
         // SAFETY: Device handlers and masked-first routes are initialized.
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        unsafe { core::arch::asm!("sti") };
     }
     let _keep_vector_allocator_and_token_live = (
         vector_allocator,

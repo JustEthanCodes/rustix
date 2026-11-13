@@ -18,6 +18,9 @@ pub struct ByteRing<const CAPACITY: usize> {
     bytes: [AtomicU8; CAPACITY],
     head: AtomicUsize,
     tail: AtomicUsize,
+    // Physical slot positions wrap at CAPACITY, independently of counter wrap.
+    head_index: AtomicUsize,
+    tail_index: AtomicUsize,
     overflows: AtomicUsize,
 }
 
@@ -27,6 +30,8 @@ impl<const CAPACITY: usize> ByteRing<CAPACITY> {
             bytes: [const { AtomicU8::new(0) }; CAPACITY],
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
+            head_index: AtomicUsize::new(0),
+            tail_index: AtomicUsize::new(0),
             overflows: AtomicUsize::new(0),
         }
     }
@@ -43,7 +48,10 @@ impl<const CAPACITY: usize> ByteRing<CAPACITY> {
             self.increment_overflows();
             return false;
         }
-        self.bytes[head % CAPACITY].store(byte, Ordering::Relaxed);
+        let index = self.head_index.load(Ordering::Relaxed);
+        self.bytes[index].store(byte, Ordering::Relaxed);
+        self.head_index
+            .store(self.next_index(index), Ordering::Relaxed);
         self.head.store(head.wrapping_add(1), Ordering::Release);
         true
     }
@@ -58,7 +66,10 @@ impl<const CAPACITY: usize> ByteRing<CAPACITY> {
         if tail == head {
             return None;
         }
-        let byte = self.bytes[tail % CAPACITY].load(Ordering::Relaxed);
+        let index = self.tail_index.load(Ordering::Relaxed);
+        let byte = self.bytes[index].load(Ordering::Relaxed);
+        self.tail_index
+            .store(self.next_index(index), Ordering::Relaxed);
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         Some(byte)
     }
@@ -69,6 +80,14 @@ impl<const CAPACITY: usize> ByteRing<CAPACITY> {
 
     pub fn is_empty(&self) -> bool {
         self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+    }
+
+    fn next_index(&self, index: usize) -> usize {
+        if index == CAPACITY - 1 {
+            0
+        } else {
+            index + 1
+        }
     }
 
     fn increment_overflows(&self) {
@@ -90,6 +109,7 @@ impl<const CAPACITY: usize> Default for ByteRing<CAPACITY> {
 mod tests {
     use super::ByteRing;
     use core::assert_eq;
+    use core::sync::atomic::Ordering;
 
     #[test]
     fn bounded_queue_preserves_order_and_reports_overflow() {
@@ -107,6 +127,23 @@ mod tests {
         assert_eq!(queue.try_pop(), Some(b'd'));
         assert_eq!(queue.try_pop(), None);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn non_power_of_two_capacity_survives_counter_wraparound() {
+        let queue = ByteRing::<3>::new();
+        queue.head.store(usize::MAX, Ordering::Relaxed);
+        queue.tail.store(usize::MAX, Ordering::Relaxed);
+
+        assert!(queue.try_push(b'a'));
+        assert!(queue.try_push(b'b'));
+        assert!(queue.try_push(b'c'));
+        assert_eq!(queue.try_pop(), Some(b'a'));
+        assert!(queue.try_push(b'd'));
+        assert_eq!(queue.try_pop(), Some(b'b'));
+        assert_eq!(queue.try_pop(), Some(b'c'));
+        assert_eq!(queue.try_pop(), Some(b'd'));
+        assert_eq!(queue.try_pop(), None);
     }
 
     #[test]

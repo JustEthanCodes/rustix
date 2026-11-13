@@ -140,14 +140,14 @@ impl KernelThreadRuntime {
         }
     }
 
-    fn wake_ready_events(&mut self) {
+    fn wake_ready_events(&mut self) -> bool {
         self.wake_expired();
-        if self.input_events_enabled
-            && rustix_kernel::input::INPUT_EVENT_PENDING.swap(false, Ordering::AcqRel)
-            && self.policy.wake_all(self.event_queue).is_err()
-        {
+        let input_event = self.input_events_enabled
+            && rustix_kernel::input::INPUT_EVENT_PENDING.swap(false, Ordering::AcqRel);
+        if input_event && self.policy.wake_all(self.event_queue).is_err() {
             THREAD_TEST_TRACE.store(99, Ordering::Release);
         }
+        input_event
     }
 
     unsafe fn run_from_raw(runtime_pointer: *mut Self) {
@@ -241,7 +241,7 @@ impl KernelThreadRuntime {
                 // a PIT wakeup cannot be lost between checking deadlines and halt.
                 // SAFETY: The verified PIT handler is installed and the only
                 // unmasked device route; it performs no allocation or scheduling.
-                unsafe { asm!("sti; hlt", options(nomem, nostack)) };
+                unsafe { asm!("sti; hlt") };
             }
         }
     }
@@ -770,7 +770,7 @@ extern "C" fn kernel_thread_trampoline() -> ! {
     // timer route only after their descriptor and runtime state are available.
     // SAFETY: The scheduler installs no thread until the caller has configured
     // the timer and registered its bounded non-scheduling handler.
-    unsafe { asm!("sti", options(nomem, nostack)) };
+    unsafe { asm!("sti") };
     entry(runtime_pointer.cast(), argument);
     // SAFETY: This thread's entry returned normally; mark it exited and switch
     // away before its stack can be reclaimed by the bootstrap context.
@@ -809,6 +809,9 @@ extern "C" fn signaler_thread(runtime: *mut (), _argument: usize) {
         return;
     }
     THREAD_TEST_TRACE.store(4, Ordering::Release);
+    while THREAD_TEST_TRACE.load(Ordering::Acquire) != 5 {
+        yield_current(runtime);
+    }
 }
 
 #[cfg(feature = "probe-kernel-threads")]
@@ -844,6 +847,7 @@ fn yield_current(runtime_pointer: *mut ()) {
     let flags = disable_interrupts();
     let switch = unsafe {
         let runtime = &mut *runtime_pointer.cast::<KernelThreadRuntime>();
+        runtime.wake_ready_events();
         let Some(current) = runtime.policy.current() else {
             restore_interrupts(flags);
             return;
@@ -886,6 +890,11 @@ unsafe fn block_current(runtime_pointer: *mut KernelThreadRuntime, delay: Option
         // SAFETY: Called from one cooperative thread with IF clear; the state
         // references are scoped entirely before the context switch.
         let runtime = unsafe { &mut *runtime_pointer };
+        let input_event = runtime.wake_ready_events();
+        if delay.is_none() && runtime.input_events_enabled && input_event {
+            restore_interrupts(flags);
+            return true;
+        }
         let Some(current) = runtime.policy.current() else {
             restore_interrupts(flags);
             return false;
@@ -932,6 +941,7 @@ unsafe fn exit_current(runtime_pointer: *mut KernelThreadRuntime) -> ! {
     let (old_rsp, new_rsp, old_fx_state, new_fx_state) = {
         // SAFETY: This is the current thread's normal return path, with IF clear.
         let runtime = unsafe { &mut *runtime_pointer };
+        runtime.wake_ready_events();
         let old_context = runtime.current_context;
         match runtime.policy.exit_current() {
             Ok(next) => {
@@ -968,7 +978,7 @@ fn restore_interrupts(flags: u64) {
     if flags & (1 << 9) != 0 {
         // SAFETY: The caller only restores the prior IF state after its critical
         // section and after the selected stack/context is fully established.
-        unsafe { asm!("sti", options(nomem, nostack)) };
+        unsafe { asm!("sti") };
     }
 }
 

@@ -54,7 +54,7 @@ root@rustix:/home# pwd
 /home
 ```
 
-The grammar intentionally does not yet support quoted paths, escaped quotes, variables, pipes, redirection, globbing, command substitution, history, or a process launcher. Input is a single ASCII line (up to 256 bytes) from the serial port.
+The grammar intentionally does not yet support quoted paths, escaped quotes, variables, pipes, redirection, globbing, command substitution, history, or a process launcher. Input is a single ASCII line (up to 256 bytes) from COM1's bounded IRQ queue, with polling fallback; PS/2 IRQ bytes are reported as raw scancodes rather than translated into characters. A scancode diagnostic redraws the prompt and any partially typed line.
 
 ## RAM filesystem contract
 
@@ -68,4 +68,4 @@ The grammar intentionally does not yet support quoted paths, escaped quotes, var
 
 ## Tests and limitations
 
-Host-side tests cover path traversal, file create/write/append/copy/move/remove, entry kinds, path rendering, directory emptiness, capacity failures without namespace mutation, and the parser's syntax/arity. The automated QEMU smoke test checks that the serial shell reaches its prompt. A separate manual `just run` session exercised `help`, `ls`, `meminfo`, `mkdir`, `cd`, `touch`, `write`, `append`, `cat`, `cp`, `mv`, `rm`, `rmdir`, and `pwd`; `cat` returned the appended text, `cp` replaced an existing destination with source contents, `rmdir` refused a nonempty directory, and `pwd` returned to `/home/rustix` after cleanup. The unsupported `memtest` command produced the expected unknown-command response. These checks do not emulate reboot persistence, exhaustively test shell interactions, or prove isolation. Since the shell runs in ring 0, a parser or filesystem bug can panic the entire kernel. This implementation must not be presented as a secure or POSIX-compliant shell.
+Host-side tests cover path traversal, file create/write/append/copy/move/remove, entry kinds, path rendering, directory emptiness, capacity failures without namespace mutation, and the parser's syntax/arity. The automated QEMU smoke test checks that the serial shell reaches its prompt; `just input-smoke` additionally exercises UART/PS/2 IRQ wakeup and raw scancode reporting. A separate manual `just run` session exercised `help`, `ls`, `meminfo`, `mkdir`, `cd`, `touch`, `write`, `append`, `cat`, `cp`, `mv`, `rm`, `rmdir`, and `pwd`; `cat` returned the appended text, `cp` replaced an existing destination with source contents, `rmdir` refused a nonempty directory, and `pwd` returned to `/home/rustix` after cleanup. The unsupported `memtest` command produced the expected unknown-command response. These checks do not emulate reboot persistence, exhaustively test shell interactions, or prove isolation. Since the shell runs in ring 0, a parser or filesystem bug can panic the entire kernel. This implementation must not be presented as a secure or POSIX-compliant shell.

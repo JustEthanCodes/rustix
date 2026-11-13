@@ -124,6 +124,7 @@ pub enum IrqRegistrationError {
     AlreadyRegistered,
 }
 
+// In 64-bit mode, exception entry saves SS:RSP even for a CPL 0 fault.
 #[repr(C)]
 pub(crate) struct ExceptionContext {
     r15: u64,
@@ -146,17 +147,21 @@ pub(crate) struct ExceptionContext {
     rip: u64,
     cs: u64,
     rflags: u64,
+    rsp: u64,
+    ss: u64,
 }
 
 const _: [(); 16] = [(); size_of::<IdtEntry>()];
 const _: [(); 4096] = [(); size_of::<IdtTable>()];
 const _: [(); 104] = [(); size_of::<TaskStateSegment>()];
-const _: [(); 160] = [(); size_of::<ExceptionContext>()];
+const _: [(); 176] = [(); size_of::<ExceptionContext>()];
 const _: [(); 120] = [(); core::mem::offset_of!(ExceptionContext, vector)];
 const _: [(); 128] = [(); core::mem::offset_of!(ExceptionContext, error_code)];
 const _: [(); 136] = [(); core::mem::offset_of!(ExceptionContext, rip)];
 const _: [(); 144] = [(); core::mem::offset_of!(ExceptionContext, cs)];
 const _: [(); 152] = [(); core::mem::offset_of!(ExceptionContext, rflags)];
+const _: [(); 160] = [(); core::mem::offset_of!(ExceptionContext, rsp)];
+const _: [(); 168] = [(); core::mem::offset_of!(ExceptionContext, ss)];
 
 extern "C" {
     static exception_stub_table: [usize; EXCEPTION_COUNT];
@@ -356,9 +361,14 @@ pub extern "C" fn rustix_exception_dispatch(context: *const ExceptionContext) ->
         context.rip
     );
     crate::kprintln!(
-        "CS={:#06x} RFLAGS={:#018x} RAX={:#018x} RBX={:#018x} RCX={:#018x}",
+        "CS={:#06x} SS={:#06x} RFLAGS={:#018x} RSP={:#018x}",
         context.cs,
+        context.ss,
         context.rflags,
+        context.rsp
+    );
+    crate::kprintln!(
+        "RAX={:#018x} RBX={:#018x} RCX={:#018x}",
         context.rax,
         context.rbx,
         context.rcx
@@ -530,6 +540,9 @@ rustix_load_gdt:
     mov ss, ax
     mov ax, 0x18
     ltr ax
+    xor eax, eax
+    mov fs, ax
+    mov gs, ax
     ret
 
     .section .rodata

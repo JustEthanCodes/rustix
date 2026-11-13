@@ -99,7 +99,7 @@ fn save_and_disable_interrupts() -> u64 {
 fn restore_interrupts(flags: u64) {
     if flags & (1 << 9) != 0 {
         // SAFETY: The guard released its lock before restoring the prior IF state.
-        unsafe { core::arch::asm!("sti", options(nostack)) };
+        unsafe { core::arch::asm!("sti") };
     }
 }
 
