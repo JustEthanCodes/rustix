@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rustix-kernel"
-version = "0.1.0-milestone3-stable"
+version = "0.1.0-milestone3-sr1"
 edition = "2021"
 publish = false
 license = "Apache-2.0"
