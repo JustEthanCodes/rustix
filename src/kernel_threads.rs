@@ -58,8 +58,7 @@ pub(crate) fn initialize_fpu_context() {
     // SAFETY: Bootstrap runs with IF clear and this pointer is published before
     // the timer or device IRQ routes can be unmasked.
     unsafe {
-        core::ptr::addr_of_mut!(ACTIVE_FX_STATE_POINTER)
-            .write(core::ptr::addr_of_mut!(BOOTSTRAP_FX_STATE));
+        ACTIVE_FX_STATE_POINTER = core::ptr::addr_of_mut!(BOOTSTRAP_FX_STATE);
     }
 }
 
@@ -1021,7 +1020,7 @@ unsafe fn rustix_arch_context_switch_from_irq(
 unsafe fn publish_fx_state(state: *mut FxSaveArea) {
     // SAFETY: The single-vCPU runtime calls this only with IF clear; IRQ assembly
     // reads the pointer only while executing on that same CPU.
-    unsafe { core::ptr::addr_of_mut!(ACTIVE_FX_STATE_POINTER).write(state) };
+    unsafe { ACTIVE_FX_STATE_POINTER = state };
 }
 
 unsafe fn save_bootstrap_fx_state() {
