@@ -307,6 +307,7 @@ impl<const THREADS: usize, const QUEUES: usize, const WAITERS: usize>
         for index in 1..queue.len {
             queue.waiters[index - 1] = queue.waiters[index];
         }
+        debug_assert!(queue.len > 0);
         queue.len -= 1;
         queue.waiters[queue.len] = None;
         self.threads[thread_id.slot].state = Some(ThreadState::Ready);

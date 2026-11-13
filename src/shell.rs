@@ -155,7 +155,7 @@ fn execute(
                 "physical frames: {} managed, {} free, {} allocated",
                 managed,
                 free,
-                managed - free
+                managed.saturating_sub(free)
             );
         }
         Command::Ls(path) => {

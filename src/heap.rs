@@ -216,6 +216,8 @@ impl<const MAX_ALLOCATIONS: usize> FrameBackedHeap<MAX_ALLOCATIONS> {
         let end = start
             .checked_add(layout.size())
             .ok_or(HeapError::AddressOverflow)?;
+        // `end` is already bounded by this heap's capacity, so this division
+        // cannot overflow the page count.
         let required_pages = end
             .checked_add(PAGE_BYTES - 1)
             .ok_or(HeapError::AddressOverflow)?

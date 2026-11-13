@@ -86,8 +86,9 @@ pub extern "C" fn irq_handler() {
                 if status & 0x01 != 0 {
                     // SAFETY: Line status reports a byte in the receive register.
                     let byte = unsafe { super::io::read_u8(COM1) };
-                    let _ = rustix_kernel::input::UART_INPUT.try_push(byte);
-                    rustix_kernel::input::INPUT_EVENT_PENDING.store(true, Ordering::Release);
+                    if rustix_kernel::input::UART_INPUT.try_push(byte) {
+                        rustix_kernel::input::INPUT_EVENT_PENDING.store(true, Ordering::Release);
+                    }
                 } else if interrupt_id & 0x0e == 0x06 {
                     break;
                 }
@@ -104,8 +105,9 @@ pub extern "C" fn irq_handler() {
                 if status & 0x01 != 0 {
                     // SAFETY: Line status reports a byte in the receive register.
                     let byte = unsafe { super::io::read_u8(COM1) };
-                    let _ = rustix_kernel::input::UART_INPUT.try_push(byte);
-                    rustix_kernel::input::INPUT_EVENT_PENDING.store(true, Ordering::Release);
+                    if rustix_kernel::input::UART_INPUT.try_push(byte) {
+                        rustix_kernel::input::INPUT_EVENT_PENDING.store(true, Ordering::Release);
+                    }
                 }
             }
         }

@@ -90,7 +90,8 @@ impl InterruptVectorAllocator {
             });
         }
         self.allocated[word] &= !mask;
-        self.allocated_count -= 1;
+        debug_assert!(self.allocated_count > 0);
+        self.allocated_count = self.allocated_count.saturating_sub(1);
         Ok(())
     }
 

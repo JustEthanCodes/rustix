@@ -164,7 +164,8 @@ impl FrameAllocator {
 
         let address = self.free[0].start;
         self.free[0].start += FRAME_SIZE;
-        self.free_frames -= 1;
+        debug_assert!(self.free_frames > 0);
+        self.free_frames = self.free_frames.saturating_sub(1);
         if self.free[0].start == self.free[0].end {
             Self::remove_range(&mut self.free, &mut self.free_count, 0);
         }
@@ -276,6 +277,7 @@ impl FrameAllocator {
         for move_index in index..(*count - 1) {
             ranges[move_index] = ranges[move_index + 1];
         }
+        debug_assert!(*count > 0);
         *count -= 1;
         ranges[*count] = FrameRange::EMPTY;
     }
