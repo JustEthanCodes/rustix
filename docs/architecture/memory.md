@@ -47,7 +47,7 @@ Never modify Limine's active page tables in place. `src/paging.rs` builds an own
 2. **Frame allocator integration:** the bounded core is initialized from `BootInfo`; table and leaf mappings use allocator-issued tokens. The active mapping smoke validates one owned page's map/access/unmap/reclamation path.
 3. **Kernel virtual memory:** Rustix runs on an active clone of Limine's hierarchy and hardens kernel-image HHDM aliases. Narrow active owned-page map/unmap operations invalidate the local TLB; this is not a clean-room address-space policy or general MMIO subsystem.
 4. **Heap:** a 256 KiB BSS arena with 128 allocation records is backed by a bounded, demand-mapped extension of up to 1 MiB. Host tests and QEMU cover growth, reuse, exhaustion, and failed growth. The global allocator uses an IRQ-save spin lock, but allocation remains prohibited in interrupt context so handlers stay bounded and allocation-free.
-5. **Process address spaces:** isolate userspace; define copy-in/copy-out helpers and never treat user pointers as kernel references.
+5. **Process address spaces (planned):** use private lower-half page-table paths and user frames with shared, supervisor-only upper-half subtrees from the retained active clone of Limine's hierarchy. The kernel mapping owner outlives every process root; process teardown frees only its private tables and frames after switching away and invalidating translations. `paging::validate_supervisor_kernel_half` provides a bounded, read-only preflight; it neither installs shared roots nor establishes arbitrary physical-memory access. This is not a curated kernel mapping policy or kernel-page-table isolation. Process-root sharing and copy-in/copy-out helpers are not implemented.
 
 ## Invariants to preserve
 
@@ -56,7 +56,7 @@ Never modify Limine's active page tables in place. `src/paging.rs` builds an own
 - Under the single-allocator-per-physical-map contract, a frame is represented by one allocator-free range or one caller-owned, non-copyable `Frame` token. Only a successful `deallocate` transfers the token back to the allocator; errors return the token and leave allocator ranges and accounting unchanged. The current public constructor relies on callers to enforce unique allocator instances.
 - `allocate` returns `None` on frame exhaustion. Metadata-capacity exhaustion is an explicit error, never silent loss of a frame.
 - A `Frame` address is physical, not directly dereferenceable. HHDM translation and table access are limited to checked full-frame token-based paths that rely on Limine's documented mapping contract. Candidate mutations are allowed only before activation and only in owned tables. The active cloned root retains its ownership tokens and rejects mutation/release until an explicit, reviewed CR3 transition away from it.
-- Mapping changes validate alignment, canonical addresses, ownership, and permissions before touching tables.
+- Mapping changes validate alignment, canonical addresses, ownership, and permissions before touching tables. User-accessible leaf mappings must stay in the lower canonical half; the upper half is reserved for supervisor mappings.
 - User-controlled addresses are validated on every syscall boundary; prior validation is not a substitute for access checks during later copies.
 - Tests cover unaligned edges, exact-boundary allocations, arithmetic overflow, overlaps, exhaustion, and unchanged state/ownership on failure.
 

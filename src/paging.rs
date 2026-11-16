@@ -403,6 +403,202 @@ pub fn walk_virtual_address<R: PageTableReader>(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum KernelHalfValidationError<E> {
+    InvalidConfiguration,
+    InvalidRoot,
+    Reader(E),
+    UserAccessibleEntry {
+        level: u8,
+        index: u16,
+    },
+    InvalidEntry {
+        level: u8,
+        index: u16,
+    },
+    TableAliasedAcrossLevels {
+        physical_address: u64,
+        first_level: u8,
+        second_level: u8,
+    },
+    TableCapacityExceeded,
+}
+
+#[derive(Clone, Copy)]
+struct KernelTableVisit {
+    physical_address: u64,
+    level: u8,
+}
+
+impl KernelTableVisit {
+    const EMPTY: Self = Self {
+        physical_address: 0,
+        level: 0,
+    };
+}
+
+/// Validate every present mapping reachable from the upper-half root entries.
+///
+/// This bounded preflight rejects user-accessible entries at any level and
+/// malformed or out-of-width descendants before a kernel subtree is shared by
+/// process roots. Lower-half root entries are deliberately not inspected. The
+/// reader remains responsible for ensuring that every physical table read is
+/// authorized and safe.
+pub fn validate_supervisor_kernel_half<R: PageTableReader>(
+    reader: &R,
+    root: Cr3Root,
+    config: PageWalkConfig,
+) -> Result<usize, KernelHalfValidationError<R::Error>> {
+    if !(12..=MAX_PTE_PHYSICAL_ADDRESS_BITS).contains(&config.physical_address_bits)
+        || (config.levels != 4 && config.levels != 5)
+        || config.virtual_address_bits != if config.levels == 4 { 48 } else { 57 }
+    {
+        return Err(KernelHalfValidationError::InvalidConfiguration);
+    }
+
+    let root_physical = root.physical_address();
+    let root_end = root_physical
+        .checked_add(PAGE_SIZE)
+        .ok_or(KernelHalfValidationError::InvalidRoot)?;
+    if root_physical & (PAGE_SIZE - 1) != 0
+        || !physical_range_fits_address_width(root_physical, root_end, config.physical_address_bits)
+    {
+        return Err(KernelHalfValidationError::InvalidRoot);
+    }
+
+    const PRESENT: u64 = 1;
+    const USER: u64 = 1 << 2;
+    const PAGE_SIZE_OR_PAT: u64 = 1 << 7;
+    const NO_EXECUTE: u64 = 1 << 63;
+    const ADDRESS_FIELD_MASK: u64 = 0x000f_ffff_ffff_f000;
+    let physical_mask = ((1u64 << config.physical_address_bits) - 1) & !(PAGE_SIZE - 1);
+
+    let mut visits = [KernelTableVisit::EMPTY; MAX_CANDIDATE_PAGE_TABLE_PAGES];
+    visits[0] = KernelTableVisit {
+        physical_address: root_physical,
+        level: config.levels,
+    };
+    let mut visit_count = 1usize;
+    let mut visit_index = 0usize;
+
+    while visit_index < visit_count {
+        let table = visits[visit_index];
+        let first_entry = if table.level == config.levels { 256 } else { 0 };
+        for index in first_entry..512 {
+            let index = index as u16;
+            let entry = reader
+                .read_entry(table.physical_address, index)
+                .map_err(KernelHalfValidationError::Reader)?;
+            if entry & PRESENT == 0 {
+                continue;
+            }
+            if entry & USER != 0 {
+                return Err(KernelHalfValidationError::UserAccessibleEntry {
+                    level: table.level,
+                    index,
+                });
+            }
+
+            let address_field = entry & ADDRESS_FIELD_MASK;
+            if address_field & !physical_mask != 0
+                || (!config.nx_enabled && entry & NO_EXECUTE != 0)
+            {
+                return Err(KernelHalfValidationError::InvalidEntry {
+                    level: table.level,
+                    index,
+                });
+            }
+
+            let large_page = table.level > 1 && entry & PAGE_SIZE_OR_PAT != 0;
+            if table.level == 1 || large_page {
+                let page_size = if table.level == 1 {
+                    PAGE_SIZE
+                } else {
+                    match table.level {
+                        2 if config.page_2m_supported => 1 << 21,
+                        3 if config.page_1g_supported => 1 << 30,
+                        _ => {
+                            return Err(KernelHalfValidationError::InvalidEntry {
+                                level: table.level,
+                                index,
+                            });
+                        }
+                    }
+                };
+                if large_page {
+                    let reserved_alignment_bits = (page_size - 1) & !0x1fff;
+                    if entry & reserved_alignment_bits != 0 {
+                        return Err(KernelHalfValidationError::InvalidEntry {
+                            level: table.level,
+                            index,
+                        });
+                    }
+                }
+                let physical_start = address_field & !(page_size - 1);
+                let physical_end = physical_start.checked_add(page_size).ok_or(
+                    KernelHalfValidationError::InvalidEntry {
+                        level: table.level,
+                        index,
+                    },
+                )?;
+                if !physical_range_fits_address_width(
+                    physical_start,
+                    physical_end,
+                    config.physical_address_bits,
+                ) {
+                    return Err(KernelHalfValidationError::InvalidEntry {
+                        level: table.level,
+                        index,
+                    });
+                }
+                continue;
+            }
+
+            let child_level = table.level - 1;
+            let child_end = address_field.checked_add(PAGE_SIZE).ok_or(
+                KernelHalfValidationError::InvalidEntry {
+                    level: table.level,
+                    index,
+                },
+            )?;
+            if !physical_range_fits_address_width(
+                address_field,
+                child_end,
+                config.physical_address_bits,
+            ) {
+                return Err(KernelHalfValidationError::InvalidEntry {
+                    level: table.level,
+                    index,
+                });
+            }
+            if let Some(existing) = visits[..visit_count]
+                .iter()
+                .find(|visit| visit.physical_address == address_field)
+            {
+                if existing.level != child_level {
+                    return Err(KernelHalfValidationError::TableAliasedAcrossLevels {
+                        physical_address: address_field,
+                        first_level: existing.level,
+                        second_level: child_level,
+                    });
+                }
+                continue;
+            }
+            if visit_count == visits.len() {
+                return Err(KernelHalfValidationError::TableCapacityExceeded);
+            }
+            visits[visit_count] = KernelTableVisit {
+                physical_address: address_field,
+                level: child_level,
+            };
+            visit_count += 1;
+        }
+        visit_index += 1;
+    }
+
+    Ok(visit_count)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagePermissions {
     pub writable: bool,
@@ -1331,6 +1527,7 @@ pub enum MappingError {
     PhysicalRangeOutOfBounds,
     NonCanonicalVirtualRange,
     CrossesCanonicalHole,
+    UserMappingOutsideLowerHalf,
     WritableExecutable,
     UnalignedPageOffset,
     PageOffsetOutOfRange,
@@ -1341,8 +1538,9 @@ pub enum MappingError {
 /// Validate one contiguous range for a future 4 KiB page-mapping operation.
 ///
 /// The physical-address width must be known; passing `None` is rejected rather
-/// than treating an unknown bound as unbounded. Successful validation does not
-/// establish that physical frames are owned by a caller or mapped in the HHDM.
+/// than treating an unknown bound as unbounded. User-accessible mappings must
+/// remain in the lower canonical half. Successful validation does not establish
+/// that physical frames are owned by a caller or mapped in the HHDM.
 pub fn validate_mapping_range(
     virtual_start: u64,
     physical_start: u64,
@@ -1389,6 +1587,11 @@ pub fn validate_mapping_range(
         && ((virtual_start ^ last_virtual_address) & (1u64 << (virtual_address_bits - 1))) != 0
     {
         return Err(MappingError::CrossesCanonicalHole);
+    }
+    if permissions.user_accessible
+        && ((virtual_start | last_virtual_address) & (1u64 << (virtual_address_bits - 1))) != 0
+    {
+        return Err(MappingError::UserMappingOutsideLowerHalf);
     }
 
     Ok(ValidatedMappingRange {
@@ -1723,6 +1926,27 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
             Some(root) => Some(root.frame.address()),
             None => None,
         }
+    }
+
+    /// Validate the upper half of this candidate as supervisor-only kernel mappings.
+    pub fn validate_supervisor_kernel_half(
+        &self,
+    ) -> Result<usize, KernelHalfValidationError<CandidatePageTableReadError<M::Error>>> {
+        let Some(root) = self.tables[0].as_ref() else {
+            return Err(KernelHalfValidationError::InvalidRoot);
+        };
+        let reader = CandidatePageTableReader { candidate: self };
+        validate_supervisor_kernel_half(
+            &reader,
+            Cr3Root {
+                physical_address: root.frame.address(),
+                low_bits: Cr3LowBits::CacheControls {
+                    page_level_write_through: false,
+                    page_level_cache_disable: false,
+                },
+            },
+            self.config,
+        )
     }
 
     /// Walk this hierarchy while restricting table reads to frames it owns.
@@ -2936,15 +3160,16 @@ fn page_table_indexes(virtual_address: u64, levels: u8) -> [u16; 5] {
 mod tests {
     use super::{
         capture_mtrr_registers, encode_cr3_value, inherited_cr3_root_hhdm_address, parse_cr3_root,
-        validate_mapping_range, CachePolicy, CandidateCloneError, CandidateCreateErrorKind,
-        CandidateMapErrorKind, CandidatePageTableMemory, CandidatePageTableReadError,
-        CandidatePageTables, CandidateReleaseError, CandidateUnmapError, Cr3Error, Cr3LowBits,
-        Cr3RootAccessError, EffectiveMemoryType, EffectiveMemoryTypeError, FixedMtrrRanges,
-        MappingError, MtrrError, MtrrLayout, MtrrMemoryType, MtrrRegisterPair, MtrrRegisters,
-        MtrrState, PageLevel, PagePermissions, PageTableEntryError, PageTableReader,
-        PageTranslation, PageWalkConfig, PageWalkError, PageWalkOutcome, PatLayout,
-        ValidatedMappingRange, VariableMtrr, MAX_CANDIDATE_MAPPINGS,
-        MAX_CANDIDATE_PAGE_TABLE_PAGES, MAX_CAPTURED_VARIABLE_MTRRS, PAGE_SIZE,
+        validate_mapping_range, validate_supervisor_kernel_half, CachePolicy, CandidateCloneError,
+        CandidateCreateErrorKind, CandidateMapErrorKind, CandidatePageTableMemory,
+        CandidatePageTableReadError, CandidatePageTables, CandidateReleaseError,
+        CandidateUnmapError, Cr3Error, Cr3LowBits, Cr3RootAccessError, EffectiveMemoryType,
+        EffectiveMemoryTypeError, FixedMtrrRanges, KernelHalfValidationError, MappingError,
+        MtrrError, MtrrLayout, MtrrMemoryType, MtrrRegisterPair, MtrrRegisters, MtrrState,
+        PageLevel, PagePermissions, PageTableEntryError, PageTableReader, PageTranslation,
+        PageWalkConfig, PageWalkError, PageWalkOutcome, PatLayout, ValidatedMappingRange,
+        VariableMtrr, MAX_CANDIDATE_MAPPINGS, MAX_CANDIDATE_PAGE_TABLE_PAGES,
+        MAX_CAPTURED_VARIABLE_MTRRS, PAGE_SIZE,
     };
     use core::cell::Cell;
 
@@ -3788,6 +4013,113 @@ mod tests {
     }
 
     #[test]
+    fn validates_only_supervisor_mappings_in_the_kernel_half() {
+        let root = parse_cr3_root(0x1000, Some(40), false).unwrap();
+        let mut reader = SyntheticReader::new();
+        reader.set(0x1000, 0, 0x7007);
+        reader.set(0x1000, 256, 0x2003);
+        reader.set(0x2000, 0, 0x3003);
+        reader.set(0x3000, 0, 0x4003);
+        reader.set(0x4000, 0, 0x5003);
+
+        assert_eq!(
+            validate_supervisor_kernel_half(&reader, root, four_level_walk_config()),
+            Ok(4)
+        );
+    }
+
+    #[test]
+    fn validates_five_level_kernel_half_subtrees() {
+        let root = parse_cr3_root(0x1000, Some(40), false).unwrap();
+        let config = PageWalkConfig {
+            levels: 5,
+            physical_address_bits: 40,
+            virtual_address_bits: 57,
+            nx_enabled: true,
+            page_2m_supported: true,
+            page_1g_supported: true,
+        };
+        let mut reader = SyntheticReader::new();
+        reader.set(0x1000, 256, 0x2003);
+        reader.set(0x2000, 0, 0x3003);
+        reader.set(0x3000, 0, 0x4003);
+        reader.set(0x4000, 0, 0x5003);
+        reader.set(0x5000, 0, 0x6003);
+
+        assert_eq!(
+            validate_supervisor_kernel_half(&reader, root, config),
+            Ok(5)
+        );
+    }
+
+    #[test]
+    fn rejects_user_entries_at_every_kernel_table_level() {
+        let root = parse_cr3_root(0x1000, Some(40), false).unwrap();
+
+        let mut root_user = SyntheticReader::new();
+        root_user.set(0x1000, 256, 0x2007);
+        assert_eq!(
+            validate_supervisor_kernel_half(&root_user, root, four_level_walk_config()),
+            Err(KernelHalfValidationError::UserAccessibleEntry {
+                level: 4,
+                index: 256,
+            })
+        );
+
+        let mut intermediate_user = SyntheticReader::new();
+        intermediate_user.set(0x1000, 256, 0x2003);
+        intermediate_user.set(0x2000, 0, 0x3007);
+        assert_eq!(
+            validate_supervisor_kernel_half(&intermediate_user, root, four_level_walk_config()),
+            Err(KernelHalfValidationError::UserAccessibleEntry { level: 3, index: 0 })
+        );
+
+        let mut leaf_user = SyntheticReader::new();
+        leaf_user.set(0x1000, 256, 0x2003);
+        leaf_user.set(0x2000, 0, 0x3003);
+        leaf_user.set(0x3000, 0, 0x4003);
+        leaf_user.set(0x4000, 0, 0x5007);
+        assert_eq!(
+            validate_supervisor_kernel_half(&leaf_user, root, four_level_walk_config()),
+            Err(KernelHalfValidationError::UserAccessibleEntry { level: 1, index: 0 })
+        );
+
+        let mut large_leaf_user = SyntheticReader::new();
+        large_leaf_user.set(0x1000, 256, 0x2003);
+        large_leaf_user.set(0x2000, 0x0, 0x4000_0087);
+        assert_eq!(
+            validate_supervisor_kernel_half(&large_leaf_user, root, four_level_walk_config()),
+            Err(KernelHalfValidationError::UserAccessibleEntry { level: 3, index: 0 })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_cross_level_aliased_kernel_tables() {
+        let root = parse_cr3_root(0x1000, Some(40), false).unwrap();
+        let mut invalid_large_root = SyntheticReader::new();
+        invalid_large_root.set(0x1000, 256, 0x2083);
+        assert_eq!(
+            validate_supervisor_kernel_half(&invalid_large_root, root, four_level_walk_config()),
+            Err(KernelHalfValidationError::InvalidEntry {
+                level: 4,
+                index: 256,
+            })
+        );
+
+        let mut aliased_table = SyntheticReader::new();
+        aliased_table.set(0x1000, 256, 0x2003);
+        aliased_table.set(0x2000, 0, 0x2003);
+        assert_eq!(
+            validate_supervisor_kernel_half(&aliased_table, root, four_level_walk_config()),
+            Err(KernelHalfValidationError::TableAliasedAcrossLevels {
+                physical_address: 0x2000,
+                first_level: 3,
+                second_level: 2,
+            })
+        );
+    }
+
+    #[test]
     fn accepts_aligned_ranges_at_canonical_boundaries() {
         let lower = validate_mapping_range(
             0x0000_7fff_ffff_e000,
@@ -3820,6 +4152,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(upper.virtual_end(), 0xffff_8000_0000_1000);
+    }
+
+    #[test]
+    fn user_mappings_are_confined_to_the_lower_canonical_half() {
+        let user_read_only = PagePermissions {
+            writable: false,
+            executable: false,
+            user_accessible: true,
+        };
+
+        for (virtual_address_bits, upper_half_start) in [
+            (48, 0xffff_8000_0000_0000),
+            (57, 0xff00_0000_0000_0000),
+            (64, 0x8000_0000_0000_0000),
+        ] {
+            assert_eq!(
+                validate_mapping_range(
+                    upper_half_start,
+                    0x1000,
+                    PAGE_SIZE,
+                    user_read_only,
+                    Some(40),
+                    virtual_address_bits,
+                ),
+                Err(MappingError::UserMappingOutsideLowerHalf)
+            );
+
+            let lower_half_last_page = (1u64 << (virtual_address_bits - 1)) - PAGE_SIZE;
+            assert!(validate_mapping_range(
+                lower_half_last_page,
+                0x1000,
+                PAGE_SIZE,
+                user_read_only,
+                Some(40),
+                virtual_address_bits,
+            )
+            .is_ok());
+        }
     }
 
     #[test]
@@ -5083,7 +5453,7 @@ mod tests {
             CandidateMapErrorKind::InvalidMapping
         );
         let user = validate_mapping_range(
-            virtual_address,
+            0x4000,
             physical,
             PAGE_SIZE,
             PagePermissions {
@@ -5197,7 +5567,7 @@ mod tests {
         assert_eq!(candidate.root_physical_address(), Some(root));
         let frame = allocator.allocate().unwrap();
         let physical = frame.address();
-        let virtual_address = 0xffff_9000_0000_1000;
+        let virtual_address = 0x0000_4000_0000_1000;
         let permissions = PagePermissions {
             writable: true,
             executable: false,

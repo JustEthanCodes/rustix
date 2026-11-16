@@ -786,6 +786,19 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
         },
         None => None,
     };
+    match candidate.validate_supervisor_kernel_half() {
+        Ok(table_count) => kprintln!(
+            "kernel upper-half preflight passed: {} shared supervisor tables",
+            table_count
+        ),
+        Err(error) => {
+            kprintln!(
+                "page-table transition rejected: unsafe kernel upper half: {:?}",
+                error
+            );
+            release_candidate_after_probe_failure(candidate, &mut boot_info.frame_allocator);
+        }
+    }
     // SAFETY: The candidate is a complete clone of every present inherited
     // hierarchy entry, with all referenced intermediate tables owned and the
     // critical code/data/stack paths compared before this point. The inherited
