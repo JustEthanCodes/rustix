@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "functions_subagent_8-6e6df928ebd6",
+  "agent_id": "ses_e1c392e92ffer6nhs4KCfEddFB",
+  "subagent_type": "general",
+  "task_description": "Audit paging and frame allocator",
+  "token_usage": {
+    "input_tokens": 140867,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 3711872,
+    "output_tokens": 5500,
+    "api_call_count": 51
+  },
+  "started_at": "2026-11-16T09:53:40.175Z",
+  "completed_at": "2026-11-16T09:59:57.483108834Z"
+}

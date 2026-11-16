@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "functions_subagent_13-8d8bc7075b2c",
+  "agent_id": "ses_e1c387d30ffeuHaOjAHRYuodmR",
+  "subagent_type": "general",
+  "task_description": "Audit main kernel entry",
+  "token_usage": {
+    "input_tokens": 104034,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 2287488,
+    "output_tokens": 4746,
+    "api_call_count": 31
+  },
+  "started_at": "2026-11-16T09:54:25.612Z",
+  "completed_at": "2026-11-16T09:58:57.834869179Z"
+}

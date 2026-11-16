@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "functions_subagent_7-f56b4c400145",
+  "agent_id": "ses_e1c392e9affescruwEbMtSvrsW",
+  "subagent_type": "general",
+  "task_description": "Audit boot and memory validation",
+  "token_usage": {
+    "input_tokens": 76833,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 251264,
+    "output_tokens": 3503,
+    "api_call_count": 7
+  },
+  "started_at": "2026-11-16T09:53:40.172Z",
+  "completed_at": "2026-11-16T09:57:53.421341313Z"
+}

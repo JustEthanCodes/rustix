@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "functions_subagent_9-b18a969fe261",
+  "agent_id": "ses_e1c38fad5ffevj1X7YBJD4z97x",
+  "subagent_type": "general",
+  "task_description": "Audit concurrency and interrupts",
+  "token_usage": {
+    "input_tokens": 127854,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 3017472,
+    "output_tokens": 4592,
+    "api_call_count": 35
+  },
+  "started_at": "2026-11-16T09:53:53.447Z",
+  "completed_at": "2026-11-16T10:05:27.216265176Z"
+}

@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "functions_subagent_11-607f826c0eb5",
+  "agent_id": "ses_e1c38cd04ffe05ccE1ghxCK3L1",
+  "subagent_type": "general",
+  "task_description": "Audit shell VFS and parser",
+  "token_usage": {
+    "input_tokens": 30863,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 257920,
+    "output_tokens": 3991,
+    "api_call_count": 9
+  },
+  "started_at": "2026-11-16T09:54:05.17Z",
+  "completed_at": "2026-11-16T09:58:13.063933427Z"
+}

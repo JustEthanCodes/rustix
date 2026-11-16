@@ -1,0 +1,15 @@
+{
+  "tool_use_id": "functions_subagent_10-9effe7f69650",
+  "agent_id": "ses_e1c38cd0affeUFqHtLy2wWyDAo",
+  "subagent_type": "general",
+  "task_description": "Audit device drivers and ACPI",
+  "token_usage": {
+    "input_tokens": 89509,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 1433216,
+    "output_tokens": 4366,
+    "api_call_count": 22
+  },
+  "started_at": "2026-11-16T09:54:05.169Z",
+  "completed_at": "2026-11-16T09:58:59.785932898Z"
+}
