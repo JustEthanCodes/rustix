@@ -157,6 +157,9 @@ fn two_paths(rest: &str) -> Result<(&str, &str), ParseError> {
     Ok((source, destination))
 }
 
+/// Split a `PATH TEXT` command line. Text in quotes is taken verbatim between
+/// the first and last bytes (an odd interior quote is not special); escapes are
+/// not supported by design. Text not starting with a quote is taken verbatim.
 fn path_and_text(rest: &str) -> Result<(&str, &str), ParseError> {
     let (path, text) = take_word(rest).ok_or(ParseError::MissingArgument)?;
     if text.is_empty() {

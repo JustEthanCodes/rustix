@@ -481,6 +481,44 @@ impl ValidatedAcpiSpan {
     }
 }
 
+/// Errors from validating a physical page span for MMIO mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmioSpanError {
+    Misaligned,
+    AddressOverflow,
+    PhysicalRangeOutOfBounds,
+    /// The page overlaps a known memory-map region not permitted for MMIO.
+    OverlapsNonMmioMemory,
+}
+
+/// A physical page authorized for MMIO mapping: 4 KiB aligned, fits the known
+/// physical-address width, and does not intersect a known memory-map region
+/// other than `Reserved` or `Unknown`. Unreported ranges are also permitted.
+///
+/// This does not prove the page is a device register (firmware could omit a
+/// RAM range from the map); callers must only use it with addresses from
+/// validated platform data (MADT, CPUID).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedMmioSpan {
+    mapping_start: u64,
+    mapping_end: u64,
+}
+
+impl ValidatedMmioSpan {
+    pub const fn mapping_start(self) -> u64 {
+        self.mapping_start
+    }
+
+    pub const fn mapping_end(self) -> u64 {
+        self.mapping_end
+    }
+
+    /// Whether one aligned 4 KiB physical page equals this validated span.
+    pub fn contains_mapping_page(self, physical_page: u64) -> bool {
+        physical_page == self.mapping_start
+    }
+}
+
 /// Validated, allocation-free snapshot of the physical memory map.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MemoryMap {
@@ -514,6 +552,43 @@ impl MemoryMap {
                 .regions()
                 .iter()
                 .any(|region| region.start <= start && end <= region.end && region.kind == kind)
+    }
+
+    /// Validate one aligned 4 KiB physical page as an MMIO page. The page must
+    /// fit the known physical-address width and must not intersect any known
+    /// memory-map region except `Reserved` or `Unknown`. Device registers are
+    /// expected to lie in reserved, unknown, or unreported address space.
+    pub fn validate_mmio_page(
+        &self,
+        physical_address: u64,
+        physical_address_bits: Option<u8>,
+    ) -> Result<ValidatedMmioSpan, MmioSpanError> {
+        const PAGE_SIZE: u64 = 4096;
+
+        if physical_address & (PAGE_SIZE - 1) != 0 {
+            return Err(MmioSpanError::Misaligned);
+        }
+        let mapping_end = physical_address
+            .checked_add(PAGE_SIZE)
+            .ok_or(MmioSpanError::AddressOverflow)?;
+        if physical_address_bits.is_some_and(|bits| {
+            !physical_range_fits_address_width(physical_address, mapping_end, bits)
+        }) {
+            return Err(MmioSpanError::PhysicalRangeOutOfBounds);
+        }
+        for region in self.regions() {
+            if region.start < mapping_end
+                && physical_address < region.end
+                && !matches!(region.kind, RegionKind::Reserved | RegionKind::Unknown(_))
+            {
+                return Err(MmioSpanError::OverlapsNonMmioMemory);
+            }
+        }
+
+        Ok(ValidatedMmioSpan {
+            mapping_start: physical_address,
+            mapping_end,
+        })
     }
 
     /// Check that a non-empty physical span is covered only by ACPI reclaimable
@@ -857,7 +932,7 @@ mod tests {
         kernel_image_segments, limine_v3_hhdm_range_is_valid, limine_x86_64_stack_bounds,
         physical_range_fits_address_width, HhdmAddressError, KernelImageSegment,
         KernelImageSegments, KernelImageVirtualSegments, MemoryMap, MemoryMapBuilder,
-        MemoryMapError, RawMemoryRegion, RegionKind, LIMINE_X86_64_MIN_STACK_SIZE,
+        MemoryMapError, MmioSpanError, RawMemoryRegion, RegionKind, LIMINE_X86_64_MIN_STACK_SIZE,
         MAX_MEMORY_REGIONS, MEMORY_MAP_USABLE,
     };
 
@@ -1411,6 +1486,91 @@ mod tests {
         assert_eq!(
             map.validate_rsdp_span(0xf5290, 20, Some(19)),
             Err(super::AcpiSpanError::PhysicalRangeOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn mmio_page_validation_rejects_ram_and_accepts_device_space() {
+        let map = MemoryMap::from_raw(&[
+            RawMemoryRegion {
+                base: 0x10_0000,
+                length: 0x1000,
+                kind: 0, // Usable
+            },
+            RawMemoryRegion {
+                base: 0x20_0000,
+                length: 0x1000,
+                kind: 6, // ExecutableAndModules
+            },
+            RawMemoryRegion {
+                base: 0x30_0000,
+                length: 0x1000,
+                kind: 5, // BootloaderReclaimable
+            },
+            RawMemoryRegion {
+                base: 0x40_0000,
+                length: 0x1000,
+                kind: 2, // AcpiReclaimable
+            },
+            RawMemoryRegion {
+                base: 0x50_0000,
+                length: 0x1000,
+                kind: 3, // AcpiNvs
+            },
+            RawMemoryRegion {
+                base: 0x60_0000,
+                length: 0x1000,
+                kind: 7, // Framebuffer
+            },
+            RawMemoryRegion {
+                base: 0x70_0000,
+                length: 0x1000,
+                kind: 4, // BadMemory
+            },
+            RawMemoryRegion {
+                base: 0x80_0000,
+                length: 0x1000,
+                kind: 42, // Unknown
+            },
+            RawMemoryRegion {
+                base: 0xfee0_0000,
+                length: 0x1000,
+                kind: 1, // Reserved (device space)
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            map.validate_mmio_page(0x10_0000, Some(52)),
+            Err(MmioSpanError::OverlapsNonMmioMemory)
+        );
+        assert_eq!(
+            map.validate_mmio_page(0x20_0000, Some(52)),
+            Err(MmioSpanError::OverlapsNonMmioMemory)
+        );
+        assert_eq!(
+            map.validate_mmio_page(0x30_0000, Some(52)),
+            Err(MmioSpanError::OverlapsNonMmioMemory)
+        );
+        for address in [0x40_0000, 0x50_0000, 0x60_0000, 0x70_0000] {
+            assert_eq!(
+                map.validate_mmio_page(address, Some(52)),
+                Err(MmioSpanError::OverlapsNonMmioMemory),
+                "known non-MMIO region at {address:#x} must not be authorized"
+            );
+        }
+        assert!(map.validate_mmio_page(0x80_0000, Some(52)).is_ok());
+        assert!(map.validate_mmio_page(0xfee0_0000, Some(52)).is_ok());
+        // A page beyond every reported region (device space) is acceptable.
+        assert!(map.validate_mmio_page(0x1000_0000_0000, Some(52)).is_ok());
+        // Misaligned pages and pages beyond the physical width are rejected.
+        assert_eq!(
+            map.validate_mmio_page(0xfee0_0001, Some(52)),
+            Err(MmioSpanError::Misaligned)
+        );
+        assert_eq!(
+            map.validate_mmio_page(0xfee0_0000, Some(12)),
+            Err(MmioSpanError::PhysicalRangeOutOfBounds)
         );
     }
 

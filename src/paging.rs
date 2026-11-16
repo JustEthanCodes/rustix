@@ -8,7 +8,7 @@
 use crate::frame::{Frame, FrameAllocator, FrameError};
 use crate::memory::{
     is_canonical_virtual_address, physical_range_fits_address_width, HhdmAddressError, MemoryMap,
-    RegionKind, ValidatedAcpiSpan,
+    RegionKind, ValidatedAcpiSpan, ValidatedMmioSpan,
 };
 
 /// Base page size supported by the initial Rustix mapping policy.
@@ -2130,18 +2130,21 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
     /// The page is supervisor, writable, NX, and must use UC effective memory type.
     ///
     /// # Safety
-    /// `mapping.physical_start` must be an assigned device-register page, not
-    /// ordinary RAM or an unverified physical address. The caller must derive it
-    /// from validated platform/device data and keep the cache policy consistent
-    /// with every alias. The candidate must remain inactive until the mapping is
+    /// `span` must have been validated against the physical memory map (see
+    /// `MemoryMap::validate_mmio_page`) for the exact physical page in
+    /// `mapping`; the caller must derive the address from validated
+    /// platform/device data and keep the cache policy consistent with every
+    /// alias. The candidate must remain inactive until the mapping is
     /// installed; this method never makes an active mapping or invalidates TLBs.
     pub unsafe fn map_mmio_page(
         &mut self,
         allocator: &mut FrameAllocator,
+        span: ValidatedMmioSpan,
         mapping: ValidatedMappingRange,
         cache_attributes: SelectedCacheAttributes,
     ) -> Result<(), CandidateBorrowedMapFailure<M::Error>> {
         if mapping.length() != PAGE_SIZE
+            || !span.contains_mapping_page(mapping.physical_start)
             || mapping.physical_start & (PAGE_SIZE - 1) != 0
             || mapping.physical_start.checked_add(PAGE_SIZE) != Some(mapping.physical_end)
             || mapping.physical_address_bits != self.config.physical_address_bits
@@ -4943,6 +4946,15 @@ mod tests {
                 .unwrap();
         let mmio_physical = 0xfee0_0000;
         let virtual_address = 0xffff_d000_0000_0000;
+        let mmio_map = MemoryMap::from_raw(&[RawMemoryRegion {
+            base: 0x10_0000,
+            length: PAGE_SIZE * total_frames as u64,
+            kind: 0,
+        }])
+        .unwrap();
+        let mmio_span = mmio_map
+            .validate_mmio_page(mmio_physical, Some(40))
+            .unwrap();
         let permissions = PagePermissions {
             writable: true,
             executable: false,
@@ -4965,10 +4977,11 @@ mod tests {
         };
         let before = allocator.free_frames();
         // SAFETY: The synthetic test treats this as a device page and never
-        // dereferences it; the API's range, permissions, and UC requirements apply.
+        // dereferences it; the API's map authorization, range, permissions, and
+        // UC requirements apply.
         unsafe {
             candidate
-                .map_mmio_page(&mut allocator, mapping, attributes)
+                .map_mmio_page(&mut allocator, mmio_span, mapping, attributes)
                 .unwrap()
         };
         assert_eq!(candidate.mapping_count(), 1);

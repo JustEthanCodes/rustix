@@ -119,7 +119,9 @@ fn read_line(
                 serial::print(format_args!("{}", byte as char));
             }
             0x20..=0x7e => serial::print(format_args!("\x07")),
-            _ => {}
+            // Audibly reject bytes outside the printable range instead of
+            // silently dropping them from the line.
+            _ => serial::print(format_args!("\x07")),
         }
     }
 }
@@ -145,6 +147,10 @@ fn execute(
             }
         }
         Command::Meminfo => {
+            if frame_allocator.is_null() {
+                crate::kprintln!("physical frames: frame allocator is unavailable");
+                return;
+            }
             // SAFETY: The sole shell thread reads frame counts on the bootstrap
             // CPU; the allocator is never mutated from an IRQ or another thread.
             let allocator = unsafe { &*frame_allocator };
@@ -271,7 +277,16 @@ fn print_file_contents(text: &str) {
         if index != 0 {
             serial::print(format_args!("\r\n"));
         }
-        serial::print(format_args!("{}", line.strip_suffix('\r').unwrap_or(line)));
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        // Never emit raw terminal control bytes from file contents; map them to
+        // a printable placeholder so a file cannot inject escape sequences.
+        for character in line.chars() {
+            if character.is_control() && character != '\t' {
+                serial::print(format_args!("."));
+            } else {
+                serial::print(format_args!("{}", character));
+            }
+        }
     }
     if !text.ends_with('\n') {
         crate::kprintln!();
@@ -300,8 +315,8 @@ fn print_help() {
     crate::kprintln!("  touch PATH            create an empty file");
     crate::kprintln!("  write PATH TEXT       replace a file's contents");
     crate::kprintln!("  append PATH TEXT      append text to a file");
-    crate::kprintln!("  cp SOURCE DEST        copy a file, replacing DEST if it exists");
-    crate::kprintln!("  mv SOURCE DEST        move/rename; refuse existing DEST");
+    crate::kprintln!("  cp SOURCE DEST        copy a file; if DEST is a directory, copy inside it");
+    crate::kprintln!("  mv SOURCE DEST        move/rename; if DEST is a directory, move inside it");
     crate::kprintln!("  cat PATH              print a text file");
     crate::kprintln!("  rm PATH               remove a file");
     crate::kprintln!("  rmdir PATH            remove an empty directory");

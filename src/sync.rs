@@ -10,7 +10,38 @@ use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// Number of exception/IRQ entry frames currently active on this CPU.
+///
+/// Exception and device-IRQ entry paths increment this on entry and decrement
+/// it via [`InterruptContextGuard`] on the paths that return. The allocator
+/// reads it to refuse (in debug builds) allocations from interrupt context,
+/// where taking the heap lock could deadlock the CPU with interrupts masked.
+/// Not SMP-safe; single-vCPU bootstrap only.
+#[doc(hidden)]
+pub static INTERRUPT_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Records one active exception/IRQ entry frame for the lifetime of the guard.
+///
+/// Fatal paths that never return simply leak their increment, which is the
+/// intended semantics: the machine is stopping. Not `Send`.
+#[doc(hidden)]
+pub struct InterruptContextGuard;
+
+impl InterruptContextGuard {
+    /// Mark the current exception/IRQ entry frame as active.
+    pub fn enter() -> Self {
+        INTERRUPT_DEPTH.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for InterruptContextGuard {
+    fn drop(&mut self) {
+        INTERRUPT_DEPTH.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// A spin lock that masks local interrupts for the full guard lifetime.
 pub struct IrqSpinLock<T> {

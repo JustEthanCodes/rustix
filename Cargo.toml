@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "rustix-kernel"
-version = "0.1.0-milestone3-sr2"
+version = "0.1.0-milestone3-sr3"
 edition = "2021"
 publish = false
 license = "Apache-2.0"
@@ -17,6 +17,9 @@ inject-invalid-opcode = []
 probe-hhdm-frame = []
 probe-active-mapping = []
 probe-kernel-threads = []
+# Include full CPU register dumps in the fatal exception path. Off by default:
+# the serial console is plaintext and unprivileged.
+fatal-register-dump = []
 
 [dependencies]
 crabshell = { path = "crates/crabshell" }
@@ -38,3 +41,6 @@ panic = "abort"
 lto = true
 codegen-units = 1
 strip = false
+# Wrapping on overflow silently corrupts address arithmetic in the freestanding
+# kernel; fail loudly (panic) instead, matching the audit hardening.
+overflow-checks = true

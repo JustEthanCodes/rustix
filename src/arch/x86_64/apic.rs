@@ -50,6 +50,7 @@ static TIMER_CONFIGURED: AtomicBool = AtomicBool::new(false);
 static LOCAL_APIC_VIRTUAL: AtomicU64 = AtomicU64::new(0);
 static IO_APIC_VIRTUAL: AtomicU64 = AtomicU64::new(0);
 static TIMER_LOW_REGISTER: AtomicU8 = AtomicU8::new(0);
+static TIMER_VECTOR: AtomicU8 = AtomicU8::new(0);
 static TIMER_ROUTE_ATTRIBUTES: AtomicU8 = AtomicU8::new(0);
 static BOOTSTRAP_APIC_ID: AtomicU8 = AtomicU8::new(0);
 static IO_APIC_GSI_BASE: AtomicU32 = AtomicU32::new(0);
@@ -108,6 +109,7 @@ pub unsafe fn initialize(
     }
 
     TIMER_CONFIGURED.store(false, Ordering::Relaxed);
+    TIMER_VECTOR.store(0, Ordering::Relaxed);
     IO_APIC_GSI_BASE.store(0, Ordering::Relaxed);
     IO_APIC_MAX_REDIRECTION.store(0, Ordering::Relaxed);
     for route in &ISA_ROUTE_LOW_REGISTERS {
@@ -180,7 +182,11 @@ pub unsafe fn initialize(
     {
         return Err(ApicError::InvalidIoApicVersion);
     }
-    unsafe { mask_all_io_apic_entries(io_apic_virtual, max_redirection_index)? };
+    // Mask every architecturally possible redirection entry, not just the
+    // hardware-reported count; a misreported MRE field must not leave a
+    // firmware-programmed route live. The entry count is bounded and harmless
+    // to touch on any conforming I/O APIC.
+    unsafe { mask_all_io_apic_entries(io_apic_virtual)? };
 
     let io_id = unsafe { io_apic_read(io_apic_virtual, IO_APIC_ID) };
     if ((io_id >> 24) & 0x0f) as u8 != io_apic.apic_id {
@@ -249,7 +255,11 @@ pub unsafe fn configure_isa_irq(madt: &Madt, isa_irq: u8, vector: u8) -> Result<
     if isa_irq >= 16 {
         return Err(ApicError::InvalidIsaIrq);
     }
-    if vector < 32 || vector == APIC_SPURIOUS_VECTOR {
+    // Device vectors live in 0x20..=0xef (see rustix_kernel::irq); vectors
+    // 0xf0-0xfe have no usable gate, and 0xff is the APIC spurious vector.
+    if !(rustix_kernel::irq::FIRST_DEVICE_VECTOR..=rustix_kernel::irq::LAST_DEVICE_VECTOR)
+        .contains(&vector)
+    {
         return Err(ApicError::InvalidVector);
     }
 
@@ -295,7 +305,11 @@ pub unsafe fn unmask_isa_irq(isa_irq: u8, vector: u8) -> Result<(), ApicError> {
     if isa_irq >= 16 {
         return Err(ApicError::InvalidIsaIrq);
     }
-    if vector < 32 || vector == APIC_SPURIOUS_VECTOR {
+    // Device vectors live in 0x20..=0xef (see rustix_kernel::irq); vectors
+    // 0xf0-0xfe have no usable gate, and 0xff is the APIC spurious vector.
+    if !(rustix_kernel::irq::FIRST_DEVICE_VECTOR..=rustix_kernel::irq::LAST_DEVICE_VECTOR)
+        .contains(&vector)
+    {
         return Err(ApicError::InvalidVector);
     }
     let low_register = ISA_ROUTE_LOW_REGISTERS[usize::from(isa_irq)].load(Ordering::Acquire);
@@ -328,7 +342,11 @@ pub unsafe fn configure_pit_timer(vector: u8, divisor: u16) -> Result<(), ApicEr
     if !INITIALIZED.load(Ordering::Acquire) {
         return Err(ApicError::NotInitialized);
     }
-    if vector < 32 || vector == APIC_SPURIOUS_VECTOR {
+    // Device vectors live in 0x20..=0xef (see rustix_kernel::irq); vectors
+    // 0xf0-0xfe have no usable gate, and 0xff is the APIC spurious vector.
+    if !(rustix_kernel::irq::FIRST_DEVICE_VECTOR..=rustix_kernel::irq::LAST_DEVICE_VECTOR)
+        .contains(&vector)
+    {
         return Err(ApicError::InvalidVector);
     }
 
@@ -361,6 +379,7 @@ pub unsafe fn configure_pit_timer(vector: u8, divisor: u16) -> Result<(), ApicEr
         io::write_u8(PIT_CHANNEL_0, (divisor >> 8) as u8);
     }
 
+    TIMER_VECTOR.store(vector, Ordering::Relaxed);
     TIMER_CONFIGURED.store(true, Ordering::Release);
     Ok(())
 }
@@ -384,7 +403,13 @@ pub unsafe fn unmask_pit_timer() -> Result<(), ApicError> {
 
     let io_apic_virtual = IO_APIC_VIRTUAL.load(Ordering::Relaxed);
     let low_register = TIMER_LOW_REGISTER.load(Ordering::Relaxed);
+    let expected_vector = TIMER_VECTOR.load(Ordering::Relaxed);
     let entry = unsafe { io_apic_read(io_apic_virtual, low_register) };
+    // Verify the entry still carries the vector we programmed and is masked,
+    // mirroring `unmask_isa_irq`; firmware could have reprogrammed it since.
+    if expected_vector == 0 || entry as u8 != expected_vector || entry & IO_APIC_REDIR_MASKED == 0 {
+        return Err(ApicError::TimerNotConfigured);
+    }
     unsafe { io_apic_write(io_apic_virtual, low_register, entry & !IO_APIC_REDIR_MASKED) };
     Ok(())
 }
@@ -407,6 +432,7 @@ pub unsafe fn mask_pit_timer() -> Result<(), ApicError> {
     let low_register = TIMER_LOW_REGISTER.load(Ordering::Relaxed);
     let entry = unsafe { io_apic_read(io_apic_virtual, low_register) };
     unsafe { io_apic_write(io_apic_virtual, low_register, entry | IO_APIC_REDIR_MASKED) };
+    TIMER_VECTOR.store(0, Ordering::Relaxed);
     TIMER_CONFIGURED.store(false, Ordering::Release);
     Ok(())
 }
@@ -500,11 +526,19 @@ unsafe fn io_apic_write(base: u64, register: u8, value: u32) {
     }
 }
 
-unsafe fn mask_all_io_apic_entries(base: u64, max_redirection_index: u8) -> Result<(), ApicError> {
-    let mut pin = 0;
-    while pin <= max_redirection_index {
-        let (low, _) = redirection_registers(pin, max_redirection_index)
+unsafe fn mask_all_io_apic_entries(base: u64) -> Result<(), ApicError> {
+    // Mask every architecturally possible redirection entry, not just the
+    // hardware-reported count. Only the low register carries the mask bit and
+    // is addressable for all 120 possible entries (0x10 + 2 * 119 = 0xfe), so
+    // no high-register edge is needed.
+    let mut pin = 0u8;
+    while pin < IO_APIC_MAX_REDIRECTIONS {
+        let low = IO_APIC_REDIR_BASE
+            .checked_add(pin.checked_mul(2).ok_or(ApicError::InvalidIoApicVersion)?)
             .ok_or(ApicError::InvalidIoApicVersion)?;
+        if low > IO_APIC_REDIR_MAX {
+            return Err(ApicError::InvalidIoApicVersion);
+        }
         let current = unsafe { io_apic_read(base, low) };
         unsafe { io_apic_write(base, low, current | IO_APIC_REDIR_MASKED) };
         pin += 1;

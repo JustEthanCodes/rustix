@@ -6,15 +6,23 @@
 
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use rustix_kernel::sync::InterruptContextGuard;
 
 const EXCEPTION_COUNT: usize = 32;
 const IRQ_FIRST_VECTOR: usize = 0x20;
 const IRQ_LAST_VECTOR: usize = 0xef;
 const IRQ_VECTOR_COUNT: usize = IRQ_LAST_VECTOR - IRQ_FIRST_VECTOR + 1;
 const APIC_SPURIOUS_VECTOR: usize = 0xff;
-const IRQ_STUB_COUNT: usize = IRQ_VECTOR_COUNT + 1;
-const _: [(); 208] = [(); IRQ_VECTOR_COUNT];
+/// Vectors 0xf0-0xfe have no registered source or IDT-worthy meaning today.
+/// They are wired to a controlled fatal stop instead of left non-present.
+const IRQ_UNWIRED_FIRST_VECTOR: usize = 0xf0;
+const IRQ_UNWIRED_LAST_VECTOR: usize = 0xfe;
+const IRQ_UNWIRED_COUNT: usize = IRQ_UNWIRED_LAST_VECTOR - IRQ_UNWIRED_FIRST_VECTOR + 1;
+const IRQ_STUB_COUNT: usize = IRQ_VECTOR_COUNT + IRQ_UNWIRED_COUNT + 1;
 const KERNEL_CODE_SELECTOR: u16 = 0x08;
+const _: [(); 208] = [(); IRQ_VECTOR_COUNT];
 const STACK_SIZE: usize = 16 * 1024;
 const TSS_DESCRIPTOR_TYPE: u64 = 0x89;
 
@@ -111,6 +119,9 @@ static mut TSS: TaskStateSegment = TaskStateSegment::EMPTY;
 static mut RING0_STACK: Stack = Stack([0; STACK_SIZE]);
 static mut DOUBLE_FAULT_STACK: Stack = Stack([0; STACK_SIZE]);
 static mut IRQ_HANDLERS: [Option<IrqHandler>; 256] = [None; 256];
+/// Whether a fatal exception diagnostic is in progress. A fault from inside
+/// the fatal path stops silently instead of recursively printing.
+static IN_FATAL_EXCEPTION: AtomicBool = AtomicBool::new(false);
 
 /// A device interrupt callback. The callback is responsible for issuing EOI.
 pub type IrqHandler = extern "C" fn();
@@ -126,6 +137,9 @@ pub enum IrqRegistrationError {
 
 // In 64-bit mode, exception entry saves SS:RSP even for a CPL 0 fault.
 #[repr(C)]
+// Register dumps are only compiled with the `fatal-register-dump` feature;
+// the vector/error/RIP fields are always needed for the fatal diagnostic.
+#[cfg_attr(not(feature = "fatal-register-dump"), allow(dead_code))]
 pub(crate) struct ExceptionContext {
     r15: u64,
     r14: u64,
@@ -255,12 +269,28 @@ unsafe fn initialize_idt() {
         }
     }
     // SAFETY: The final table entry is the dedicated 0xff spurious-IRQ stub.
-    let spurious_handler = unsafe { irq_stubs.add(IRQ_VECTOR_COUNT).read() } as u64;
+    let spurious_handler =
+        unsafe { irq_stubs.add(IRQ_VECTOR_COUNT + IRQ_UNWIRED_COUNT).read() } as u64;
     // SAFETY: The APIC spurious vector is a valid IDT index.
     unsafe {
         idt_entries
             .add(APIC_SPURIOUS_VECTOR)
             .write(IdtEntry::interrupt_gate(spurious_handler, 0));
+    }
+    // Vectors 0xf0-0xfe have no registered source; wire them to a controlled
+    // fatal stop (through the shared dispatch, which halts) instead of leaving
+    // non-present gates that would cascade into #GP with no diagnostics.
+    for vector in IRQ_UNWIRED_FIRST_VECTOR..=IRQ_UNWIRED_LAST_VECTOR {
+        // SAFETY: The assembly table provides one stub for each vector.
+        let handler =
+            unsafe { irq_stubs.add(IRQ_VECTOR_COUNT + (vector - IRQ_UNWIRED_FIRST_VECTOR)) }.read()
+                as u64;
+        // SAFETY: `vector` is bounded by the statically allocated 256-entry IDT.
+        unsafe {
+            idt_entries
+                .add(vector)
+                .write(IdtEntry::interrupt_gate(handler, 0));
+        }
     }
 
     let idtr = DescriptorTablePointer {
@@ -318,6 +348,9 @@ pub unsafe fn register_irq_handler(
 /// Device IRQ target called by the normalized assembly stubs.
 #[no_mangle]
 pub extern "C" fn rustix_irq_dispatch(vector: u64) {
+    // SAFETY: guard records this entry frame for the heap's debug checks; it
+    // decrements automatically on every return path.
+    let _depth = InterruptContextGuard::enter();
     if vector == APIC_SPURIOUS_VECTOR as u64 {
         return;
     }
@@ -350,6 +383,17 @@ fn fatal_irq_halt() -> ! {
 /// Fatal exception target called by the assembly stubs.
 #[no_mangle]
 pub extern "C" fn rustix_exception_dispatch(context: *const ExceptionContext) -> ! {
+    // SAFETY: guard records this entry frame; this path never returns and the
+    // frame is already doomed, so the increment is intentionally retained.
+    let _depth = InterruptContextGuard::enter();
+    // A fault raised while this handler is running (including a #DF on the
+    // IST stack) must not re-enter the printing path; stop silently instead.
+    if IN_FATAL_EXCEPTION.swap(true, Ordering::Acquire) {
+        loop {
+            // SAFETY: Re-entrant fatal diagnostics are deliberately silent.
+            unsafe { asm!("cli; hlt", options(nomem, nostack)) };
+        }
+    }
     // SAFETY: The common assembly stub passes a pointer to its normalized stack
     // frame, which remains live for the duration of this non-returning handler.
     let context = unsafe { &*context };
@@ -360,6 +404,7 @@ pub extern "C" fn rustix_exception_dispatch(context: *const ExceptionContext) ->
         context.error_code,
         context.rip
     );
+    #[cfg(feature = "fatal-register-dump")]
     crate::kprintln!(
         "CS={:#06x} SS={:#06x} RFLAGS={:#018x} RSP={:#018x}",
         context.cs,
@@ -367,12 +412,14 @@ pub extern "C" fn rustix_exception_dispatch(context: *const ExceptionContext) ->
         context.rflags,
         context.rsp
     );
+    #[cfg(feature = "fatal-register-dump")]
     crate::kprintln!(
         "RAX={:#018x} RBX={:#018x} RCX={:#018x}",
         context.rax,
         context.rbx,
         context.rcx
     );
+    #[cfg(feature = "fatal-register-dump")]
     crate::kprintln!(
         "RDX={:#018x} RSI={:#018x} RDI={:#018x} RBP={:#018x}",
         context.rdx,
@@ -380,6 +427,7 @@ pub extern "C" fn rustix_exception_dispatch(context: *const ExceptionContext) ->
         context.rdi,
         context.rbp
     );
+    #[cfg(feature = "fatal-register-dump")]
     crate::kprintln!(
         "R8={:#018x} R9={:#018x} R10={:#018x} R11={:#018x}",
         context.r8,
@@ -387,6 +435,7 @@ pub extern "C" fn rustix_exception_dispatch(context: *const ExceptionContext) ->
         context.r10,
         context.r11
     );
+    #[cfg(feature = "fatal-register-dump")]
     crate::kprintln!(
         "R12={:#018x} R13={:#018x} R14={:#018x} R15={:#018x}",
         context.r12,
@@ -576,6 +625,11 @@ rustix_irq_stub_start:
     RUSTIX_IRQ_STUB irq_vector
     .set irq_vector, irq_vector + 1
     .endr
+    .set unwired_vector, 0xf0
+    .rept 15
+    RUSTIX_IRQ_STUB unwired_vector
+    .set unwired_vector, unwired_vector + 1
+    .endr
     .global rustix_irq_spurious_stub
 rustix_irq_spurious_stub:
     RUSTIX_IRQ_STUB 0xff
@@ -599,6 +653,9 @@ rustix_irq_spurious_stub:
     push r15
     # Preserve asynchronous x87/SSE state before Rust IRQ dispatch can use it.
     mov rax, qword ptr [rip + rustix_active_fpu_state_pointer]
+    # A null pointer here means IRQ/FPU initialization order was broken; stop.
+    test rax, rax
+    jz rustix_irq_fatal_no_fx_state
     fxsave64 [rax]
     mov edi, dword ptr [rsp + 120]
     mov rbx, rsp
@@ -606,6 +663,8 @@ rustix_irq_spurious_stub:
     call rustix_irq_dispatch
     # A timer switch updates the active state pointer before selecting a context.
     mov rax, qword ptr [rip + rustix_active_fpu_state_pointer]
+    test rax, rax
+    jz rustix_irq_fatal_no_fx_state
     fxrstor64 [rax]
     mov rsp, rbx
     pop r15
@@ -626,6 +685,13 @@ rustix_irq_spurious_stub:
     add rsp, 16
     iretq
 
+    .global rustix_irq_fatal_no_fx_state
+    .type rustix_irq_fatal_no_fx_state, @function
+rustix_irq_fatal_no_fx_state:
+    cli
+    hlt
+    jmp rustix_irq_fatal_no_fx_state
+
     .section .rodata
     .align 8
     .global irq_stub_table
@@ -634,6 +700,11 @@ irq_stub_table:
     .rept 208
     .quad rustix_irq_stub_start + ((irq_vector - 0x20) * 12)
     .set irq_vector, irq_vector + 1
+    .endr
+    .set unwired_vector, 0xf0
+    .rept 15
+    .quad rustix_irq_stub_start + ((208 + unwired_vector - 0xf0) * 12)
+    .set unwired_vector, unwired_vector + 1
     .endr
     .quad rustix_irq_spurious_stub
 

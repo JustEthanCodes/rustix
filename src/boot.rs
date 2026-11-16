@@ -207,6 +207,7 @@ pub struct BootInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootInfoError {
     UnsupportedBaseRevision { reported: u64, required: u64 },
+    MissingPhysicalAddressBits,
     MissingHhdmResponse,
     InvalidHhdmResponsePointer,
     InvalidHhdmOffset,
@@ -255,6 +256,12 @@ pub fn capture_boot_information(entry_rsp: u64) -> Result<BootInfo, BootInfoErro
     }
 
     let cpu_info = crate::arch::x86_64::cpu::identify();
+    // Boot-time physical-address-width validation fail-closes: without it,
+    // every width-checked physical access in the capture path would silently
+    // go unvalidated.
+    if cpu_info.physical_address_bits.is_none() {
+        return Err(BootInfoError::MissingPhysicalAddressBits);
+    }
     let inherited_cr3_raw = crate::arch::x86_64::cpu::read_cr3_raw();
     let inherited_cr3_root = parse_cr3_root(
         inherited_cr3_raw,
@@ -293,6 +300,11 @@ pub fn capture_boot_information(entry_rsp: u64) -> Result<BootInfo, BootInfoErro
     let hhdm = unsafe { hhdm_pointer.read_volatile() };
     if hhdm.offset & 0xfff != 0 || !is_canonical_virtual_address(hhdm.offset, virtual_address_bits)
     {
+        return Err(BootInfoError::InvalidHhdmOffset);
+    }
+    // A zero HHDM offset would alias the entire physical address space onto the
+    // low canonical half, colliding with the kernel's uncontrolled low mappings.
+    if hhdm.offset == 0 {
         return Err(BootInfoError::InvalidHhdmOffset);
     }
 
@@ -426,6 +438,17 @@ pub fn capture_boot_information(entry_rsp: u64) -> Result<BootInfo, BootInfoErro
             return Err(BootInfoError::InvalidHhdmMappingRange { index });
         }
     }
+    // The HHDM window must not cover the linked kernel image; an offset chosen
+    // so the window includes the linked range would alias kernel text and data
+    // through the HHDM path used for page-table walks and frame translations.
+    if let Some(highest_physical) = memory_map.regions().iter().map(|region| region.end()).max() {
+        let Some(hhdm_end) = hhdm.offset.checked_add(highest_physical) else {
+            return Err(BootInfoError::InvalidHhdmOffset);
+        };
+        if hhdm.offset < linked_virtual_end && linked_virtual_start < hhdm_end {
+            return Err(BootInfoError::InvalidHhdmOffset);
+        }
+    }
     let boot_stack_physical_start = boot_stack_virtual_start
         .checked_sub(hhdm.offset)
         .ok_or(BootInfoError::InvalidInitialStackHhdmRange)?;
@@ -488,8 +511,21 @@ pub fn capture_boot_information(entry_rsp: u64) -> Result<BootInfo, BootInfoErro
         Some(address)
     };
 
+    // Exclude the kernel image and boot stack physical spans even if a loader
+    // mislabels them as usable; the allocator must never hand them out.
+    let mut exclusions = [(0u64, 0u64); 2];
+    let mut exclusion_count = 0usize;
+    if kernel_physical_end > executable_address.physical_base {
+        exclusions[exclusion_count] = (executable_address.physical_base, kernel_physical_end);
+        exclusion_count += 1;
+    }
+    if boot_stack_physical_end > boot_stack_physical_start {
+        exclusions[exclusion_count] = (boot_stack_physical_start, boot_stack_physical_end);
+        exclusion_count += 1;
+    }
     let frame_allocator =
-        FrameAllocator::from_memory_map(&memory_map).map_err(BootInfoError::FrameAllocator)?;
+        FrameAllocator::from_memory_map_excluding(&memory_map, &exclusions[..exclusion_count])
+            .map_err(BootInfoError::FrameAllocator)?;
 
     Ok(BootInfo {
         hhdm_revision: hhdm.revision,
@@ -517,6 +553,21 @@ pub fn capture_boot_information(entry_rsp: u64) -> Result<BootInfo, BootInfoErro
 
 /// Print a report from the copied snapshot; no loader pointers are used here.
 pub fn report_boot_information(boot_info: &BootInfo) {
+    // Response `revision` fields are reported as 0 by the pinned Limine. A
+    // nonzero value may indicate a newer response layout; the kernel validates
+    // base revision 3 and does not consume revision-specific fields, so note
+    // it rather than reject it.
+    if boot_info.hhdm_revision != 0
+        || boot_info.executable_address_revision != 0
+        || boot_info.memory_map_revision != 0
+    {
+        crate::kprintln!(
+            "NOTE: boot response revision is nonzero (hhdm={}, executable={}, memory_map={}); base revision 3 was validated",
+            boot_info.hhdm_revision,
+            boot_info.executable_address_revision,
+            boot_info.memory_map_revision
+        );
+    }
     crate::kprintln!(
         "HHDM: offset {:#018x}, response revision {}",
         boot_info.hhdm_offset,

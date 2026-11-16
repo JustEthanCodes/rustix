@@ -51,15 +51,17 @@ static THREAD_TEST_TRACE: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_RUNTIME: AtomicPtr<KernelThreadRuntime> = AtomicPtr::new(core::ptr::null_mut());
 static mut BOOTSTRAP_FX_STATE: FxSaveArea = FxSaveArea::INITIAL;
 #[export_name = "rustix_active_fpu_state_pointer"]
-static mut ACTIVE_FX_STATE_POINTER: *mut FxSaveArea = core::ptr::null_mut();
+static ACTIVE_FX_STATE_POINTER: AtomicPtr<FxSaveArea> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Initialize the IRQ assembly's FXSAVE destination before any IRQ route is armed.
 pub(crate) fn initialize_fpu_context() {
-    // SAFETY: Bootstrap runs with IF clear and this pointer is published before
-    // the timer or device IRQ routes can be unmasked.
-    unsafe {
-        ACTIVE_FX_STATE_POINTER = core::ptr::addr_of_mut!(BOOTSTRAP_FX_STATE);
-    }
+    // Bootstrap runs with IF clear; release stores the pointer before the timer
+    // or device IRQ routes can be unmasked. IRQ assembly reads it with a plain
+    // aligned 8-byte load, which is atomic on x86_64.
+    ACTIVE_FX_STATE_POINTER.store(
+        core::ptr::addr_of_mut!(BOOTSTRAP_FX_STATE),
+        Ordering::Release,
+    );
 }
 
 #[cfg(feature = "probe-kernel-threads")]
@@ -133,7 +135,10 @@ impl KernelThreadRuntime {
             if self.deadlines[slot].is_some_and(|deadline| now >= deadline) {
                 self.deadlines[slot] = None;
                 if self.policy.wake_one(self.timer_queues[slot]).is_err() {
-                    THREAD_TEST_TRACE.store(99, Ordering::Release);
+                    // A scheduler that cannot wake a waiter leaks a permanently
+                    // sleeping thread; stop loudly instead of limping.
+                    crate::kprintln!("scheduler: timer wake failed for queue {}", slot);
+                    halt_on_stack_cleanup_failure();
                 }
             }
         }
@@ -144,7 +149,10 @@ impl KernelThreadRuntime {
         let input_event = self.input_events_enabled
             && rustix_kernel::input::INPUT_EVENT_PENDING.swap(false, Ordering::AcqRel);
         if input_event && self.policy.wake_all(self.event_queue).is_err() {
-            THREAD_TEST_TRACE.store(99, Ordering::Release);
+            // A scheduler that cannot wake its waiters leaks permanent blockage;
+            // stop loudly instead of limping.
+            crate::kprintln!("scheduler: event wake failed");
+            halt_on_stack_cleanup_failure();
         }
         input_event
     }
@@ -1018,9 +1026,9 @@ unsafe fn rustix_arch_context_switch_from_irq(
 }
 
 unsafe fn publish_fx_state(state: *mut FxSaveArea) {
-    // SAFETY: The single-vCPU runtime calls this only with IF clear; IRQ assembly
-    // reads the pointer only while executing on that same CPU.
-    unsafe { ACTIVE_FX_STATE_POINTER = state };
+    // Release pairs with the IRQ stub's plain load; the store is a single
+    // aligned 8-byte atomic, so the stub never observes a torn pointer.
+    ACTIVE_FX_STATE_POINTER.store(state, Ordering::Release);
 }
 
 unsafe fn save_bootstrap_fx_state() {

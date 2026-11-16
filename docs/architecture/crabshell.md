@@ -36,10 +36,10 @@ The kernel welcomes the user in `/home/rustix`. The initial namespace contains `
 | `touch PATH` | Create an empty file, or leave an existing file unchanged. |
 | `write PATH TEXT` | Create a file if needed and replace its contents with the remaining line. Matching outer single or double quotes around the text are removed. |
 | `append PATH TEXT` | Create a file if needed and append the remaining line. |
-| `cp SOURCE DEST` | Copy a file; an existing destination file is replaced. |
-| `mv SOURCE DEST` | Move/rename a file; directories and existing destinations are rejected. |
+| `cp SOURCE DEST` | Copy a file; an existing destination file is replaced. If DEST is an existing directory, the file is copied into it under the source's base name. |
+| `mv SOURCE DEST` | Move/rename a file. If DEST is an existing directory, the file is moved into it under the source's base name. Existing targets are never overwritten. |
 | `cat PATH` | Print a UTF-8 text file. Binary data is not displayed. |
-| `rm PATH` | Remove a file. Directories are rejected. |
+| `rm PATH` | Remove a file. Directories are rejected; a trailing `/` requires a directory operand. |
 | `rmdir PATH` | Remove an empty directory other than the current directory. |
 
 Example:
@@ -61,11 +61,12 @@ The grammar intentionally does not yet support quoted paths, escaped quotes, var
 - The root plus at most 31 live entries fit in the fixed 32-node table.
 - Path components are limited to 31 UTF-8 bytes; file contents are limited to 1024 bytes each.
 - Paths may be absolute or relative and support repeated `/`, `.`, and `..`.
-- `write` replaces a file; `append` adds bytes; `touch` never truncates. Oversized path-based writes and appends fail before creating a missing file, and failed capacity checks leave existing contents unchanged.
-- `cp` copies files and replaces an existing destination file. `mv` moves files only and refuses to overwrite an existing destination. `rm` handles files only. `rmdir` refuses non-empty directories and the current directory.
+- A trailing `/` on a path operand demands a directory, following POSIX `ENOTDIR` semantics: `file/` never resolves to a regular file, and a trailing separator on a nonexistent destination is an error, not an implicit directory.
+- `write` replaces a file; `append` adds bytes; `touch` never truncates. Oversized path-based writes and appends, and appends that would exceed the 1024-byte limit, fail before creating a missing file or mutating existing contents.
+- `cp` copies files and replaces an existing destination file; with an existing directory as DEST, the file is copied into it. `mv` moves files only and refuses to overwrite an existing destination; with an existing directory as DEST, the file is moved into it. `rm` handles files only. `rmdir` refuses non-empty directories and the current directory.
 - Filesystem allocation is fixed-capacity; errors are reported rather than allocating a heap.
 - Every file and directory disappears when the machine resets. There is no block device, journaling, metadata persistence, permission model, links, or concurrent access yet.
 
 ## Tests and limitations
 
-Host-side tests cover path traversal, file create/write/append/copy/move/remove, entry kinds, path rendering, directory emptiness, capacity failures without namespace mutation, and the parser's syntax/arity. The automated QEMU smoke test checks that the serial shell reaches its prompt; `just input-smoke` additionally exercises UART/PS/2 IRQ wakeup and raw scancode reporting. A separate manual `just run` session exercised `help`, `ls`, `meminfo`, `mkdir`, `cd`, `touch`, `write`, `append`, `cat`, `cp`, `mv`, `rm`, `rmdir`, and `pwd`; `cat` returned the appended text, `cp` replaced an existing destination with source contents, `rmdir` refused a nonempty directory, and `pwd` returned to `/home/rustix` after cleanup. The unsupported `memtest` command produced the expected unknown-command response. These checks do not emulate reboot persistence, exhaustively test shell interactions, or prove isolation. Since the shell runs in ring 0, a parser or filesystem bug can panic the entire kernel. This implementation must not be presented as a secure or POSIX-compliant shell.
+Host-side tests cover path traversal, file create/write/append/copy/move/remove, entry kinds, path rendering, directory emptiness, capacity failures without namespace mutation, and the parser's syntax/arity. They also cover trailing-separator `ENOTDIR` semantics, `cp`/`mv` into existing directories, and cumulative-capacity prechecks on append. The automated QEMU smoke test checks that the serial shell reaches its prompt; `just input-smoke` additionally exercises UART/PS/2 IRQ wakeup and raw scancode reporting. A separate manual `just run` session exercised `help`, `ls`, `meminfo`, `mkdir`, `cd`, `touch`, `write`, `append`, `cat`, `cp`, `mv`, `rm`, `rmdir`, and `pwd`; `cat` returned the appended text, `cp` replaced an existing destination with source contents, `rmdir` refused a nonempty directory, and `pwd` returned to `/home/rustix` after cleanup. The unsupported `memtest` command produced the expected unknown-command response. These checks do not emulate reboot persistence, exhaustively test shell interactions, or prove isolation. Since the shell runs in ring 0, a parser or filesystem bug can panic the entire kernel. This implementation must not be presented as a secure or POSIX-compliant shell.

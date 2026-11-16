@@ -55,6 +55,9 @@ pub enum FrameError {
     NotManaged,
     AlreadyFree,
     AccountingOverflow,
+    /// A half-open exclusion span was empty, inverted, or exceeded the
+    /// supported exclusion count.
+    InvalidExclusion,
 }
 
 /// A rejected deallocation that returns ownership of the frame to the caller.
@@ -108,6 +111,34 @@ impl FrameAllocator {
     /// The caller must ensure there is only one allocator instance per physical
     /// map; constructing multiple instances would duplicate allocation authority.
     pub fn from_memory_map(map: &MemoryMap) -> Result<Self, FrameError> {
+        Self::from_memory_map_excluding(map, &[])
+    }
+
+    /// Build allocator metadata like [`Self::from_memory_map`], additionally
+    /// excluding half-open physical spans that must never be handed out as free
+    /// frames.
+    ///
+    /// This exists to defend the kernel against a loader that mislabels
+    /// kernel-owned pages (for example the kernel image or the boot stack) as
+    /// `Usable`; such spans are subtracted from every otherwise-usable region
+    /// before frames are accounted. Up to seven exclusions are supported;
+    /// each must satisfy `start < end` with checked arithmetic.
+    pub fn from_memory_map_excluding(
+        map: &MemoryMap,
+        exclusions: &[(u64, u64)],
+    ) -> Result<Self, FrameError> {
+        const MAX_EXCLUSIONS: usize = 7;
+        const MAX_PIECES: usize = MAX_EXCLUSIONS + 1;
+
+        if exclusions.len() > MAX_EXCLUSIONS {
+            return Err(FrameError::RangeTableFull);
+        }
+        for &(start, end) in exclusions {
+            if start >= end {
+                return Err(FrameError::InvalidExclusion);
+            }
+        }
+
         let mut allocator = Self::EMPTY;
         let page_mask = !(FRAME_SIZE - 1);
 
@@ -116,31 +147,62 @@ impl FrameAllocator {
                 continue;
             }
 
-            let start = region.start().max(LOW_MEMORY_RESERVED_END);
-            let Some(start) = start
-                .checked_add(FRAME_SIZE - 1)
-                .map(|address| address & page_mask)
-            else {
-                continue;
-            };
-            let end = region.end() & page_mask;
-            if start >= end {
-                continue;
+            let region_start = region.start().max(LOW_MEMORY_RESERVED_END);
+            let region_end = region.end();
+
+            let mut pieces = [(0u64, 0u64); MAX_PIECES];
+            pieces[0] = (region_start, region_end);
+            let mut piece_count = 1usize;
+            for &(exclusion_start, exclusion_end) in exclusions {
+                let mut next = [(0u64, 0u64); MAX_PIECES];
+                let mut next_count = 0usize;
+                for piece_index in 0..piece_count {
+                    let (piece_start, piece_end) = pieces[piece_index];
+                    if exclusion_end <= piece_start || exclusion_start >= piece_end {
+                        next[next_count] = (piece_start, piece_end);
+                        next_count += 1;
+                        continue;
+                    }
+                    if piece_start < exclusion_start && next_count < MAX_PIECES {
+                        next[next_count] = (piece_start, exclusion_start);
+                        next_count += 1;
+                    }
+                    if exclusion_end < piece_end && next_count < MAX_PIECES {
+                        next[next_count] = (exclusion_end, piece_end);
+                        next_count += 1;
+                    }
+                }
+                pieces[..next_count].copy_from_slice(&next[..next_count]);
+                piece_count = next_count;
             }
 
-            let range = FrameRange { start, end };
-            Self::insert_range(&mut allocator.managed, &mut allocator.managed_count, range)?;
-            Self::insert_range(&mut allocator.free, &mut allocator.free_count, range)?;
+            for piece_index in 0..piece_count {
+                let (piece_start, piece_end) = pieces[piece_index];
+                let Some(start) = piece_start
+                    .checked_add(FRAME_SIZE - 1)
+                    .map(|address| address & page_mask)
+                else {
+                    continue;
+                };
+                let end = piece_end & page_mask;
+                if start >= end {
+                    continue;
+                }
 
-            let frames = (end - start) / FRAME_SIZE;
-            allocator.managed_frames = allocator
-                .managed_frames
-                .checked_add(frames)
-                .ok_or(FrameError::AccountingOverflow)?;
-            allocator.free_frames = allocator
-                .free_frames
-                .checked_add(frames)
-                .ok_or(FrameError::AccountingOverflow)?;
+                let range = FrameRange { start, end };
+                Self::insert_range(&mut allocator.managed, &mut allocator.managed_count, range)?;
+                Self::insert_range(&mut allocator.free, &mut allocator.free_count, range)?;
+
+                let frames = (end - start) / FRAME_SIZE;
+                allocator.managed_frames = allocator
+                    .managed_frames
+                    .checked_add(frames)
+                    .ok_or(FrameError::AccountingOverflow)?;
+                allocator.free_frames = allocator
+                    .free_frames
+                    .checked_add(frames)
+                    .ok_or(FrameError::AccountingOverflow)?;
+            }
         }
 
         Ok(allocator)
@@ -464,6 +526,50 @@ mod tests {
         assert_eq!(allocator.allocate().unwrap().address(), 0x10_0000);
         assert_eq!(allocator.allocate().unwrap().address(), 0x10_1000);
         assert_eq!(allocator.allocate(), None);
+    }
+
+    #[test]
+    fn exclusion_spans_are_subtracted_before_frames_are_accounted() {
+        let regions = [RawMemoryRegion {
+            base: 0x10_0000,
+            length: FRAME_SIZE * 8,
+            kind: 0,
+        }];
+        let map = MemoryMap::from_raw(&regions).unwrap();
+        // Exclude the second and third pages entirely.
+        let allocator =
+            FrameAllocator::from_memory_map_excluding(&map, &[(0x10_1000, 0x10_3000)]).unwrap();
+        assert_eq!(allocator.managed_frames(), 6);
+        assert_eq!(allocator.free_frames(), 6);
+
+        // Exclude a non-page-aligned span; page-granularity truncation must not
+        // allocate any frame that overlaps the exclusion.
+        let allocator =
+            FrameAllocator::from_memory_map_excluding(&map, &[(0x10_1234, 0x10_5678)]).unwrap();
+        let mut allocated = allocator;
+        while let Some(frame) = allocated.allocate() {
+            let frame_end = frame.address().checked_add(FRAME_SIZE).unwrap();
+            assert!(
+                frame_end <= 0x10_1234 || 0x10_5678 <= frame.address(),
+                "frame at {:#x} overlaps the exclusion",
+                frame.address()
+            );
+        }
+        // An exclusion covering the whole region leaves no allocatable frame.
+        let allocator =
+            FrameAllocator::from_memory_map_excluding(&map, &[(0x10_0000, 0x18_0000)]).unwrap();
+        assert_eq!(allocator.managed_frames(), 0);
+
+        // Invalid exclusions and too many exclusions are rejected.
+        assert!(matches!(
+            FrameAllocator::from_memory_map_excluding(&map, &[(0x4000, 0x4000)]),
+            Err(FrameError::InvalidExclusion)
+        ));
+        let many = [(0x20_0000u64, 0x20_1000u64); 8];
+        assert!(matches!(
+            FrameAllocator::from_memory_map_excluding(&map, &many),
+            Err(FrameError::RangeTableFull)
+        ));
     }
 
     #[test]

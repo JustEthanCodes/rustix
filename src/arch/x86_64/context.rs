@@ -2,7 +2,8 @@
 //!
 //! The switch preserves the SysV callee-saved general-purpose registers, stack
 //! pointer, and x87/SSE state. It does not save flags, caller-saved general-
-//! purpose registers, control registers, or address-space state. Timer
+//! purpose registers, control registers, or address-space state; both switches
+//! clear the direction flag before returning. Timer
 //! preemption uses a separate entry because the IRQ stub has already saved the
 //! interrupted task's x87/SSE state before calling Rust.
 
@@ -26,6 +27,7 @@ core::arch::global_asm!(
     "    pop r12",
     "    pop rbp",
     "    pop rbx",
+    "    cld",
     "    ret",
     ".global rustix_context_switch_from_irq",
     "rustix_context_switch_from_irq:",
@@ -44,6 +46,7 @@ core::arch::global_asm!(
     "    pop r12",
     "    pop rbp",
     "    pop rbx",
+    "    cld",
     "    ret",
 );
 

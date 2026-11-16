@@ -381,6 +381,13 @@ unsafe impl<const HEAP_SIZE: usize, const MAX_ALLOCATIONS: usize> GlobalAlloc
     for LockedHeap<HEAP_SIZE, MAX_ALLOCATIONS>
 {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Allocation from interrupt/exception context can deadlock the only
+        // CPU with IF masked; the allocator contract forbids it. Enforced in
+        // debug builds; release builds document the contract instead.
+        debug_assert!(
+            crate::sync::INTERRUPT_DEPTH.load(core::sync::atomic::Ordering::Relaxed) == 0,
+            "kernel heap allocation from interrupt/exception context"
+        );
         let _lock = self.acquire();
         // SAFETY: The lock grants exclusive access to both allocator regions.
         let heap = unsafe { &mut *self.heap.get() };
@@ -404,9 +411,17 @@ unsafe impl<const HEAP_SIZE: usize, const MAX_ALLOCATIONS: usize> GlobalAlloc
         // SAFETY: The same lock exclusively protects growth allocation metadata.
         let growth = unsafe { &mut *self.growth.get() };
         if growth.contains_pointer(pointer.as_ptr() as usize) {
-            let _ = growth.deallocate(pointer, layout);
+            let result = growth.deallocate(pointer, layout);
+            debug_assert!(
+                result.is_ok(),
+                "frame-backed dealloc failed; possible double-free or layout mismatch"
+            );
         } else {
-            let _ = heap.deallocate(pointer, layout);
+            let result = heap.deallocate(pointer, layout);
+            debug_assert!(
+                result.is_ok(),
+                "arena dealloc failed; possible double-free or layout mismatch"
+            );
         }
     }
 }

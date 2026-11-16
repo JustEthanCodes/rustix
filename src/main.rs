@@ -294,7 +294,12 @@ fn rollback_kernel_heap_pages(
     use rustix_kernel::paging::PAGE_SIZE;
 
     for page in (first_page..first_page + mapped_pages).rev() {
-        let virtual_address = KERNEL_HEAP_GROWTH_VIRTUAL_BASE + page as u64 * PAGE_SIZE;
+        let Some(virtual_address) = (page as u64)
+            .checked_mul(PAGE_SIZE)
+            .and_then(|offset| KERNEL_HEAP_GROWTH_VIRTUAL_BASE.checked_add(offset))
+        else {
+            halt_forever();
+        };
         // SAFETY: The pages belong to this transaction in the current active
         // root; unmapping invalidates their TLB entries before token return.
         let frame = unsafe { candidate.unmap_owned_page_active(virtual_address) }
@@ -767,6 +772,11 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
             &mut boot_info.frame_allocator,
             &boot_info.cpu_info,
             madt,
+            &boot_info.memory_map,
+            (
+                boot_info.kernel_physical_base,
+                boot_info.kernel_physical_end,
+            ),
         ) {
             Ok(addresses) => Some(addresses),
             Err(error) => {
@@ -1318,6 +1328,8 @@ fn map_bootstrap_apic_pages<'memory, 'map>(
     allocator: &mut rustix_kernel::frame::FrameAllocator,
     cpu_info: &arch::x86_64::cpu::CpuInfo,
     madt: &rustix_kernel::acpi::Madt,
+    memory_map: &rustix_kernel::memory::MemoryMap,
+    kernel_physical_span: (u64, u64),
 ) -> Result<(u64, u64), &'static str> {
     use rustix_kernel::paging::{
         validate_mapping_range, CachePolicy, EffectiveMemoryType, MtrrState, PagePermissions,
@@ -1357,6 +1369,21 @@ fn map_bootstrap_apic_pages<'memory, 'map>(
         ) {
             return Err("reserved APIC virtual address is not unmapped");
         }
+        if physical_address & (PAGE_SIZE - 1) != 0 {
+            return Err("APIC MMIO page is not 4 KiB aligned");
+        }
+        // Platform data does not authorize writing to ordinary memory: the APIC
+        // MMIO pages must lie outside known non-MMIO memory-map regions and the
+        // kernel image. A hostile or buggy MADT can name an arbitrary page.
+        let mmio_span = memory_map
+            .validate_mmio_page(physical_address, Some(physical_address_bits))
+            .map_err(|_| "APIC MMIO page failed physical-memory authorization")?;
+        let page_end = physical_address
+            .checked_add(PAGE_SIZE)
+            .ok_or("APIC MMIO page address overflows")?;
+        if physical_address < kernel_physical_span.1 && kernel_physical_span.0 < page_end {
+            return Err("APIC MMIO page overlaps the kernel image");
+        }
         let mapping = validate_mapping_range(
             virtual_address,
             physical_address,
@@ -1377,12 +1404,14 @@ fn map_bootstrap_apic_pages<'memory, 'map>(
         if attributes.effective_type() != EffectiveMemoryType::Uncacheable {
             return Err("APIC page is not effectively uncacheable");
         }
-        // SAFETY: Both physical addresses come from the copied MADT, are used
-        // only as device registers, and will be mapped with the validated UC
-        // policy. The API enforces supervisor RW/NX mappings and non-ownership.
+        // SAFETY: Both physical addresses come from the copied MADT, were
+        // validated against the physical memory map and the kernel image span,
+        // and are used only as device registers; they will be mapped with the
+        // validated UC policy. The API enforces supervisor RW/NX mappings and
+        // non-ownership.
         unsafe {
             candidate
-                .map_mmio_page(allocator, mapping, attributes)
+                .map_mmio_page(allocator, mmio_span, mapping, attributes)
                 .map_err(|_| "APIC candidate mapping failed")?;
         }
         match candidate.walk(virtual_address) {
@@ -2606,8 +2635,25 @@ fn run_fault_injection() {
     halt_forever();
 }
 
+/// Set once the fatal panic path has started. A panic from inside the fatal
+/// path stops silently instead of recursively printing or looping diagnostics.
+static FATAL_PANIC_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
+    // Mask maskable interrupts before any diagnostics run: another kernel
+    // thread must not resume after a panic is declared, and the fatal report
+    // must not be preempted mid-print.
+    //
+    // SAFETY: Kernel panic path runs at CPL 0; masking IF is always sound.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    if FATAL_PANIC_ACTIVE.swap(true, core::sync::atomic::Ordering::Acquire) {
+        loop {
+            // SAFETY: Re-entrant panics are deliberately silent.
+            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) };
+        }
+    }
     arch::x86_64::serial::initialize();
     kprintln!("KERNEL PANIC: {}", info);
     halt_forever()

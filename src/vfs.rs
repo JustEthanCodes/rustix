@@ -141,6 +141,11 @@ impl RamFs {
                 }
             }
         }
+        // A trailing separator demands a directory (POSIX ENOTDIR semantics):
+        // silently resolving `file/` to the file would let `rm file/` delete it.
+        if path.ends_with('/') && self.node(current)?.kind != EntryKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
         Ok(current)
     }
 
@@ -242,11 +247,25 @@ impl RamFs {
         if contents.len() > FILE_CAPACITY {
             return Err(FsError::FileTooLarge);
         }
+        // Pre-check the cumulative bound so a failing append neither creates a
+        // node nor leaves a file in a surprising state.
+        if let Ok(node) = self.resolve(cwd, path) {
+            if self.node(node)?.kind == EntryKind::Directory {
+                return Err(FsError::IsDirectory);
+            }
+            let data_len = self.node(node)?.data_len;
+            data_len
+                .checked_add(contents.len())
+                .filter(|length| *length <= FILE_CAPACITY)
+                .ok_or(FsError::FileTooLarge)?;
+        }
         let node = self.open_or_create_file(cwd, path)?;
         self.append_file(node, contents)
     }
 
-    /// Copy a file to a destination path, replacing an existing destination file.
+    /// Copy a file to a destination path, replacing an existing destination
+    /// file. If the destination resolves to an existing directory, the file is
+    /// copied into it under the source's base name.
     pub fn copy_file_path(
         &mut self,
         cwd: usize,
@@ -260,11 +279,25 @@ impl RamFs {
             contents[..source_contents.len()].copy_from_slice(source_contents);
             source_contents.len()
         };
-        let destination = self.open_or_create_file(cwd, destination_path)?;
+        let destination = match self.resolve(cwd, destination_path) {
+            Ok(node) if self.node(node)?.kind == EntryKind::Directory => {
+                let base = split_parent(source_path)?.1;
+                self.open_or_create_file(node, base)?
+            }
+            // A trailing separator on a nonexistent destination is an error
+            // (POSIX ENOTDIR), not a create-at-path.
+            Err(FsError::NotFound) if destination_path.ends_with('/') => {
+                return Err(FsError::NotDirectory)
+            }
+            Ok(_) | Err(FsError::NotFound) => self.open_or_create_file(cwd, destination_path)?,
+            Err(error) => return Err(error),
+        };
         self.write_file(destination, &contents[..length])
     }
 
-    /// Move or rename a file. Existing destinations are never overwritten.
+    /// Move or rename a file. Existing destinations are never overwritten. If
+    /// the destination resolves to an existing directory, the file is moved
+    /// into it under the source's base name.
     pub fn move_file_path(
         &mut self,
         cwd: usize,
@@ -279,12 +312,28 @@ impl RamFs {
             return Err(FsError::IsDirectory);
         }
 
-        let (parent_path, name) = split_parent(destination_path)?;
+        // The destination may name a file path or an existing directory to move
+        // into; both reuse the never-overwrite logic below.
+        let (parent, name) = match self.resolve(cwd, destination_path) {
+            Ok(node) if self.node(node)?.kind == EntryKind::Directory => {
+                (node, split_parent(source_path)?.1)
+            }
+            // A trailing separator on a nonexistent destination is an error
+            // (POSIX ENOTDIR), not a move-at-path.
+            Err(FsError::NotFound) if destination_path.ends_with('/') => {
+                return Err(FsError::NotDirectory)
+            }
+            Ok(_) | Err(FsError::NotFound) => {
+                let (parent_path, name) = split_parent(destination_path)?;
+                let parent = self.resolve(cwd, parent_path)?;
+                if self.node(parent)?.kind != EntryKind::Directory {
+                    return Err(FsError::NotDirectory);
+                }
+                (parent, name)
+            }
+            Err(error) => return Err(error),
+        };
         validate_name(name)?;
-        let parent = self.resolve(cwd, parent_path)?;
-        if self.node(parent)?.kind != EntryKind::Directory {
-            return Err(FsError::NotDirectory);
-        }
         if let Some(existing) = self.find_child(parent, name) {
             return if existing == source {
                 Ok(())
@@ -625,6 +674,104 @@ mod tests {
         let directory = fs.create_dir(ROOT_NODE, "work").unwrap();
         fs.create_file(directory, "note").unwrap();
         assert_eq!(fs.remove_dir(directory), Err(FsError::DirectoryNotEmpty));
+    }
+
+    #[test]
+    fn trailing_separator_requires_a_directory() {
+        let mut fs = RamFs::new();
+        fs.write_file_path(ROOT_NODE, "/note.txt", b"data").unwrap();
+
+        assert_eq!(
+            fs.resolve(ROOT_NODE, "/note.txt/"),
+            Err(FsError::NotDirectory)
+        );
+        assert_eq!(
+            fs.remove_file_path(ROOT_NODE, "/note.txt/"),
+            Err(FsError::NotDirectory)
+        );
+        assert_eq!(
+            fs.write_file_path(ROOT_NODE, "/note.txt/", b"clobber"),
+            Err(FsError::NotDirectory)
+        );
+        // Existing file contents must be preserved.
+        let file = fs.resolve(ROOT_NODE, "/note.txt").unwrap();
+        assert_eq!(fs.read_file(file).unwrap(), b"data");
+
+        let directory = fs.create_dir(ROOT_NODE, "work").unwrap();
+        assert_eq!(fs.resolve(ROOT_NODE, "/work/").unwrap(), directory);
+
+        // A trailing separator on a nonexistent destination is ENOTDIR, not a
+        // create at the trimmed path.
+        assert_eq!(
+            fs.copy_file_path(ROOT_NODE, "/note.txt", "/missing/"),
+            Err(FsError::NotDirectory)
+        );
+        assert_eq!(
+            fs.move_file_path(ROOT_NODE, "/note.txt", "/missing/"),
+            Err(FsError::NotDirectory)
+        );
+    }
+
+    #[test]
+    fn copy_and_move_into_an_existing_directory() {
+        let mut fs = RamFs::new();
+        let source = fs.create_file_path(ROOT_NODE, "/source.txt").unwrap();
+        fs.write_file(source, b"data").unwrap();
+        let dest_dir = fs.create_dir(ROOT_NODE, "destdir").unwrap();
+
+        fs.copy_file_path(ROOT_NODE, "/source.txt", "/destdir")
+            .unwrap();
+        let copied = fs.resolve(dest_dir, "source.txt").unwrap();
+        assert_eq!(fs.read_file(copied).unwrap(), b"data");
+        // copy with a trailing separator also lands inside the directory
+        fs.copy_file_path(ROOT_NODE, "/source.txt", "/destdir/")
+            .unwrap();
+        assert_eq!(fs.read_file(copied).unwrap(), b"data");
+
+        // mv never overwrites an existing target, even inside a directory
+        assert_eq!(
+            fs.move_file_path(ROOT_NODE, "/source.txt", "/destdir/"),
+            Err(FsError::AlreadyExists)
+        );
+
+        // mv succeeds into a directory when the target name is free
+        let incoming = fs.create_dir(ROOT_NODE, "incoming").unwrap();
+        fs.move_file_path(ROOT_NODE, "/source.txt", "/incoming/")
+            .unwrap();
+        assert_eq!(fs.resolve(ROOT_NODE, "/source.txt"), Err(FsError::NotFound));
+        assert_eq!(
+            fs.read_file(fs.resolve(incoming, "source.txt").unwrap())
+                .unwrap(),
+            b"data"
+        );
+
+        // mv a file onto itself is a no-op
+        let moved = fs.resolve(incoming, "source.txt").unwrap();
+        fs.move_file_path(ROOT_NODE, "/incoming/source.txt", "/incoming/source.txt")
+            .unwrap();
+        assert_eq!(fs.kind(moved), Ok(EntryKind::File));
+    }
+
+    #[test]
+    fn append_prechecks_cumulative_capacity_before_touching_nodes() {
+        let mut fs = RamFs::new();
+        let file = fs.create_file_path(ROOT_NODE, "/fill").unwrap();
+        fs.write_file(file, &[b'x'; FILE_CAPACITY]).unwrap();
+        // Filling the file must not accept a single extra byte.
+        assert_eq!(
+            fs.append_file_path(ROOT_NODE, "/fill", b"y"),
+            Err(FsError::FileTooLarge)
+        );
+        assert_eq!(fs.read_file(file).unwrap().len(), FILE_CAPACITY);
+
+        // Fill a file to exactly the limit, then overflow it via the path API;
+        // the pre-check must reject before the append mutates anything.
+        fs.write_file(file, &[b'z'; FILE_CAPACITY - 4]).unwrap();
+        assert_eq!(
+            fs.append_file_path(ROOT_NODE, "/fill", b"12345"),
+            Err(FsError::FileTooLarge)
+        );
+        assert_eq!(fs.read_file(file).unwrap(), &[b'z'; FILE_CAPACITY - 4][..]);
     }
 
     #[test]

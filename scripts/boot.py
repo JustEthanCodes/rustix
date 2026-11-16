@@ -26,6 +26,12 @@ ROOT = Path(__file__).resolve().parents[1]
 TARGET_DIR = ROOT / "target"
 LIMINE_VERSION = "12.9.3"
 LIMINE_ARCHIVE_NAME = "limine-binary.zip"
+# Provenance: SHA-256 of limine-binary.zip v12.9.3 as published for the
+# upstream v12.9.3 release (cross-checked against the GitHub release API
+# digest at pin time; the release is marked immutable upstream). The archive is
+# re-hashed on every run and mismatch is fatal. The upstream PGP signature
+# (limine-binary.zip.sig) is NOT verified by this script; verify it out-of-band
+# whenever the pin is bumped.
 LIMINE_ARCHIVE_SHA256 = "1bdbbcda650c5dba9b1eca5833d598137bf11bd6289bc89b6bcc4f8f112fa676"
 LIMINE_ARCHIVE_URL = (
     "https://github.com/Limine-Bootloader/Limine/releases/download/"
@@ -244,7 +250,12 @@ def smoke_test(
     serial_log = TARGET_DIR / "rustix-qemu-serial.log"
     serial_log.parent.mkdir(parents=True, exist_ok=True)
     serial_log.unlink(missing_ok=True)
-    serial_device = "file:" + serial_log.relative_to(ROOT).as_posix()
+    serial_path = serial_log.as_posix()
+    if "," in serial_path:
+        raise BuildError(
+            "serial log path must not contain ',': " + serial_path
+        )
+    serial_device = "file:" + serial_path
     command = [
         qemu,
         "-machine",
