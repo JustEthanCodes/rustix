@@ -1,12 +1,14 @@
 //! Host-testable ownership for x86 interrupt vectors reserved for device IRQs.
 //!
 //! Architectural exceptions occupy vectors 0–31. The upper range 0xf0–0xff is
-//! kept unavailable for future local-APIC/spurious vectors; allocated vectors
-//! therefore come only from 0x20–0xef. This allocator does not install IDT gates,
+//! kept unavailable for future local-APIC/spurious vectors, and 0x80 is reserved
+//! for the planned user syscall gate. Allocated device vectors therefore come
+//! from 0x20–0xef except 0x80. This allocator does not install IDT gates,
 //! configure a controller, or enable interrupt delivery.
 
 pub const FIRST_DEVICE_VECTOR: u8 = 0x20;
 pub const LAST_DEVICE_VECTOR: u8 = 0xef;
+pub const SYSCALL_VECTOR: u8 = 0x80;
 const VECTOR_COUNT: usize = 256;
 const VECTOR_BITMAP_WORDS: usize = VECTOR_COUNT / u64::BITS as usize;
 
@@ -34,7 +36,7 @@ pub struct VectorReleaseFailure {
     pub vector: InterruptVector,
 }
 
-/// Fixed-capacity allocator for vectors 0x20 through 0xef.
+/// Fixed-capacity allocator for device vectors 0x20 through 0xef except 0x80.
 ///
 /// Only one allocator may manage a given CPU's vector namespace. The caller is
 /// responsible for keeping it alive while any returned tokens are in use.
@@ -48,9 +50,11 @@ impl InterruptVectorAllocator {
         let mut allocated = [u64::MAX; VECTOR_BITMAP_WORDS];
         let mut vector = FIRST_DEVICE_VECTOR;
         while vector <= LAST_DEVICE_VECTOR {
-            let word = vector as usize / u64::BITS as usize;
-            let bit = vector as usize % u64::BITS as usize;
-            allocated[word] &= !(1u64 << bit);
+            if vector != SYSCALL_VECTOR {
+                let word = vector as usize / u64::BITS as usize;
+                let bit = vector as usize % u64::BITS as usize;
+                allocated[word] &= !(1u64 << bit);
+            }
             vector += 1;
         }
         Self {
@@ -61,6 +65,9 @@ impl InterruptVectorAllocator {
 
     pub fn allocate(&mut self) -> Option<InterruptVector> {
         for number in FIRST_DEVICE_VECTOR..=LAST_DEVICE_VECTOR {
+            if number == SYSCALL_VECTOR {
+                continue;
+            }
             let word = number as usize / u64::BITS as usize;
             let bit = number as usize % u64::BITS as usize;
             let mask = 1u64 << bit;
@@ -74,7 +81,9 @@ impl InterruptVectorAllocator {
     }
 
     pub fn release(&mut self, vector: InterruptVector) -> Result<(), VectorReleaseFailure> {
-        if !(FIRST_DEVICE_VECTOR..=LAST_DEVICE_VECTOR).contains(&vector.0) {
+        if !(FIRST_DEVICE_VECTOR..=LAST_DEVICE_VECTOR).contains(&vector.0)
+            || vector.0 == SYSCALL_VECTOR
+        {
             return Err(VectorReleaseFailure {
                 error: VectorReleaseError::ReservedVector,
                 vector,
@@ -110,6 +119,7 @@ impl Default for InterruptVectorAllocator {
 mod tests {
     use super::{
         InterruptVectorAllocator, VectorReleaseError, FIRST_DEVICE_VECTOR, LAST_DEVICE_VECTOR,
+        SYSCALL_VECTOR,
     };
     use core::assert_eq;
 
@@ -120,10 +130,31 @@ mod tests {
         assert_eq!(first.number(), FIRST_DEVICE_VECTOR);
 
         for expected in (FIRST_DEVICE_VECTOR + 1)..=LAST_DEVICE_VECTOR {
-            assert_eq!(allocator.allocate().unwrap().number(), expected);
+            if expected != SYSCALL_VECTOR {
+                assert_eq!(allocator.allocate().unwrap().number(), expected);
+            }
         }
-        assert_eq!(allocator.allocated_count(), 208);
+        assert_eq!(allocator.allocated_count(), 207);
         assert_eq!(allocator.allocate(), None);
+    }
+
+    #[test]
+    fn syscall_vector_is_never_allocated_or_released_as_a_device_vector() {
+        let mut allocator = InterruptVectorAllocator::new();
+        let mut count = 0;
+        while let Some(vector) = allocator.allocate() {
+            assert_ne!(vector.number(), SYSCALL_VECTOR);
+            count += 1;
+        }
+        assert_eq!(count, 207);
+        assert_eq!(allocator.allocated_count(), 207);
+
+        let failure = allocator
+            .release(super::InterruptVector(SYSCALL_VECTOR))
+            .unwrap_err();
+        assert_eq!(failure.error, VectorReleaseError::ReservedVector);
+        assert_eq!(failure.vector.number(), SYSCALL_VECTOR);
+        assert_eq!(allocator.allocated_count(), 207);
     }
 
     #[test]
@@ -145,7 +176,7 @@ mod tests {
         while allocator.allocate().is_some() {
             count += 1;
         }
-        assert_eq!(count, 208);
+        assert_eq!(count, 207);
         assert_eq!(allocator.allocated_count(), count);
         assert_eq!(allocator.allocate(), None);
     }

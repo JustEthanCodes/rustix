@@ -48,6 +48,14 @@ active-map-smoke:
 frame-smoke:
     python3 scripts/boot.py frame-smoke
 
+# Run bundled init in Ring 3 and verify syscalls, wait status, and root teardown in QEMU.
+process-smoke:
+    python3 scripts/boot.py process-smoke
+
+# Terminate a Ring 3 process on #UD and verify wait/reap plus root teardown in QEMU.
+user-fault-smoke:
+    python3 scripts/boot.py user-fault-smoke
+
 # Exercise IRQ-safe locking, cooperative waits, timer preemption, and FPU state in OVMF.
 thread-smoke:
     python3 scripts/boot.py thread-smoke
@@ -68,5 +76,5 @@ run: image
 test:
     cargo test --workspace --lib
 
-# Run formatting, host tests, target checks, and the Milestone 3 QEMU smoke suite.
-verify: fmt test check smoke uefi-smoke active-map-smoke thread-smoke input-smoke
+# Run formatting, host tests, target checks, and the boot, scheduler, input, and process QEMU smokes.
+verify: fmt test check smoke uefi-smoke active-map-smoke thread-smoke input-smoke process-smoke user-fault-smoke

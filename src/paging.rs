@@ -933,6 +933,9 @@ pub struct MtrrRegisters {
     pub variable_registers: [MtrrRegisterPair; MAX_CAPTURED_VARIABLE_MTRRS],
 }
 
+// Captured MTRR state is an intentionally inline fixed-capacity snapshot; boxing
+// it would require allocation in the no_std boot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MtrrState {
     Unsupported,
@@ -1866,6 +1869,8 @@ pub const MAX_PROCESS_ADDRESS_SPACES: usize = 4;
 pub const MAX_PROCESS_PRIVATE_TABLES: usize = MAX_CANDIDATE_PAGE_TABLE_PAGES - 1;
 /// Maximum allocator-owned user mappings retained by one process root.
 pub const MAX_PROCESS_MAPPINGS: usize = 64;
+/// Copy helpers are bounded to one page of kernel scratch storage per call.
+pub const MAX_PROCESS_USER_COPY_BYTES: usize = PAGE_SIZE as usize;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProcessRootCreateErrorKind<E> {
@@ -1931,9 +1936,23 @@ pub enum ProcessUserCopyError<E> {
     InvalidHandle,
     Releasing,
     InvalidRange,
+    LengthTooLarge,
     Unmapped,
     PermissionDenied,
     Memory(E),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessUserEntryError {
+    InvalidHandle,
+    Releasing,
+    ActiveRoot,
+    InvalidInstructionPointer,
+    EntryUnmapped,
+    EntryPermissionDenied,
+    InvalidStackPointer,
+    StackUnmapped,
+    StackPermissionDenied,
 }
 
 /// Copy failures report bytes completed; a backend fault can follow a partial copy.
@@ -1979,6 +1998,7 @@ struct ProcessMapping {
     virtual_address: u64,
     frame: Frame,
     writable: bool,
+    executable: bool,
 }
 
 struct ProcessRoot<P: Copy> {
@@ -2035,6 +2055,10 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
             roots: core::array::from_fn(|_| None),
             generations: [0; MAX_PROCESS_ADDRESS_SPACES],
         })
+    }
+
+    pub const fn page_walk_config(&self) -> PageWalkConfig {
+        self.config
     }
 
     /// Allocate a private root and copy only sanitized upper-half root entries.
@@ -2427,6 +2451,7 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
             virtual_address: mapping.virtual_start,
             frame,
             writable: mapping.permissions.writable,
+            executable: mapping.permissions.executable,
         });
         Ok(())
     }
@@ -2516,11 +2541,55 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
             .frame)
     }
 
+    /// Validate the initial user instruction and stack addresses before a future
+    /// privilege transition. The stack pointer names the first byte above the
+    /// writable stack area, so its preceding byte must be mapped.
+    pub fn validate_initial_user_state(
+        &self,
+        handle: ProcessAddressSpaceHandle,
+        instruction_pointer: u64,
+        stack_pointer: u64,
+    ) -> Result<(), ProcessUserEntryError> {
+        let root = self
+            .root(handle)
+            .ok_or(ProcessUserEntryError::InvalidHandle)?;
+        if root.releasing {
+            return Err(ProcessUserEntryError::Releasing);
+        }
+        if root.active {
+            return Err(ProcessUserEntryError::ActiveRoot);
+        }
+
+        validate_user_entry_mappings(root, self.config, instruction_pointer, stack_pointer)
+    }
+
+    /// Validate a saved user return frame against this process root while active.
+    ///
+    /// Unlike `validate_initial_user_state`, this permits an active root and is
+    /// intended for every syscall return to CPL3.
+    pub fn validate_user_return_state(
+        &self,
+        handle: ProcessAddressSpaceHandle,
+        instruction_pointer: u64,
+        stack_pointer: u64,
+    ) -> Result<(), ProcessUserEntryError> {
+        let root = self
+            .root(handle)
+            .ok_or(ProcessUserEntryError::InvalidHandle)?;
+        if root.releasing {
+            return Err(ProcessUserEntryError::Releasing);
+        }
+        validate_user_entry_mappings(root, self.config, instruction_pointer, stack_pointer)
+    }
+
     /// Copy kernel bytes from mapped user pages without forming user pointers.
     ///
     /// The complete range is validated before the first copy. If the frame
     /// backend fails during copying, `transferred` reports the completed prefix.
-    pub fn copy_from_user<U: UserFrameMemory>(
+    ///
+    /// # Safety
+    /// `destination` must not alias storage in any frame mapped by this process.
+    pub unsafe fn copy_from_user<U: UserFrameMemory>(
         &self,
         handle: ProcessAddressSpaceHandle,
         user_address: u64,
@@ -2537,6 +2606,12 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
                 transferred: 0,
             });
         }
+        if destination.len() > MAX_PROCESS_USER_COPY_BYTES {
+            return Err(ProcessUserCopyFailure {
+                cause: ProcessUserCopyError::LengthTooLarge,
+                transferred: 0,
+            });
+        }
         let end =
             validate_process_user_range(root, user_address, destination.len(), self.config, false)
                 .map_err(|error| ProcessUserCopyFailure {
@@ -2549,6 +2624,7 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
                     },
                     transferred: 0,
                 })?;
+        let mut scratch = [0; MAX_PROCESS_USER_COPY_BYTES];
         let mut transferred = 0;
         while transferred < destination.len() {
             let current = user_address
@@ -2567,8 +2643,9 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
             if let Err(error) = user_memory.copy_from_frame(
                 &mapping.frame,
                 page_offset,
-                &mut destination[transferred..transferred + chunk_length],
+                &mut scratch[transferred..transferred + chunk_length],
             ) {
+                destination[..transferred].copy_from_slice(&scratch[..transferred]);
                 return Err(ProcessUserCopyFailure {
                     cause: ProcessUserCopyError::Memory(error),
                     transferred,
@@ -2576,12 +2653,16 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
             }
             transferred += chunk_length;
         }
+        destination.copy_from_slice(&scratch[..destination.len()]);
         debug_assert_eq!(user_address + destination.len() as u64, end);
         Ok(transferred)
     }
 
     /// Copy kernel bytes into mapped, writable user pages without user pointers.
-    pub fn copy_to_user<U: UserFrameMemory>(
+    ///
+    /// # Safety
+    /// `source` must not alias storage in any frame mapped by this process.
+    pub unsafe fn copy_to_user<U: UserFrameMemory>(
         &self,
         handle: ProcessAddressSpaceHandle,
         user_address: u64,
@@ -2598,7 +2679,14 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
                 transferred: 0,
             });
         }
-        let end = validate_process_user_range(root, user_address, source.len(), self.config, true)
+        let source_len = source.len();
+        if source_len > MAX_PROCESS_USER_COPY_BYTES {
+            return Err(ProcessUserCopyFailure {
+                cause: ProcessUserCopyError::LengthTooLarge,
+                transferred: 0,
+            });
+        }
+        let end = validate_process_user_range(root, user_address, source_len, self.config, true)
             .map_err(|error| ProcessUserCopyFailure {
                 cause: match error {
                     ProcessUserRangeError::InvalidRange => ProcessUserCopyError::InvalidRange,
@@ -2609,14 +2697,16 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
                 },
                 transferred: 0,
             })?;
+        let mut scratch = [0; MAX_PROCESS_USER_COPY_BYTES];
+        scratch[..source_len].copy_from_slice(source);
         let mut transferred = 0;
-        while transferred < source.len() {
+        while transferred < source_len {
             let current = user_address
                 .checked_add(transferred as u64)
                 .expect("validated user-copy range cannot overflow");
             let page_address = current & !(PAGE_SIZE - 1);
             let page_offset = (current & (PAGE_SIZE - 1)) as usize;
-            let chunk_length = (PAGE_SIZE as usize - page_offset).min(source.len() - transferred);
+            let chunk_length = (PAGE_SIZE as usize - page_offset).min(source_len - transferred);
             let mapping = root
                 .mappings
                 .iter()
@@ -2626,7 +2716,7 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
             if let Err(error) = user_memory.copy_to_frame(
                 &mapping.frame,
                 page_offset,
-                &source[transferred..transferred + chunk_length],
+                &scratch[transferred..transferred + chunk_length],
             ) {
                 return Err(ProcessUserCopyFailure {
                     cause: ProcessUserCopyError::Memory(error),
@@ -2635,7 +2725,7 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
             }
             transferred += chunk_length;
         }
-        debug_assert_eq!(user_address + source.len() as u64, end);
+        debug_assert_eq!(user_address + source_len as u64, end);
         Ok(transferred)
     }
 
@@ -2742,6 +2832,7 @@ impl<'share, 'kernel, 'memory, M: CandidatePageTableMemory>
                         virtual_address: mapping.virtual_address,
                         frame: error.frame,
                         writable: mapping.writable,
+                        executable: mapping.executable,
                     });
                     return Err(ProcessRootDestroyError::Frame(error.error));
                 }
@@ -2817,6 +2908,49 @@ fn rollback_process_tables<P: Copy>(
         }
     }
     retained
+}
+
+fn validate_user_entry_mappings<P: Copy>(
+    root: &ProcessRoot<P>,
+    config: PageWalkConfig,
+    instruction_pointer: u64,
+    stack_pointer: u64,
+) -> Result<(), ProcessUserEntryError> {
+    let lower_half_end = 1u64 << (config.virtual_address_bits - 1);
+    if instruction_pointer >= lower_half_end
+        || !is_canonical_virtual_address(instruction_pointer, config.virtual_address_bits)
+    {
+        return Err(ProcessUserEntryError::InvalidInstructionPointer);
+    }
+    let instruction_page = instruction_pointer & !(PAGE_SIZE - 1);
+    let entry_mapping = root
+        .mappings
+        .iter()
+        .flatten()
+        .find(|mapping| mapping.virtual_address == instruction_page)
+        .ok_or(ProcessUserEntryError::EntryUnmapped)?;
+    if !entry_mapping.executable || entry_mapping.writable {
+        return Err(ProcessUserEntryError::EntryPermissionDenied);
+    }
+
+    let stack_last_byte = stack_pointer
+        .checked_sub(1)
+        .filter(|address| {
+            *address < lower_half_end
+                && is_canonical_virtual_address(*address, config.virtual_address_bits)
+        })
+        .ok_or(ProcessUserEntryError::InvalidStackPointer)?;
+    let stack_page = stack_last_byte & !(PAGE_SIZE - 1);
+    let stack_mapping = root
+        .mappings
+        .iter()
+        .flatten()
+        .find(|mapping| mapping.virtual_address == stack_page)
+        .ok_or(ProcessUserEntryError::StackUnmapped)?;
+    if !stack_mapping.writable || stack_mapping.executable {
+        return Err(ProcessUserEntryError::StackPermissionDenied);
+    }
+    Ok(())
 }
 
 fn validate_process_user_range<P: Copy>(
@@ -3112,7 +3246,11 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
 
         let indexes = page_table_indexes(virtual_address, self.config.levels);
         let mut table_slot = 0;
-        for depth in 0..usize::from(self.config.levels) {
+        for (depth, index) in indexes
+            .iter()
+            .enumerate()
+            .take(usize::from(self.config.levels))
+        {
             let level_number = self.config.levels - depth as u8;
             let Some(table) = self.tables[table_slot].as_ref() else {
                 return Err(CandidatePermissionError::InvalidIntermediateEntry);
@@ -3121,7 +3259,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                 return Err(CandidatePermissionError::InvalidIntermediateEntry);
             };
             let entry = self
-                .read_table_entry(prepared, indexes[depth])
+                .read_table_entry(prepared, *index)
                 .map_err(CandidatePermissionError::TableMemory)?;
             if entry & PTE_PRESENT == 0 {
                 return Err(CandidatePermissionError::NotPresent);
@@ -3149,7 +3287,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                 }
                 // SAFETY: This is a cloned candidate-owned table and the leaf
                 // index was derived from the aligned canonical virtual address.
-                unsafe { self.memory.write_entry(prepared, indexes[depth], updated) };
+                unsafe { self.memory.write_entry(prepared, *index, updated) };
                 return Ok(());
             }
 
@@ -3158,7 +3296,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                     allocator,
                     table_slot,
                     prepared,
-                    indexes[depth],
+                    *index,
                     entry,
                     level_number,
                 )?;
@@ -3567,7 +3705,11 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
         let mut existing_parents = [(0usize, 0u16, 0u64); 4];
         let mut existing_parent_count = 0;
 
-        for depth in 0..usize::from(self.config.levels) {
+        for (depth, index) in indexes
+            .iter()
+            .enumerate()
+            .take(usize::from(self.config.levels))
+        {
             let level_number = usize::from(self.config.levels) - depth;
             let Some(table) = self.tables[current_table_slot].as_ref() else {
                 fail!(CandidateMapErrorKind::InvalidIntermediateEntry, 0);
@@ -3575,7 +3717,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
             let Some(prepared) = table.prepared else {
                 fail!(CandidateMapErrorKind::InvalidIntermediateEntry, 0);
             };
-            let entry = match self.read_table_entry(prepared, indexes[depth]) {
+            let entry = match self.read_table_entry(prepared, *index) {
                 Ok(entry) => entry,
                 Err(error) => fail!(CandidateMapErrorKind::TableMemory(error), 0),
             };
@@ -3611,7 +3753,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
             }) else {
                 fail!(CandidateMapErrorKind::UnownedIntermediateTable, 0);
             };
-            existing_parents[existing_parent_count] = (current_table_slot, indexes[depth], entry);
+            existing_parents[existing_parent_count] = (current_table_slot, *index, entry);
             existing_parent_count += 1;
             current_table_slot = child_slot;
         }
@@ -3809,7 +3951,11 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
 
         let indexes = page_table_indexes(virtual_address, self.config.levels);
         let mut current_table_slot = 0;
-        for depth in 0..usize::from(self.config.levels) {
+        for (depth, index) in indexes
+            .iter()
+            .enumerate()
+            .take(usize::from(self.config.levels))
+        {
             let level_number = usize::from(self.config.levels) - depth;
             let Some(table) = self.tables[current_table_slot].as_ref() else {
                 return Err(CandidateUnmapError::InvalidIntermediateEntry);
@@ -3818,7 +3964,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                 return Err(CandidateUnmapError::InvalidIntermediateEntry);
             };
             let entry = self
-                .read_table_entry(prepared, indexes[depth])
+                .read_table_entry(prepared, *index)
                 .map_err(CandidateUnmapError::TableMemory)?;
             if entry & PTE_PRESENT == 0 {
                 return Err(CandidateUnmapError::OwnershipMismatch);
@@ -3832,7 +3978,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
                 }
                 // SAFETY: `prepared` belongs to this candidate-owned table and
                 // `indexes[depth]` was derived from the aligned virtual address.
-                unsafe { self.memory.write_entry(prepared, indexes[depth], 0) };
+                unsafe { self.memory.write_entry(prepared, *index, 0) };
                 if active_operation {
                     // SAFETY: The active-unmap API requires this root to be
                     // current and serializes local page-table users. Invalidate
@@ -3934,6 +4080,7 @@ impl<'memory, M: CandidatePageTableMemory> CandidatePageTables<'memory, M> {
     /// Return all held frames to the allocator. Active roots are never released.
     /// On frame-release failure, returns the still-owned candidate so the caller
     /// can retry; it is permanently unavailable for mapping once release begins.
+    #[allow(clippy::result_large_err)] // The error retains frame ownership without allocation.
     pub fn release(
         mut self,
         allocator: &mut FrameAllocator,
@@ -4257,9 +4404,9 @@ mod tests {
         MtrrError, MtrrLayout, MtrrMemoryType, MtrrRegisterPair, MtrrRegisters, MtrrState,
         PageLevel, PagePermissions, PageTableEntryError, PageTableReader, PageTranslation,
         PageWalkConfig, PageWalkError, PageWalkOutcome, PatLayout, ProcessAddressSpaceRoots,
-        ProcessRootCreateErrorKind, ProcessRootDestroyError, ValidatedMappingRange, VariableMtrr,
-        MAX_CANDIDATE_MAPPINGS, MAX_CANDIDATE_PAGE_TABLE_PAGES, MAX_CAPTURED_VARIABLE_MTRRS,
-        PAGE_SIZE,
+        ProcessRootCreateErrorKind, ProcessRootDestroyError, ProcessUserEntryError,
+        ValidatedMappingRange, VariableMtrr, MAX_CANDIDATE_MAPPINGS,
+        MAX_CANDIDATE_PAGE_TABLE_PAGES, MAX_CAPTURED_VARIABLE_MTRRS, PAGE_SIZE,
     };
     use core::cell::Cell;
 
@@ -4481,16 +4628,19 @@ mod tests {
         MissingFrame,
         OutOfBounds,
         Capacity,
+        InjectedFault,
     }
 
     struct SyntheticUserMemory {
         pages: [Option<SyntheticUserPage>; 4],
+        fail_reads_of: Option<u64>,
     }
 
     impl SyntheticUserMemory {
         fn new() -> Self {
             Self {
                 pages: core::array::from_fn(|_| None),
+                fail_reads_of: None,
             }
         }
 
@@ -4521,6 +4671,9 @@ mod tests {
                 .checked_add(destination.len())
                 .filter(|end| *end <= PAGE_SIZE as usize)
                 .ok_or(SyntheticUserMemoryError::OutOfBounds)?;
+            if self.fail_reads_of == Some(frame.address()) {
+                return Err(SyntheticUserMemoryError::InjectedFault);
+            }
             let page = self
                 .pages
                 .iter()
@@ -4541,14 +4694,63 @@ mod tests {
                 .checked_add(source.len())
                 .filter(|end| *end <= PAGE_SIZE as usize)
                 .ok_or(SyntheticUserMemoryError::OutOfBounds)?;
-            let page = self
+            let slot = self
                 .pages
-                .iter_mut()
-                .flatten()
-                .find(|page| page.physical == frame.address())
-                .ok_or(SyntheticUserMemoryError::MissingFrame)?;
+                .iter()
+                .position(|page| {
+                    page.as_ref()
+                        .is_some_and(|page| page.physical == frame.address())
+                })
+                .or_else(|| self.pages.iter().position(Option::is_none))
+                .ok_or(SyntheticUserMemoryError::Capacity)?;
+            if self.pages[slot].is_none() {
+                self.pages[slot] = Some(SyntheticUserPage {
+                    physical: frame.address(),
+                    bytes: [0; PAGE_SIZE as usize],
+                });
+            }
+            let page = self.pages[slot]
+                .as_mut()
+                .expect("synthetic frame slot was initialized");
             page.bytes[offset..end].copy_from_slice(source);
             Ok(())
+        }
+    }
+
+    struct SyntheticConsoleOutput {
+        bytes: [u8; 16],
+        written: usize,
+        max_write: usize,
+        stream: Option<crate::syscall::ConsoleStream>,
+    }
+
+    impl SyntheticConsoleOutput {
+        fn new(max_write: usize) -> Self {
+            Self {
+                bytes: [0; 16],
+                written: 0,
+                max_write,
+                stream: None,
+            }
+        }
+    }
+
+    impl crate::syscall::ConsoleOutput for SyntheticConsoleOutput {
+        type Error = ();
+
+        fn write(
+            &mut self,
+            stream: crate::syscall::ConsoleStream,
+            bytes: &[u8],
+        ) -> Result<usize, Self::Error> {
+            let count = bytes
+                .len()
+                .min(self.max_write)
+                .min(self.bytes.len().saturating_sub(self.written));
+            self.bytes[self.written..self.written + count].copy_from_slice(&bytes[..count]);
+            self.written += count;
+            self.stream = Some(stream);
+            Ok(count)
         }
     }
 
@@ -4562,6 +4764,7 @@ mod tests {
         FrameAllocator::from_memory_map(&map).unwrap()
     }
 
+    #[allow(clippy::drop_non_drop)]
     #[test]
     fn process_roots_share_sanitized_kernel_entries_and_release_only_private_roots() {
         for levels in [4, 5] {
@@ -4676,6 +4879,243 @@ mod tests {
         }
     }
 
+    #[allow(clippy::drop_non_drop)]
+    #[test]
+    fn parsed_elf_page_population_maps_into_process_root_and_copies_back() {
+        let mut elf_bytes = [0; 0x2000];
+        elf_bytes[..4].copy_from_slice(b"\x7fELF");
+        elf_bytes[4] = 2;
+        elf_bytes[5] = 1;
+        elf_bytes[6] = 1;
+        elf_bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf_bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf_bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf_bytes[24..32].copy_from_slice(&0x4000_0000u64.to_le_bytes());
+        elf_bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf_bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf_bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf_bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        elf_bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+        elf_bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
+        elf_bytes[72..80].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf_bytes[80..88].copy_from_slice(&0x4000_0000u64.to_le_bytes());
+        elf_bytes[96..104].copy_from_slice(&16u64.to_le_bytes());
+        elf_bytes[104..112].copy_from_slice(&(PAGE_SIZE * 2).to_le_bytes());
+        elf_bytes[112..120].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+        elf_bytes[0x1000..0x1010].fill(0x90);
+        let image = crate::elf::Elf64Image::parse(&elf_bytes, 48).unwrap();
+
+        let config = four_level_walk_config();
+        let mut allocator = candidate_allocator(32);
+        let initial_free_frames = allocator.free_frames();
+        let mut kernel_memory = CandidateTestMemory::new();
+        let mut kernel =
+            CandidatePageTables::new(&mut allocator, &mut kernel_memory, config).unwrap();
+        kernel
+            .clone_inherited_hierarchy(
+                &mut allocator,
+                &SyntheticReader::new(),
+                parse_cr3_root(0x8000, Some(40), false).unwrap(),
+            )
+            .unwrap();
+        let shared = kernel.share_supervisor_kernel_half().unwrap();
+        let mut process_memory = CandidateTestMemory::new();
+        let mut roots =
+            ProcessAddressSpaceRoots::new(&shared, &mut process_memory, config).unwrap();
+        let process = roots.create(&mut allocator).unwrap();
+        let pat = PatLayout::from_msr_value(0x0606_0606_0606_0606).unwrap();
+        let mtrrs = empty_mtrr_registers(0, (1 << 11) | MtrrMemoryType::WriteBack as u64)
+            .validated_layout(40)
+            .unwrap();
+        let mut user_memory = SyntheticUserMemory::new();
+        let loaded = image
+            .load_into_process_root(
+                &mut roots,
+                &mut allocator,
+                process,
+                &mut user_memory,
+                |mapping| {
+                    mapping.select_cache_attributes(CachePolicy::WriteBack, pat, &mtrrs, true)
+                },
+            )
+            .unwrap();
+        assert_eq!(loaded.entry_point, 0x4000_0000);
+        assert_eq!(loaded.mapped_pages, 2);
+
+        let segment = image.segments().next().unwrap();
+        let mut copied = [0; 16];
+        // SAFETY: `copied` is stack storage and is disjoint from the synthetic
+        // user-frame backend used by this test.
+        assert_eq!(
+            unsafe {
+                roots.copy_from_user(
+                    process,
+                    segment.virtual_start(),
+                    &mut copied,
+                    &mut user_memory,
+                )
+            },
+            Ok(16)
+        );
+        assert_eq!(copied, [0x90; 16]);
+        let mut bss = [0xff; 16];
+        // SAFETY: `bss` is stack storage disjoint from the synthetic user frames.
+        assert_eq!(
+            unsafe {
+                roots.copy_from_user(
+                    process,
+                    segment.virtual_start() + PAGE_SIZE,
+                    &mut bss,
+                    &mut user_memory,
+                )
+            },
+            Ok(16)
+        );
+        assert_eq!(bss, [0; 16]);
+        let mut console = SyntheticConsoleOutput::new(8);
+        // SAFETY: The kernel test stack is separate from allocator-owned synthetic user frames.
+        assert_eq!(
+            unsafe {
+                crate::syscall::write_user_buffer(
+                    &roots,
+                    process,
+                    1,
+                    segment.virtual_start(),
+                    16,
+                    &mut user_memory,
+                    &mut console,
+                )
+            },
+            Ok(8)
+        );
+        assert_eq!(console.stream, Some(crate::syscall::ConsoleStream::Stdout));
+        assert_eq!(console.written, 8);
+        assert_eq!(console.bytes[..8], [0x90; 8]);
+        // A valid descriptor with zero length returns before inspecting its pointer.
+        // SAFETY: No user memory is accessed for a zero-length write.
+        assert_eq!(
+            unsafe {
+                crate::syscall::write_user_buffer(
+                    &roots,
+                    process,
+                    1,
+                    u64::MAX,
+                    0,
+                    &mut user_memory,
+                    &mut console,
+                )
+            },
+            Ok(0)
+        );
+        // The descriptor is still checked for a zero-length request.
+        // SAFETY: An invalid descriptor is rejected before user memory is accessed.
+        assert_eq!(
+            unsafe {
+                crate::syscall::write_user_buffer(
+                    &roots,
+                    process,
+                    3,
+                    u64::MAX,
+                    0,
+                    &mut user_memory,
+                    &mut console,
+                )
+            },
+            Err(crate::syscall::SyscallError::BadFileDescriptor)
+        );
+        // SAFETY: The kernel test stack is separate from allocator-owned synthetic user frames.
+        assert_eq!(
+            unsafe {
+                crate::syscall::write_user_buffer(
+                    &roots,
+                    process,
+                    2,
+                    u64::MAX,
+                    1,
+                    &mut user_memory,
+                    &mut console,
+                )
+            },
+            Err(crate::syscall::SyscallError::Fault)
+        );
+        assert_eq!(console.written, 8);
+        let second_page_physical = user_memory.pages[1]
+            .as_ref()
+            .expect("ELF loader populated the second page")
+            .physical;
+        user_memory.fail_reads_of = Some(second_page_physical);
+        let mut partial_console = SyntheticConsoleOutput::new(16);
+        // SAFETY: The kernel test stack is separate from allocator-owned synthetic user frames.
+        assert_eq!(
+            unsafe {
+                crate::syscall::write_user_buffer(
+                    &roots,
+                    process,
+                    2,
+                    segment.virtual_start() + PAGE_SIZE - 8,
+                    16,
+                    &mut user_memory,
+                    &mut partial_console,
+                )
+            },
+            Ok(8)
+        );
+        assert_eq!(
+            partial_console.stream,
+            Some(crate::syscall::ConsoleStream::Stderr)
+        );
+        assert_eq!(partial_console.written, 8);
+        assert_eq!(partial_console.bytes[..8], [0; 8]);
+        user_memory.fail_reads_of = None;
+        // SAFETY: The literal is kernel storage disjoint from the synthetic frame.
+        assert_eq!(
+            unsafe { roots.copy_to_user(process, segment.virtual_start(), b"x", &mut user_memory) },
+            Err(super::ProcessUserCopyFailure {
+                cause: super::ProcessUserCopyError::PermissionDenied,
+                transferred: 0,
+            })
+        );
+
+        roots.destroy(&mut allocator, process).unwrap();
+
+        let failed_process = roots.create(&mut allocator).unwrap();
+        let mut cache_policy_calls = 0;
+        let failure = image
+            .load_into_process_root(
+                &mut roots,
+                &mut allocator,
+                failed_process,
+                &mut user_memory,
+                |mapping| {
+                    let call = cache_policy_calls;
+                    cache_policy_calls += 1;
+                    if call == 1 {
+                        Err("synthetic cache-policy failure")
+                    } else {
+                        mapping
+                            .select_cache_attributes(CachePolicy::WriteBack, pat, &mtrrs, true)
+                            .map_err(|_| "cache-policy selection failed")
+                    }
+                },
+            )
+            .unwrap_err();
+        assert_eq!(cache_policy_calls, 2);
+        assert_eq!(failure.mapped_pages, 1);
+        assert_eq!(failure.rollback_retained_table_frames, 0);
+        assert_eq!(
+            failure.cause,
+            crate::elf::ElfLoadError::CachePolicy("synthetic cache-policy failure")
+        );
+        allocator.deallocate(failure.frame.unwrap()).unwrap();
+        roots.destroy(&mut allocator, failed_process).unwrap();
+
+        drop(roots);
+        drop(shared);
+        kernel.release(&mut allocator).unwrap();
+        assert_eq!(allocator.free_frames(), initial_free_frames);
+    }
+
+    #[allow(clippy::drop_non_drop)]
     #[test]
     fn process_user_copy_helpers_validate_ranges_and_cross_page_boundaries() {
         let config = four_level_walk_config();
@@ -4759,33 +5199,42 @@ mod tests {
             .unwrap();
 
         let source = *b"abcdef";
-        assert_eq!(
-            roots.copy_to_user(process, 0x4000_0ffd, &source, &mut user_memory),
-            Ok(6)
-        );
+        // SAFETY: `source` is stack storage, disjoint from synthetic user frames.
+        let written =
+            unsafe { roots.copy_to_user(process, 0x4000_0ffd, &source, &mut user_memory) };
+        assert_eq!(written, Ok(6));
         let mut copied = [0; 6];
-        assert_eq!(
-            roots.copy_from_user(process, 0x4000_0ffd, &mut copied, &mut user_memory),
-            Ok(6)
-        );
+        // SAFETY: `copied` is stack storage, disjoint from synthetic user frames.
+        let read =
+            unsafe { roots.copy_from_user(process, 0x4000_0ffd, &mut copied, &mut user_memory) };
+        assert_eq!(read, Ok(6));
         assert_eq!(copied, source);
+        // SAFETY: The stack literal is disjoint from synthetic user frames.
+        let readonly_write =
+            unsafe { roots.copy_to_user(process, 0x4000_2000, b"x", &mut user_memory) };
         assert_eq!(
-            roots.copy_to_user(process, 0x4000_2000, b"x", &mut user_memory),
+            readonly_write,
             Err(super::ProcessUserCopyFailure {
                 cause: super::ProcessUserCopyError::PermissionDenied,
                 transferred: 0,
             })
         );
         let mut invalid = [0; 2];
+        // SAFETY: `invalid` is stack storage, disjoint from synthetic user frames.
+        let missing_read =
+            unsafe { roots.copy_from_user(process, 0x4000_2fff, &mut invalid, &mut user_memory) };
         assert_eq!(
-            roots.copy_from_user(process, 0x4000_2fff, &mut invalid, &mut user_memory),
+            missing_read,
             Err(super::ProcessUserCopyFailure {
                 cause: super::ProcessUserCopyError::Unmapped,
                 transferred: 0,
             })
         );
+        // SAFETY: `invalid` is stack storage, disjoint from synthetic user frames.
+        let overflow_read =
+            unsafe { roots.copy_from_user(process, u64::MAX - 1, &mut invalid, &mut user_memory) };
         assert_eq!(
-            roots.copy_from_user(process, u64::MAX - 1, &mut invalid, &mut user_memory),
+            overflow_read,
             Err(super::ProcessUserCopyFailure {
                 cause: super::ProcessUserCopyError::InvalidRange,
                 transferred: 0,
@@ -4798,6 +5247,120 @@ mod tests {
         kernel.release(&mut allocator).unwrap();
     }
 
+    #[allow(clippy::drop_non_drop)]
+    #[test]
+    fn process_initial_user_state_requires_executable_code_and_writable_nx_stack() {
+        let config = four_level_walk_config();
+        let mut allocator = candidate_allocator(20);
+        let mut kernel_memory = CandidateTestMemory::new();
+        let mut kernel =
+            CandidatePageTables::new(&mut allocator, &mut kernel_memory, config).unwrap();
+        kernel
+            .clone_inherited_hierarchy(
+                &mut allocator,
+                &SyntheticReader::new(),
+                parse_cr3_root(0x8000, Some(40), false).unwrap(),
+            )
+            .unwrap();
+        let shared = kernel.share_supervisor_kernel_half().unwrap();
+        let mut process_memory = CandidateTestMemory::new();
+        let mut roots =
+            ProcessAddressSpaceRoots::new(&shared, &mut process_memory, config).unwrap();
+        let process = roots.create(&mut allocator).unwrap();
+
+        let code_frame = allocator.allocate().unwrap();
+        let (mapping, cache_attributes) = candidate_mapping(
+            &code_frame,
+            0x4000_0000,
+            PagePermissions {
+                writable: false,
+                executable: true,
+                user_accessible: true,
+            },
+        );
+        roots
+            .map_user_page(
+                &mut allocator,
+                process,
+                code_frame,
+                mapping,
+                cache_attributes,
+            )
+            .unwrap();
+
+        let stack_frame = allocator.allocate().unwrap();
+        let (mapping, cache_attributes) = candidate_mapping(
+            &stack_frame,
+            0x8000_0000,
+            PagePermissions {
+                writable: true,
+                executable: false,
+                user_accessible: true,
+            },
+        );
+        roots
+            .map_user_page(
+                &mut allocator,
+                process,
+                stack_frame,
+                mapping,
+                cache_attributes,
+            )
+            .unwrap();
+
+        assert_eq!(
+            roots.validate_initial_user_state(process, 0x4000_0080, 0x8000_0ff0),
+            Ok(())
+        );
+        assert_eq!(
+            roots.validate_initial_user_state(process, u64::MAX, 0x8000_0ff0),
+            Err(ProcessUserEntryError::InvalidInstructionPointer)
+        );
+        assert_eq!(
+            roots.validate_initial_user_state(process, 0x5000_0000, 0x8000_0ff0),
+            Err(ProcessUserEntryError::EntryUnmapped)
+        );
+        assert_eq!(
+            roots.validate_initial_user_state(process, 0x8000_0000, 0x8000_0ff0),
+            Err(ProcessUserEntryError::EntryPermissionDenied)
+        );
+        assert_eq!(
+            roots.validate_initial_user_state(process, 0x4000_0080, 0),
+            Err(ProcessUserEntryError::InvalidStackPointer)
+        );
+        assert_eq!(
+            roots.validate_initial_user_state(process, 0x4000_0080, 0x6000_0001),
+            Err(ProcessUserEntryError::StackUnmapped)
+        );
+        assert_eq!(
+            roots.validate_initial_user_state(process, 0x4000_0080, 0x4000_0ff0),
+            Err(ProcessUserEntryError::StackPermissionDenied)
+        );
+
+        // SAFETY: This test models installing `process` in CR3 before attempting
+        // to validate a new initial user frame.
+        unsafe { roots.mark_active(process).unwrap() };
+        assert_eq!(
+            roots.validate_initial_user_state(process, 0x4000_0080, 0x8000_0ff0),
+            Err(ProcessUserEntryError::ActiveRoot)
+        );
+        assert_eq!(
+            roots.validate_user_return_state(process, 0x4000_0080, 0x8000_0ff0),
+            Ok(())
+        );
+        assert_eq!(
+            roots.validate_user_return_state(process, 0x5000_0000, 0x8000_0ff0),
+            Err(ProcessUserEntryError::EntryUnmapped)
+        );
+        // SAFETY: The test models switching away from the root before teardown.
+        unsafe { roots.mark_inactive(process).unwrap() };
+        roots.destroy(&mut allocator, process).unwrap();
+        drop(roots);
+        drop(shared);
+        kernel.release(&mut allocator).unwrap();
+    }
+
+    #[allow(clippy::drop_non_drop)]
     #[test]
     fn process_root_prepare_failure_returns_the_frame_without_publishing_a_root() {
         let config = four_level_walk_config();
@@ -5958,13 +6521,7 @@ mod tests {
             Err(EffectiveMemoryTypeError::UnalignedRange)
         );
         assert_eq!(
-            layout.select_pat_index_for_range(
-                u64::MAX & !(PAGE_SIZE - 1),
-                PAGE_SIZE,
-                pat,
-                requested,
-                true,
-            ),
+            layout.select_pat_index_for_range(!(PAGE_SIZE - 1), PAGE_SIZE, pat, requested, true,),
             Err(EffectiveMemoryTypeError::AddressOverflow)
         );
         assert_eq!(
@@ -6577,8 +7134,8 @@ mod tests {
         };
         assert_eq!(neighbor.physical_address, 0x20_2000);
         assert_eq!(neighbor.page_size, PAGE_SIZE);
-        assert_eq!(neighbor.permissions.writable, true);
-        assert_eq!(neighbor.permissions.executable, true);
+        assert!(neighbor.permissions.writable);
+        assert!(neighbor.permissions.executable);
         assert_eq!(neighbor.pat_index, 4);
 
         candidate.release(&mut allocator).unwrap();

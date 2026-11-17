@@ -178,7 +178,7 @@ impl<const MAX_ALLOCATIONS: usize> FrameBackedHeap<MAX_ALLOCATIONS> {
             .and_then(|bytes| base.checked_add(bytes));
         if self.map_pages.is_some()
             || base == 0
-            || base % PAGE_BYTES != 0
+            || !base.is_multiple_of(PAGE_BYTES)
             || capacity_pages == 0
             || capacity.is_none()
         {
@@ -195,6 +195,11 @@ impl<const MAX_ALLOCATIONS: usize> FrameBackedHeap<MAX_ALLOCATIONS> {
         Ok(())
     }
 
+    fn seal_growth(&mut self) {
+        self.context = core::ptr::null_mut();
+        self.map_pages = None;
+    }
+
     fn contains_pointer(&self, pointer: usize) -> bool {
         self.capacity_pages
             .checked_mul(PAGE_BYTES)
@@ -206,7 +211,6 @@ impl<const MAX_ALLOCATIONS: usize> FrameBackedHeap<MAX_ALLOCATIONS> {
         if layout.size() == 0 {
             return Err(HeapError::ZeroSizedAllocation);
         }
-        let map_pages = self.map_pages.ok_or(HeapError::OutOfMemory)?;
         let slot = self
             .allocations
             .iter()
@@ -223,6 +227,7 @@ impl<const MAX_ALLOCATIONS: usize> FrameBackedHeap<MAX_ALLOCATIONS> {
             .ok_or(HeapError::AddressOverflow)?
             / PAGE_BYTES;
         if required_pages > self.mapped_pages {
+            let map_pages = self.map_pages.ok_or(HeapError::OutOfMemory)?;
             let first_page = self.mapped_pages;
             let page_count = required_pages - first_page;
             // SAFETY: Configuration is unsafe at the public boundary. The
@@ -372,8 +377,29 @@ impl<const HEAP_SIZE: usize, const MAX_ALLOCATIONS: usize> LockedHeap<HEAP_SIZE,
         growth.configure(base, capacity_pages, context, map_pages)
     }
 
+    /// Disable future frame-backed growth while retaining already-mapped pages and allocations.
+    ///
+    /// This also clears the callback context pointer, ending the heap's ownership
+    /// dependency on the page-table owner. Call before creating shared process
+    /// roots that immutably borrow that owner. Allocations fitting in currently
+    /// mapped heap pages continue to work; requests requiring new pages fail.
+    pub fn seal_frame_backed_growth(&self) {
+        let _lock = self.acquire();
+        // SAFETY: The IRQ-save lock gives exclusive access to growth metadata and
+        // waits for any synchronous mapping callback to finish before clearing it.
+        unsafe { &mut *self.growth.get() }.seal_growth();
+    }
+
     fn acquire(&self) -> IrqSpinLockGuard<'_, ()> {
         self.lock.lock()
+    }
+}
+
+impl<const HEAP_SIZE: usize, const MAX_ALLOCATIONS: usize> Default
+    for LockedHeap<HEAP_SIZE, MAX_ALLOCATIONS>
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -428,10 +454,10 @@ unsafe impl<const HEAP_SIZE: usize, const MAX_ALLOCATIONS: usize> GlobalAlloc
 
 #[cfg(test)]
 mod tests {
-    use core::alloc::Layout;
+    use core::alloc::{GlobalAlloc, Layout};
     use core::assert_eq;
 
-    use super::{FixedHeap, FrameBackedHeap, HeapError, PAGE_BYTES};
+    use super::{FixedHeap, FrameBackedHeap, HeapError, LockedHeap, PAGE_BYTES};
 
     #[repr(align(4096))]
     struct TestRegion([u8; PAGE_BYTES * 2]);
@@ -549,6 +575,60 @@ mod tests {
         assert_eq!(reused, allocation);
         assert_eq!(trace.mapped_pages, 2);
         heap.deallocate(reused, layout).unwrap();
+    }
+
+    #[test]
+    fn sealing_frame_backed_growth_keeps_mapped_pages_and_releases_context() {
+        let mut region = TestRegion([0; PAGE_BYTES * 2]);
+        let mut trace = MapTrace::default();
+        let heap = LockedHeap::<128, 4>::new();
+        let bootstrap_layout = Layout::from_size_align(128, 1).unwrap();
+        let growth_layout = Layout::from_size_align(8, 1).unwrap();
+        // SAFETY: `region` and `trace` remain alive and uniquely used throughout
+        // the test; the mapper records a complete successful mapping.
+        unsafe {
+            heap.initialize_frame_backed_region(
+                region.0.as_mut_ptr() as usize,
+                2,
+                core::ptr::addr_of_mut!(trace).cast(),
+                test_map_pages,
+            )
+        }
+        .unwrap();
+        // SAFETY: Layouts are nonzero and the heap was initialized above.
+        let bootstrap = unsafe { GlobalAlloc::alloc(&heap, bootstrap_layout) };
+        // SAFETY: Layouts are nonzero and the configured mapper has a live context.
+        let first_growth = unsafe { GlobalAlloc::alloc(&heap, growth_layout) };
+        assert!(!bootstrap.is_null());
+        assert!(!first_growth.is_null());
+        assert_eq!(trace.mapped_pages, 1);
+
+        heap.seal_frame_backed_growth();
+        // SAFETY: The wrapper is exclusively used in this test after sealing.
+        let growth = unsafe { &*heap.growth.get() };
+        assert!(growth.map_pages.is_none());
+        assert!(growth.context.is_null());
+
+        // SAFETY: `first_growth` is a live allocation with its original layout.
+        unsafe { GlobalAlloc::dealloc(&heap, first_growth, growth_layout) };
+        // Already-mapped pages remain available after the callback is severed.
+        // SAFETY: Layout is nonzero and reuses the released mapped range.
+        let reused_growth = unsafe { GlobalAlloc::alloc(&heap, growth_layout) };
+        assert!(!reused_growth.is_null());
+        assert_eq!(trace.mapped_pages, 1);
+
+        let beyond_mapped_layout = Layout::from_size_align(PAGE_BYTES + 1, 1).unwrap();
+        // SAFETY: The request is bounded but exceeds the two-page test region;
+        // after sealing, required growth is rejected without calling the mapper.
+        let beyond_mapped = unsafe { GlobalAlloc::alloc(&heap, beyond_mapped_layout) };
+        assert!(beyond_mapped.is_null());
+        assert_eq!(trace.mapped_pages, 1);
+
+        // SAFETY: Both returned pointers are live allocations with matching layouts.
+        unsafe {
+            GlobalAlloc::dealloc(&heap, reused_growth, growth_layout);
+            GlobalAlloc::dealloc(&heap, bootstrap, bootstrap_layout);
+        }
     }
 
     #[test]

@@ -156,8 +156,7 @@ impl FrameAllocator {
             for &(exclusion_start, exclusion_end) in exclusions {
                 let mut next = [(0u64, 0u64); MAX_PIECES];
                 let mut next_count = 0usize;
-                for piece_index in 0..piece_count {
-                    let (piece_start, piece_end) = pieces[piece_index];
+                for &(piece_start, piece_end) in pieces.iter().take(piece_count) {
                     if exclusion_end <= piece_start || exclusion_start >= piece_end {
                         next[next_count] = (piece_start, piece_end);
                         next_count += 1;
@@ -176,8 +175,7 @@ impl FrameAllocator {
                 piece_count = next_count;
             }
 
-            for piece_index in 0..piece_count {
-                let (piece_start, piece_end) = pieces[piece_index];
+            for &(piece_start, piece_end) in pieces.iter().take(piece_count) {
                 let Some(start) = piece_start
                     .checked_add(FRAME_SIZE - 1)
                     .map(|address| address & page_mask)

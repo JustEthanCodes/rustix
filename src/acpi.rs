@@ -197,7 +197,7 @@ impl<'a> RootPointerTable<'a> {
             _ => return Err(AcpiError::NotRootPointerTable),
         };
         let payload_length = table.bytes.len() - SDT_HEADER_SIZE;
-        if payload_length % entry_width != 0 {
+        if !payload_length.is_multiple_of(entry_width) {
             return Err(AcpiError::InvalidRootPointerTableLength);
         }
         let entry_count = payload_length / entry_width;

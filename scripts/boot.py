@@ -294,6 +294,7 @@ def smoke_test(
     output = serial_log.read_text(encoding="latin-1") if serial_log.exists() else ""
     expected = (
         "Rustix kernel: x86_64 Rust bootstrap",
+        "bundled init ELF validated: entry=",
         "kernel HHDM aliases validated: text/rodata R/NX, data RW/NX, PAT preserved",
         "page-table transition passed:",
         "kernel heap probe passed: bootstrap exhaustion, frame-backed growth, reuse",
@@ -685,6 +686,99 @@ def frame_smoke_workflow(timeout: int) -> None:
     print("Restored the default release kernel and ISO after the HHDM frame probe.")
 
 
+def process_smoke_workflow(timeout: int) -> None:
+    failure: BuildError | OSError | subprocess.SubprocessError | None = None
+    try:
+        build_kernel(("probe-user-process",))
+        build_image()
+        smoke_test(timeout)
+        serial_log = TARGET_DIR / "rustix-qemu-serial.log"
+        output = serial_log.read_text(encoding="latin-1") if serial_log.exists() else ""
+        markers = (
+            "bundled init ELF validated:",
+            "rustix-init: hello from ring 3",
+            "rustix-init: invalid user buffer returned EFAULT",
+            "init process exited with status 42 and was reaped by kernel wait",
+            "Ring 3 init passed: write/EFAULT/exit syscalls, kernel wait, and process-root teardown",
+        )
+        missing = [marker for marker in markers if marker not in output]
+        if missing:
+            raise BuildError(
+                "QEMU did not report successful process-root validation; missing serial markers: "
+                + ", ".join(repr(marker) for marker in missing)
+                + f"\nSerial output:\n{output}"
+            )
+        print("QEMU Ring 3 init write/EFAULT/exit, kernel wait, and process-root teardown passed.")
+    except (BuildError, OSError, subprocess.SubprocessError) as error:
+        failure = error
+
+    try:
+        build_kernel()
+        build_image()
+    except (BuildError, OSError, subprocess.SubprocessError) as restore_error:
+        if failure is not None:
+            raise BuildError(
+                f"process-root workflow failed ({failure}); restoring the default image "
+                f"also failed ({restore_error})"
+            ) from restore_error
+        raise
+
+    if failure is not None:
+        raise BuildError(
+            f"process-root workflow failed; the default release image was restored: {failure}"
+        ) from failure
+    print("Restored the default release kernel and ISO after the Ring 3 init test.")
+
+
+def user_fault_smoke_workflow(timeout: int) -> None:
+    failure: BuildError | OSError | subprocess.SubprocessError | None = None
+    probes = (
+        ("probe-user-fault", 6, "invalid opcode"),
+        ("probe-user-page-fault", 14, "page fault"),
+        ("probe-user-general-protection", 13, "general protection fault"),
+        ("probe-user-divide-error", 0, "divide error"),
+    )
+    try:
+        for feature, vector, name in probes:
+            build_kernel((feature,))
+            build_image()
+            smoke_test(timeout)
+            serial_log = TARGET_DIR / "rustix-qemu-serial.log"
+            output = serial_log.read_text(encoding="latin-1") if serial_log.exists() else ""
+            markers = (
+                f"USER EXCEPTION: vector {vector} ({name})",
+                f"user fault vector {vector} exited with status {128 + vector} and was reaped by kernel wait",
+                "Ring 3 user fault passed: process exited, was waited on, and its root was torn down",
+            )
+            missing = [marker for marker in markers if marker not in output]
+            if missing:
+                raise BuildError(
+                    f"QEMU user vector {vector} did not complete process teardown; missing markers: "
+                    + ", ".join(repr(marker) for marker in missing)
+                    + f"\nSerial output:\n{output}"
+                )
+            print(f"QEMU user-mode vector {vector} ({name}) termination and teardown passed.")
+    except (BuildError, OSError, subprocess.SubprocessError) as error:
+        failure = error
+
+    try:
+        build_kernel()
+        build_image()
+    except (BuildError, OSError, subprocess.SubprocessError) as restore_error:
+        if failure is not None:
+            raise BuildError(
+                f"user-fault workflow failed ({failure}); restoring the default image "
+                f"also failed ({restore_error})"
+            ) from restore_error
+        raise
+
+    if failure is not None:
+        raise BuildError(
+            f"user-fault workflow failed; the default release image was restored: {failure}"
+        ) from failure
+    print("Restored the default release kernel and ISO after the user-fault matrix.")
+
+
 def active_map_smoke_workflow(timeout: int) -> None:
     failure: BuildError | OSError | subprocess.SubprocessError | None = None
     try:
@@ -863,6 +957,14 @@ def main() -> int:
         "frame-smoke", help="probe HHDM access and an inactive candidate root in QEMU"
     )
     frame_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
+    process_smoke = subparsers.add_parser(
+        "process-smoke", help="run bundled init in Ring 3 and verify syscall/wait/teardown"
+    )
+    process_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
+    user_fault_smoke = subparsers.add_parser(
+        "user-fault-smoke", help="terminate a Ring 3 init on #UD and verify wait/teardown"
+    )
+    user_fault_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
     active_map_smoke = subparsers.add_parser(
         "active-map-smoke", help="probe active owned-page mapping in QEMU, then restore the image"
     )
@@ -894,6 +996,14 @@ def main() -> int:
             if args.timeout <= 0:
                 raise BuildError("--timeout must be a positive number of seconds")
             frame_smoke_workflow(args.timeout)
+        elif args.command == "process-smoke":
+            if args.timeout <= 0:
+                raise BuildError("--timeout must be a positive number of seconds")
+            process_smoke_workflow(args.timeout)
+        elif args.command == "user-fault-smoke":
+            if args.timeout <= 0:
+                raise BuildError("--timeout must be a positive number of seconds")
+            user_fault_smoke_workflow(args.timeout)
         elif args.command == "active-map-smoke":
             if args.timeout <= 0:
                 raise BuildError("--timeout must be a positive number of seconds")

@@ -1272,7 +1272,7 @@ mod tests {
             Err(HhdmAddressError::UnknownPhysicalAddressWidth)
         );
         assert_eq!(
-            map.usable_hhdm_address(offset, u64::MAX & !0xfff, 0x1000, Some(64), 48),
+            map.usable_hhdm_address(offset, !0xfff, 0x1000, Some(64), 48),
             Err(HhdmAddressError::AddressOverflow)
         );
         assert_eq!(

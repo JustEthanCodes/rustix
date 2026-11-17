@@ -18,10 +18,10 @@ const CR4_OSXSAVE: u64 = 1 << 18;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CpuStateError {
-    X87Unavailable,
-    FxsaveUnavailable,
-    SseUnavailable,
-    Sse2Unavailable,
+    MissingX87,
+    MissingFxsave,
+    MissingSse,
+    MissingSse2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,16 +52,16 @@ pub struct CpuInfo {
 pub fn initialize_fpu_state() -> Result<(), CpuStateError> {
     let features = __cpuid(1).edx;
     if features & (1 << 0) == 0 {
-        return Err(CpuStateError::X87Unavailable);
+        return Err(CpuStateError::MissingX87);
     }
     if features & (1 << 24) == 0 {
-        return Err(CpuStateError::FxsaveUnavailable);
+        return Err(CpuStateError::MissingFxsave);
     }
     if features & (1 << 25) == 0 {
-        return Err(CpuStateError::SseUnavailable);
+        return Err(CpuStateError::MissingSse);
     }
     if features & (1 << 26) == 0 {
-        return Err(CpuStateError::Sse2Unavailable);
+        return Err(CpuStateError::MissingSse2);
     }
 
     let cr0 = (read_cr0_raw() | CR0_MP | CR0_NE) & !(CR0_EM | CR0_TS);

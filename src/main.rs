@@ -8,7 +8,27 @@
     all(feature = "probe-kernel-threads", feature = "inject-page-fault"),
     all(feature = "probe-kernel-threads", feature = "inject-invalid-opcode"),
     all(feature = "probe-kernel-threads", feature = "probe-hhdm-frame"),
-    all(feature = "probe-kernel-threads", feature = "probe-active-mapping")
+    all(feature = "probe-kernel-threads", feature = "probe-active-mapping"),
+    all(feature = "probe-user-process", feature = "inject-page-fault"),
+    all(feature = "probe-user-process", feature = "inject-invalid-opcode"),
+    all(feature = "probe-user-process", feature = "probe-kernel-threads"),
+    all(feature = "probe-user-process", feature = "probe-hhdm-frame"),
+    all(feature = "probe-user-process", feature = "probe-active-mapping"),
+    all(feature = "probe-user-fault", feature = "probe-user-page-fault"),
+    all(
+        feature = "probe-user-fault",
+        feature = "probe-user-general-protection"
+    ),
+    all(feature = "probe-user-fault", feature = "probe-user-divide-error"),
+    all(
+        feature = "probe-user-page-fault",
+        feature = "probe-user-general-protection"
+    ),
+    all(feature = "probe-user-page-fault", feature = "probe-user-divide-error"),
+    all(
+        feature = "probe-user-general-protection",
+        feature = "probe-user-divide-error"
+    )
 ))]
 compile_error!("opt-in QEMU diagnostic features are mutually exclusive");
 
@@ -26,6 +46,23 @@ const LOCAL_APIC_VIRTUAL_ADDRESS: u64 = 0xffff_c100_0000_0000;
 const IO_APIC_VIRTUAL_ADDRESS: u64 = LOCAL_APIC_VIRTUAL_ADDRESS + rustix_kernel::paging::PAGE_SIZE;
 const KERNEL_HEAP_GROWTH_VIRTUAL_BASE: u64 = 0xffff_c200_0000_0000;
 const KERNEL_HEAP_GROWTH_MAX_PAGES: usize = 256;
+#[cfg(target_os = "none")]
+const INIT_ELF_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rustix-init.elf"));
+#[cfg(any(
+    feature = "probe-user-fault",
+    feature = "probe-user-page-fault",
+    feature = "probe-user-general-protection",
+    feature = "probe-user-divide-error"
+))]
+const PROBE_USER_FAULT_VECTOR: u64 = if cfg!(feature = "probe-user-fault") {
+    6
+} else if cfg!(feature = "probe-user-page-fault") {
+    14
+} else if cfg!(feature = "probe-user-general-protection") {
+    13
+} else {
+    0
+};
 
 static BOOTSTRAP_TIMER_TICKS: AtomicTickCounter = AtomicTickCounter::new();
 static mut RAM_FILESYSTEM: RamFs = RamFs::new();
@@ -162,6 +199,96 @@ unsafe impl rustix_kernel::paging::CandidatePageTableMemory for LimineHhdmCandid
     }
 }
 
+#[cfg(any(feature = "probe-hhdm-frame", feature = "probe-user-process"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LimineUserFrameMemoryError {
+    OutOfBounds,
+    Address(rustix_kernel::memory::HhdmAddressError),
+}
+
+#[cfg(any(feature = "probe-hhdm-frame", feature = "probe-user-process"))]
+struct LimineHhdmUserFrameMemory<'a> {
+    memory_map: &'a rustix_kernel::memory::MemoryMap,
+    hhdm_offset: u64,
+    physical_address_bits: Option<u8>,
+    virtual_address_bits: u8,
+}
+
+#[cfg(any(feature = "probe-hhdm-frame", feature = "probe-user-process"))]
+impl LimineHhdmUserFrameMemory<'_> {
+    fn frame_slice_address(
+        &self,
+        frame: &rustix_kernel::frame::Frame,
+        offset: usize,
+        length: usize,
+    ) -> Result<*mut u8, LimineUserFrameMemoryError> {
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > rustix_kernel::frame::FRAME_SIZE as usize)
+        {
+            return Err(LimineUserFrameMemoryError::OutOfBounds);
+        }
+        if length == 0 {
+            return Ok(core::ptr::null_mut());
+        }
+
+        let base = frame
+            .hhdm_address(
+                self.memory_map,
+                self.hhdm_offset,
+                self.physical_address_bits,
+                self.virtual_address_bits,
+            )
+            .map_err(LimineUserFrameMemoryError::Address)?;
+        let address =
+            base.checked_add(offset as u64)
+                .ok_or(LimineUserFrameMemoryError::Address(
+                    rustix_kernel::memory::HhdmAddressError::AddressOverflow,
+                ))?;
+        Ok(address as *mut u8)
+    }
+}
+
+#[cfg(any(feature = "probe-hhdm-frame", feature = "probe-user-process"))]
+// SAFETY: The non-copyable Frame token and checked HHDM conversion authorize a
+// complete Usable page. Each operation checks its subrange, accesses only that
+// page, and uses raw copies rather than forming user virtual references. The
+// implementation relies on Limine's mapped-usable-memory contract; hardware
+// faults from a broken mapping remain fatal and are not recoverable here.
+unsafe impl rustix_kernel::paging::UserFrameMemory for LimineHhdmUserFrameMemory<'_> {
+    type Error = LimineUserFrameMemoryError;
+
+    fn copy_from_frame(
+        &mut self,
+        frame: &rustix_kernel::frame::Frame,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> Result<(), Self::Error> {
+        let source = self.frame_slice_address(frame, offset, destination.len())?;
+        if !destination.is_empty() {
+            // SAFETY: The frame subrange was checked and the HHDM address was
+            // validated for the full allocator-owned frame. `copy` permits overlap.
+            unsafe { core::ptr::copy(source, destination.as_mut_ptr(), destination.len()) };
+        }
+        Ok(())
+    }
+
+    fn copy_to_frame(
+        &mut self,
+        frame: &rustix_kernel::frame::Frame,
+        offset: usize,
+        source: &[u8],
+    ) -> Result<(), Self::Error> {
+        let destination = self.frame_slice_address(frame, offset, source.len())?;
+        if !source.is_empty() {
+            // SAFETY: The frame subrange was checked and the HHDM address was
+            // validated for the full allocator-owned frame. `copy` permits overlap.
+            unsafe { core::ptr::copy(source.as_ptr(), destination, source.len()) };
+        }
+        Ok(())
+    }
+}
+
 struct KernelHeapMappingContext {
     candidate: *mut (),
     allocator: *mut rustix_kernel::frame::FrameAllocator,
@@ -219,8 +346,7 @@ unsafe fn map_kernel_heap_pages(
             executable: false,
             user_accessible: false,
         };
-        let mut mapped = 0usize;
-        for page in first_page..first_page + page_count {
+        for (mapped, page) in (first_page..first_page + page_count).enumerate() {
             let virtual_address = KERNEL_HEAP_GROWTH_VIRTUAL_BASE
                 .checked_add((page as u64).checked_mul(PAGE_SIZE)?)?;
             let frame = match allocator.allocate() {
@@ -270,7 +396,6 @@ unsafe fn map_kernel_heap_pages(
                 rollback_kernel_heap_pages(candidate, allocator, first_page, mapped);
                 return None;
             }
-            mapped += 1;
         }
         Some(())
     })()
@@ -548,6 +673,29 @@ pub extern "C" fn rustix_start(entry_rsp: u64) -> ! {
             halt_forever();
         }
     };
+    if let Err(error) = arch::x86_64::interrupts::configure_user_address_width(
+        boot_info.cpu_info.active_linear_address_bits,
+    ) {
+        kprintln!("user syscall address-width setup failed: {:?}", error);
+        halt_forever();
+    }
+    #[cfg(target_os = "none")]
+    let init_image = match rustix_kernel::elf::Elf64Image::parse(
+        INIT_ELF_IMAGE,
+        boot_info.cpu_info.active_linear_address_bits,
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            kprintln!("bundled init ELF rejected: {:?}", error);
+            halt_forever();
+        }
+    };
+    #[cfg(target_os = "none")]
+    kprintln!(
+        "bundled init ELF validated: entry={:#x}, load pages={}",
+        init_image.entry_point(),
+        init_image.load_page_count()
+    );
     boot::report_boot_information(&boot_info);
 
     #[cfg(feature = "probe-hhdm-frame")]
@@ -677,14 +825,16 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
     if !harden_kernel_hhdm_aliases(
         &mut candidate,
         &mut boot_info.frame_allocator,
-        &boot_info.memory_map,
-        boot_info.hhdm_offset,
-        boot_info.cpu_info.physical_address_bits,
-        boot_info.cpu_info.active_linear_address_bits,
-        boot_info.kernel_image_segments,
-        &reader,
-        inherited_root,
-        config,
+        KernelAliasHardeningContext {
+            memory_map: &boot_info.memory_map,
+            hhdm_offset: boot_info.hhdm_offset,
+            physical_address_bits: boot_info.cpu_info.physical_address_bits,
+            virtual_address_bits: boot_info.cpu_info.active_linear_address_bits,
+            segments: boot_info.kernel_image_segments,
+            reader: &reader,
+            inherited_root,
+            config,
+        },
     ) {
         release_candidate_after_probe_failure(candidate, &mut boot_info.frame_allocator);
     }
@@ -1041,6 +1191,63 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
         }
     }
     probe_kernel_heap();
+
+    #[cfg(feature = "probe-user-process")]
+    {
+        let probe_flags: u64;
+        // SAFETY: This is the single-vCPU bootstrap path; retain IF for restoration.
+        unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) probe_flags) };
+        KERNEL_HEAP.seal_frame_backed_growth();
+
+        let probe_result = probe_user_process_root(
+            &candidate,
+            &boot_info.memory_map,
+            &mut boot_info.frame_allocator,
+            &boot_info.cpu_info,
+            boot_info.hhdm_offset,
+            config,
+        );
+        // SAFETY: The process root set and its shared borrow are dropped before
+        // returning from the probe. The candidate and callback context remain live.
+        if let Err(error) = unsafe {
+            KERNEL_HEAP.initialize_frame_backed_region(
+                KERNEL_HEAP_GROWTH_VIRTUAL_BASE as usize,
+                KERNEL_HEAP_GROWTH_MAX_PAGES,
+                core::ptr::addr_of_mut!(heap_mapping_context).cast(),
+                map_kernel_heap_pages,
+            )
+        } {
+            kprintln!(
+                "process-root probe could not restore heap growth: {:?}",
+                error
+            );
+            halt_forever();
+        }
+        if probe_flags & (1 << 9) != 0 {
+            // SAFETY: The process root is destroyed and heap growth is restored.
+            unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+        }
+        if let Err(error) = probe_result {
+            kprintln!("process-root probe failed: {}", error);
+            halt_forever();
+        }
+        #[cfg(not(any(
+            feature = "probe-user-fault",
+            feature = "probe-user-page-fault",
+            feature = "probe-user-general-protection",
+            feature = "probe-user-divide-error"
+        )))]
+        kprintln!("Ring 3 init passed: write/EFAULT/exit syscalls, kernel wait, and process-root teardown");
+        #[cfg(any(
+            feature = "probe-user-fault",
+            feature = "probe-user-page-fault",
+            feature = "probe-user-general-protection",
+            feature = "probe-user-divide-error"
+        ))]
+        kprintln!(
+            "Ring 3 user fault passed: process exited, was waited on, and its root was torn down"
+        );
+    }
 
     // Keep the candidate and its frame tokens alive for as long as this root is
     // active. The shell runs forever and does not return to this stack frame.
@@ -1520,23 +1727,39 @@ fn load_acpi_madt<'candidate, 'memory, 'map>(
         .map_err(AcpiBootReadError::Read)
 }
 
-fn harden_kernel_hhdm_aliases(
-    candidate: &mut rustix_kernel::paging::CandidatePageTables<'_, LimineHhdmCandidateMemory<'_>>,
-    allocator: &mut rustix_kernel::frame::FrameAllocator,
-    memory_map: &rustix_kernel::memory::MemoryMap,
+struct KernelAliasHardeningContext<'a, R> {
+    memory_map: &'a rustix_kernel::memory::MemoryMap,
     hhdm_offset: u64,
     physical_address_bits: Option<u8>,
     virtual_address_bits: u8,
     segments: rustix_kernel::memory::KernelImageSegments,
-    reader: &impl rustix_kernel::paging::PageTableReader<
-        Error = rustix_kernel::memory::HhdmAddressError,
-    >,
+    reader: &'a R,
     inherited_root: rustix_kernel::paging::Cr3Root,
     config: rustix_kernel::paging::PageWalkConfig,
-) -> bool {
+}
+
+fn harden_kernel_hhdm_aliases<R>(
+    candidate: &mut rustix_kernel::paging::CandidatePageTables<'_, LimineHhdmCandidateMemory<'_>>,
+    allocator: &mut rustix_kernel::frame::FrameAllocator,
+    context: KernelAliasHardeningContext<'_, R>,
+) -> bool
+where
+    R: rustix_kernel::paging::PageTableReader<Error = rustix_kernel::memory::HhdmAddressError>,
+{
     use rustix_kernel::paging::{
         walk_virtual_address, PagePermissions, PageWalkOutcome, PAGE_SIZE,
     };
+
+    let KernelAliasHardeningContext {
+        memory_map,
+        hhdm_offset,
+        physical_address_bits,
+        virtual_address_bits,
+        segments,
+        reader,
+        inherited_root,
+        config,
+    } = context;
 
     let image_segments = [
         ("kernel text", segments.text, false),
@@ -1672,7 +1895,7 @@ fn probe_kernel_heap() {
     };
     // SAFETY: The heap is available after releasing the full-arena allocation.
     let allocation = unsafe { KERNEL_HEAP.alloc(layout) };
-    if allocation.is_null() || allocation as usize % layout.align() != 0 {
+    if allocation.is_null() || !(allocation as usize).is_multiple_of(layout.align()) {
         if !allocation.is_null() {
             // SAFETY: This is the live allocation returned for `layout`.
             unsafe { KERNEL_HEAP.dealloc(allocation, layout) };
@@ -1731,7 +1954,7 @@ fn probe_kernel_heap() {
         || growth_address
             .checked_add(growth_layout.size())
             .is_none_or(|end| end > growth_end)
-        || growth_address % growth_layout.align() != 0
+        || !growth_address.is_multiple_of(growth_layout.align())
     {
         // SAFETY: `growth` is the live allocation returned for `growth_layout`.
         unsafe { KERNEL_HEAP.dealloc(growth.as_ptr(), growth_layout) };
@@ -1780,9 +2003,521 @@ fn probe_kernel_heap() {
     kprintln!("kernel heap probe passed: bootstrap exhaustion, frame-backed growth, reuse");
 }
 
+#[cfg(feature = "probe-user-process")]
+struct SerialProcessProbeOutput;
+
+#[cfg(feature = "probe-user-process")]
+impl rustix_kernel::syscall::ConsoleOutput for SerialProcessProbeOutput {
+    type Error = ();
+
+    fn write(
+        &mut self,
+        _stream: rustix_kernel::syscall::ConsoleStream,
+        bytes: &[u8],
+    ) -> Result<usize, Self::Error> {
+        let text = core::str::from_utf8(bytes).map_err(|_| ())?;
+        arch::x86_64::serial::print(format_args!("{}", text));
+        Ok(bytes.len())
+    }
+}
+
+#[cfg(feature = "probe-user-process")]
+struct ActiveUserProcessSyscallContext {
+    roots: *mut (),
+    user_memory: *mut (),
+    process_table: *mut rustix_kernel::process::ProcessTable,
+    process: rustix_kernel::paging::ProcessAddressSpaceHandle,
+    process_id: rustix_kernel::process::ProcessId,
+    kernel_cr3: u64,
+}
+
+#[cfg(feature = "probe-user-process")]
+fn finish_active_user_process<M: rustix_kernel::paging::CandidatePageTableMemory>(
+    state: &mut ActiveUserProcessSyscallContext,
+    roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+    status: i32,
+) -> i64 {
+    use rustix_kernel::syscall::SyscallError;
+
+    // SAFETY: The process table remains live through this synchronous entry.
+    if unsafe { &mut *state.process_table }
+        .exit(state.process_id, status)
+        .is_err()
+    {
+        return SyscallError::InvalidArgument.return_value();
+    }
+    // SAFETY: The kernel CR3 was captured before entering this root, and
+    // interrupts remain disabled for the complete user-process run.
+    unsafe { arch::x86_64::cpu::write_cr3_with_global_flush(state.kernel_cr3) };
+    if arch::x86_64::cpu::read_cr3_raw() != state.kernel_cr3 {
+        halt_forever();
+    }
+    // SAFETY: The kernel root is installed and verified; no CPU can use the
+    // process root after this point in the single-vCPU test harness.
+    if unsafe { roots.mark_inactive(state.process) }.is_err() {
+        halt_forever();
+    }
+    // SAFETY: The kernel root is active, process root is inactive, and IF=0.
+    unsafe { arch::x86_64::interrupts::request_user_process_exit(status) };
+    0
+}
+
+#[cfg(feature = "probe-user-process")]
+extern "C" fn dispatch_active_user_process_syscall(
+    raw_context: *mut rustix_kernel::syscall::SyscallContext,
+    opaque: *mut (),
+) -> i64 {
+    use rustix_kernel::syscall::{
+        decode_syscall, SyscallArguments, SyscallError, SyscallRequest, ABI_VERSION,
+    };
+
+    // SAFETY: The DPL-3 entry supplies a live kernel-stack context. The runtime
+    // pointer is installed only for the synchronous user entry below and remains
+    // valid until the exit path returns to this stack.
+    let Some(context) = (unsafe { raw_context.as_mut() }) else {
+        halt_forever();
+    };
+    // SAFETY: `opaque` points to the live stack-owned runtime record registered
+    // before switching to the process root; callbacks cannot retain its fields.
+    let state = unsafe { &mut *opaque.cast::<ActiveUserProcessSyscallContext>() };
+    // SAFETY: These raw pointers were captured from distinct live local objects;
+    // each reference is limited to this synchronous dispatch.
+    let roots = unsafe {
+        &mut *state
+            .roots
+            .cast::<rustix_kernel::paging::ProcessAddressSpaceRoots<
+                '_,
+                '_,
+                '_,
+                LimineHhdmCandidateMemory<'_>,
+            >>()
+    };
+    // SAFETY: This is the distinct frame-data backend retained by the same runtime.
+    let user_memory = unsafe { &mut *state.user_memory.cast::<LimineHhdmUserFrameMemory<'_>>() };
+    // SAFETY: The process root is active and the sanitized syscall return frame
+    // must resolve to executable code and a writable NX stack before any service.
+    if roots
+        .validate_user_return_state(
+            state.process,
+            context.instruction_pointer,
+            context.stack_pointer,
+        )
+        .is_err()
+    {
+        return finish_active_user_process(state, roots, 141);
+    }
+    let arguments = SyscallArguments {
+        rdi: context.rdi,
+        rsi: context.rsi,
+        rdx: context.rdx,
+        r10: context.r10,
+        r8: context.r8,
+        r9: context.r9,
+    };
+    let request = match decode_syscall(context.rax, arguments) {
+        Ok(request) => request,
+        Err(error) => return error.return_value(),
+    };
+
+    match request {
+        SyscallRequest::AbiVersion => ABI_VERSION as i64,
+        SyscallRequest::Write {
+            fd,
+            user_buffer,
+            length,
+        } => {
+            let mut output = SerialProcessProbeOutput;
+            // SAFETY: The kernel stack is not allocator-usable user memory; the
+            // service copies via owned frame tokens and never dereferences user VA.
+            match unsafe {
+                rustix_kernel::syscall::write_user_buffer(
+                    roots,
+                    state.process,
+                    fd,
+                    user_buffer,
+                    length,
+                    user_memory,
+                    &mut output,
+                )
+            } {
+                Ok(written) => written as i64,
+                Err(error) => error.return_value(),
+            }
+        }
+        SyscallRequest::Exit { status } => finish_active_user_process(state, roots, status),
+        SyscallRequest::Wait { .. } => SyscallError::NotSupported.return_value(),
+    }
+}
+
+#[cfg(feature = "probe-user-process")]
+extern "C" fn dispatch_active_user_process_exception(vector: u64, opaque: *mut ()) -> bool {
+    if vector >= 128 {
+        return false;
+    }
+    // SAFETY: `opaque` points to the same live, stack-owned process runtime used
+    // by syscall dispatch and remains valid until the exception exit trampoline.
+    let state = unsafe { &mut *opaque.cast::<ActiveUserProcessSyscallContext>() };
+    // SAFETY: The root manager is retained by the runtime for the synchronous
+    // user entry; this exception arrived on its mapped supervisor entry stack.
+    let roots = unsafe {
+        &mut *state
+            .roots
+            .cast::<rustix_kernel::paging::ProcessAddressSpaceRoots<
+                '_,
+                '_,
+                '_,
+                LimineHhdmCandidateMemory<'_>,
+            >>()
+    };
+    finish_active_user_process(state, roots, 128 + vector as i32) == 0
+}
+
+#[cfg(feature = "probe-user-process")]
+fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
+    candidate: &rustix_kernel::paging::CandidatePageTables<'_, M>,
+    memory_map: &rustix_kernel::memory::MemoryMap,
+    allocator: &mut rustix_kernel::frame::FrameAllocator,
+    cpu_info: &arch::x86_64::cpu::CpuInfo,
+    hhdm_offset: u64,
+    config: rustix_kernel::paging::PageWalkConfig,
+) -> Result<(), &'static str> {
+    use rustix_kernel::paging::{
+        validate_mapping_range, CachePolicy, MtrrState, PagePermissions, PatLayout,
+        ProcessAddressSpaceRoots, PAGE_SIZE,
+    };
+
+    let init_image =
+        rustix_kernel::elf::Elf64Image::parse(INIT_ELF_IMAGE, cpu_info.active_linear_address_bits)
+            .map_err(|_| "bundled init ELF validation failed in process probe")?;
+    let initial_free_frames = allocator.free_frames();
+    let kernel_half = candidate
+        .share_supervisor_kernel_half()
+        .map_err(|_| "active kernel half could not be shared safely")?;
+    let physical_address_bits = cpu_info
+        .physical_address_bits
+        .ok_or("physical address width unavailable")?;
+    let pat = match cpu_info.pat_msr_value {
+        Some(value) => PatLayout::from_msr_value(value)
+            .map_err(|_| "PAT state is invalid for process mappings")?,
+        None => return Err("PAT state unavailable for process mappings"),
+    };
+    let mtrr_layout = match &cpu_info.mtrr {
+        MtrrState::Captured(registers) => registers
+            .validated_layout(physical_address_bits)
+            .map_err(|_| "MTRR state is invalid for process mappings")?,
+        _ => return Err("MTRR state unavailable for process mappings"),
+    };
+    let mut select_cache = |mapping: rustix_kernel::paging::ValidatedMappingRange| {
+        mapping
+            .select_cache_attributes(
+                CachePolicy::WriteBack,
+                pat,
+                &mtrr_layout,
+                cpu_info.normal_caching,
+            )
+            .map_err(|_| "no uniform write-back cache policy for process page")
+    };
+    let mut process_memory = LimineHhdmCandidateMemory {
+        memory_map,
+        hhdm_offset,
+        physical_address_bits,
+        virtual_address_bits: cpu_info.active_linear_address_bits,
+    };
+    let mut roots = match ProcessAddressSpaceRoots::new(&kernel_half, &mut process_memory, config) {
+        Ok(roots) => roots,
+        Err(failure) => {
+            if let Some(frame) = failure.frame {
+                allocator
+                    .deallocate(frame)
+                    .map_err(|_| "process-root manager frame could not be reclaimed")?;
+            }
+            return Err("process-root manager creation failed");
+        }
+    };
+    let process = match roots.create(allocator) {
+        Ok(process) => process,
+        Err(failure) => {
+            if let Some(frame) = failure.frame {
+                allocator
+                    .deallocate(frame)
+                    .map_err(|_| "process-root frame could not be reclaimed")?;
+            }
+            return Err("process root creation failed");
+        }
+    };
+    let mut user_memory = LimineHhdmUserFrameMemory {
+        memory_map,
+        hhdm_offset,
+        physical_address_bits: Some(physical_address_bits),
+        virtual_address_bits: cpu_info.active_linear_address_bits,
+    };
+
+    if let Err(failure) = init_image.load_into_process_root(
+        &mut roots,
+        allocator,
+        process,
+        &mut user_memory,
+        &mut select_cache,
+    ) {
+        if let Some(frame) = failure.frame {
+            allocator
+                .deallocate(frame)
+                .map_err(|_| "unmapped ELF frame could not be reclaimed")?;
+        }
+        roots
+            .destroy(allocator, process)
+            .map_err(|_| "partially loaded process root could not be destroyed")?;
+        return Err("bundled init ELF could not be loaded into the process root");
+    }
+
+    const USER_STACK_BASE: u64 = 0x0000_7fff_ffff_f000;
+    let stack_frame = match allocator.allocate() {
+        Some(frame) => frame,
+        None => {
+            roots
+                .destroy(allocator, process)
+                .map_err(|_| "process root could not be destroyed after stack allocation failed")?;
+            return Err("no frame available for the user stack");
+        }
+    };
+    let stack_mapping = match validate_mapping_range(
+        USER_STACK_BASE,
+        stack_frame.address(),
+        PAGE_SIZE,
+        PagePermissions {
+            writable: true,
+            executable: false,
+            user_accessible: true,
+        },
+        Some(physical_address_bits),
+        cpu_info.active_linear_address_bits,
+    ) {
+        Ok(mapping) => mapping,
+        Err(_) => {
+            allocator
+                .deallocate(stack_frame)
+                .map_err(|_| "unmapped stack frame could not be reclaimed")?;
+            roots
+                .destroy(allocator, process)
+                .map_err(|_| "process root could not be destroyed after stack validation failed")?;
+            return Err("user stack mapping range was rejected");
+        }
+    };
+    let stack_cache = match select_cache(stack_mapping) {
+        Ok(attributes) => attributes,
+        Err(error) => {
+            allocator
+                .deallocate(stack_frame)
+                .map_err(|_| "unmapped stack frame could not be reclaimed")?;
+            roots
+                .destroy(allocator, process)
+                .map_err(|_| "process root could not be destroyed after cache selection failed")?;
+            return Err(error);
+        }
+    };
+    if let Err(failure) =
+        roots.map_user_page(allocator, process, stack_frame, stack_mapping, stack_cache)
+    {
+        allocator
+            .deallocate(failure.frame)
+            .map_err(|_| "unmapped stack frame could not be reclaimed")?;
+        roots
+            .destroy(allocator, process)
+            .map_err(|_| "process root could not be destroyed after stack mapping failed")?;
+        return Err("user stack page could not be mapped");
+    }
+
+    let stack_pointer = USER_STACK_BASE + PAGE_SIZE;
+    if roots
+        .validate_initial_user_state(process, init_image.entry_point(), stack_pointer)
+        .is_err()
+    {
+        roots
+            .destroy(allocator, process)
+            .map_err(|_| "process root could not be destroyed after entry validation failed")?;
+        return Err("ELF entry or writable NX stack validation failed");
+    }
+
+    let mut process_table = rustix_kernel::process::ProcessTable::new();
+    let process_id = process_table
+        .create_initial()
+        .map_err(|_| "initial process record could not be created")?;
+    let root_address = match roots.root_physical_address(process) {
+        Ok(address) => address,
+        Err(_) => {
+            roots
+                .destroy(allocator, process)
+                .map_err(|_| "process root could not be destroyed after root lookup failed")?;
+            return Err("process root address is unavailable");
+        }
+    };
+    let kernel_cr3 = arch::x86_64::cpu::read_cr3_raw();
+    let kernel_cr3_root = match rustix_kernel::paging::parse_cr3_root(
+        kernel_cr3,
+        Some(physical_address_bits),
+        cpu_info.pcid_enabled,
+    ) {
+        Ok(root) => root,
+        Err(_) => {
+            roots.destroy(allocator, process).map_err(|_| {
+                "process root could not be destroyed after kernel CR3 validation failed"
+            })?;
+            return Err("active kernel CR3 could not be validated");
+        }
+    };
+    let process_cr3 = match rustix_kernel::paging::encode_cr3_value(
+        root_address,
+        kernel_cr3_root.low_bits(),
+        physical_address_bits,
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            roots
+                .destroy(allocator, process)
+                .map_err(|_| "process root could not be destroyed after CR3 encoding failed")?;
+            return Err("process CR3 encoding failed");
+        }
+    };
+    let raw_user_frame = rustix_kernel::syscall::UserIretFrame {
+        instruction_pointer: init_image.entry_point(),
+        code_selector: u64::from(arch::x86_64::interrupts::USER_CODE_SELECTOR),
+        flags: rustix_kernel::syscall::SAFE_USER_RFLAGS,
+        stack_pointer,
+        stack_selector: u64::from(arch::x86_64::interrupts::USER_DATA_SELECTOR),
+    };
+    let user_frame = match rustix_kernel::syscall::sanitize_user_iret_frame(
+        raw_user_frame,
+        cpu_info.active_linear_address_bits,
+    ) {
+        Ok(frame) => frame,
+        Err(_) => {
+            roots.destroy(allocator, process).map_err(|_| {
+                "process root could not be destroyed after IRET frame validation failed"
+            })?;
+            return Err("initial user IRET frame was rejected");
+        }
+    };
+
+    let mut process_context = ActiveUserProcessSyscallContext {
+        roots: core::ptr::addr_of_mut!(roots).cast(),
+        user_memory: core::ptr::addr_of_mut!(user_memory).cast(),
+        process_table: core::ptr::addr_of_mut!(process_table),
+        process,
+        process_id,
+        kernel_cr3,
+    };
+    // SAFETY: IF was disabled by the caller; all pointer targets remain live
+    // until the synchronous user entry returns through its exit syscall.
+    if unsafe {
+        arch::x86_64::interrupts::install_user_syscall_handler(
+            dispatch_active_user_process_syscall,
+            dispatch_active_user_process_exception,
+            core::ptr::addr_of_mut!(process_context).cast(),
+        )
+    }
+    .is_err()
+    {
+        roots.destroy(allocator, process).map_err(|_| {
+            "process root could not be destroyed after syscall handler setup failed"
+        })?;
+        return Err("user syscall handler setup failed");
+    }
+    // SAFETY: IF remains disabled, and this complete root was prevalidated.
+    if unsafe { roots.mark_active(process) }.is_err() {
+        // SAFETY: No user callback is in flight and the root is not installed.
+        unsafe { arch::x86_64::interrupts::clear_user_syscall_handler() };
+        roots
+            .destroy(allocator, process)
+            .map_err(|_| "process root could not be destroyed after activation failed")?;
+        return Err("process root could not be marked active");
+    }
+
+    // SAFETY: The process root shares the validated supervisor kernel half and
+    // the kernel/TSS stacks are mapped in both roots; interrupts remain disabled.
+    unsafe { arch::x86_64::cpu::write_cr3_with_global_flush(process_cr3) };
+    if arch::x86_64::cpu::read_cr3_raw() != process_cr3 {
+        halt_forever();
+    }
+    // SAFETY: The mapped entry/stack were validated above; syscall/fault dispatch
+    // are installed and maskable interrupts remain disabled through process exit.
+    let exit_status = match unsafe { arch::x86_64::interrupts::enter_user(user_frame) } {
+        Ok(status) => status,
+        Err(_) => halt_forever(),
+    };
+    if arch::x86_64::cpu::read_cr3_raw() != kernel_cr3 {
+        halt_forever();
+    }
+    // SAFETY: The exit trampoline returned to the kernel root with IF=0 and no
+    // syscall callback remains in flight.
+    unsafe { arch::x86_64::interrupts::clear_user_syscall_handler() };
+    let wait_result =
+        match process_table.try_wait(rustix_kernel::process::KERNEL_PROCESS_ID, process_id.get()) {
+            Ok(result) => result,
+            Err(_) => {
+                roots.destroy(allocator, process).map_err(|_| {
+                    "inactive process root could not be destroyed after wait failed"
+                })?;
+                return Err("kernel wait could not inspect the init process");
+            }
+        };
+    #[cfg(any(
+        feature = "probe-user-fault",
+        feature = "probe-user-page-fault",
+        feature = "probe-user-general-protection",
+        feature = "probe-user-divide-error"
+    ))]
+    let expected_status = 128 + PROBE_USER_FAULT_VECTOR as i32;
+    #[cfg(not(any(
+        feature = "probe-user-fault",
+        feature = "probe-user-page-fault",
+        feature = "probe-user-general-protection",
+        feature = "probe-user-divide-error"
+    )))]
+    let expected_status = 42;
+    if !matches!(
+        wait_result,
+        rustix_kernel::process::WaitResult::Exited { pid, status }
+            if pid == process_id && status == exit_status && status == expected_status
+    ) {
+        roots
+            .destroy(allocator, process)
+            .map_err(|_| "inactive process root could not be destroyed after wait mismatch")?;
+        return Err("init exit status was not retained and reaped as expected");
+    }
+    roots
+        .destroy(allocator, process)
+        .map_err(|_| "inactive process root teardown failed")?;
+    if allocator.free_frames() != initial_free_frames {
+        return Err("process-root teardown did not restore the frame count");
+    }
+    #[cfg(not(any(
+        feature = "probe-user-fault",
+        feature = "probe-user-page-fault",
+        feature = "probe-user-general-protection",
+        feature = "probe-user-divide-error"
+    )))]
+    kprintln!(
+        "init process exited with status {} and was reaped by kernel wait",
+        exit_status
+    );
+    #[cfg(any(
+        feature = "probe-user-fault",
+        feature = "probe-user-page-fault",
+        feature = "probe-user-general-protection",
+        feature = "probe-user-divide-error"
+    ))]
+    kprintln!(
+        "user fault vector {} exited with status {} and was reaped by kernel wait",
+        PROBE_USER_FAULT_VECTOR,
+        exit_status
+    );
+    Ok(())
+}
+
 #[cfg(feature = "probe-hhdm-frame")]
 fn probe_hhdm_frame(boot_info: &mut boot::BootInfo) {
     use rustix_kernel::frame::FRAME_SIZE;
+    use rustix_kernel::paging::UserFrameMemory;
 
     let frame = match boot_info.frame_allocator.allocate() {
         Some(frame) => frame,
@@ -1805,9 +2540,31 @@ fn probe_hhdm_frame(boot_info: &mut boot::BootInfo) {
         }
     };
 
+    let mut user_memory = LimineHhdmUserFrameMemory {
+        memory_map: &boot_info.memory_map,
+        hhdm_offset: boot_info.hhdm_offset,
+        physical_address_bits: boot_info.cpu_info.physical_address_bits,
+        virtual_address_bits: boot_info.cpu_info.active_linear_address_bits,
+    };
+    let mut expected = [0; 64];
+    for (index, byte) in expected.iter_mut().enumerate() {
+        *byte = index as u8 ^ 0x5a;
+    }
+    let mut observed = [0; 64];
+    let copy_round_trip = user_memory
+        .copy_to_frame(&frame, 128, &expected)
+        .and_then(|()| user_memory.copy_from_frame(&frame, 128, &mut observed));
+    let mut out_of_bounds = [0; 2];
+    let bounds_rejected = user_memory
+        .copy_from_frame(&frame, FRAME_SIZE as usize - 1, &mut out_of_bounds)
+        .is_err();
+    let empty_copy = user_memory
+        .copy_to_frame(&frame, FRAME_SIZE as usize, &[])
+        .is_ok();
+    let mut verified =
+        copy_round_trip.is_ok() && observed == expected && bounds_rejected && empty_copy;
     let words = (FRAME_SIZE / core::mem::size_of::<u64>() as u64) as usize;
     let page = hhdm_address as *mut u64;
-    let mut verified = true;
     // SAFETY: The non-copyable `Frame` token is held exclusively; its full page
     // is within validated `Usable` memory and its HHDM arithmetic was checked.
     // Limine base revision 3 guarantees usable memory in the HHDM, and no other
