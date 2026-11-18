@@ -20,7 +20,7 @@ Unsafe blocks should remain as small as practical and state the assumptions that
 A full static security audit (boot trust boundary, allocators, paging, interrupts/scheduler, drivers, shell/VFS, build/CI) was performed and its actionable findings were applied. Highlights:
 
 - The panic handler masks maskable interrupts before any diagnostics, and a re-entrant fatal path stops silently instead of recursively printing. A fault inside the fatal exception handler likewise stops silently.
-- Full CPU register dumps in the fatal exception path are gated behind the `fatal-register-dump` cargo feature, which is off by default; `KERNEL EXCEPTION` reports the vector, error code, and RIP only.
+- Full CPU register dumps in the fatal exception path are gated behind the `fatal-register-dump` cargo feature, which is off by default; `FATAL EXCEPTION` reports the vector, error code, and RIP only; supported CPL3 process faults use a separate bounded diagnostic and process-exit path.
 - The APIC MMIO pages (LAPIC and I/O APIC, from the MADT) are validated against the physical memory map (`MemoryMap::validate_mmio_page`) and against the kernel-image span before being mapped: known memory-map regions are rejected unless classified `Reserved` or `Unknown`, including ACPI reclaimable/NVS, framebuffer, and bad memory. A page that fails validation is not mapped, and the corresponding APIC route stays masked.
 - The frame allocator subtracts the kernel-image and boot-stack physical spans before accounting usable frames (`from_memory_map_excluding`).
 - Boot rejects a zero HHDM offset or one whose window covers the linked kernel image, and fails closed when the physical address width is unknown.

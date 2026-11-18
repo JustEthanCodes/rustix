@@ -603,13 +603,23 @@ def fault_smoke_test(kind: str, timeout: int) -> None:
     if kind == "page-fault":
         expected = (
             "fault injection: triggering page fault at 0x00000000deadbeef",
-            "KERNEL EXCEPTION: vector 14 (page fault)",
+            "FATAL EXCEPTION: vector 14 (page fault)",
             "page fault address (CR2): 0x00000000deadbeef",
         )
     elif kind == "invalid-opcode":
         expected = (
             "fault injection: triggering invalid opcode with ud2",
-            "KERNEL EXCEPTION: vector 6 (invalid opcode)",
+            "FATAL EXCEPTION: vector 6 (invalid opcode)",
+        )
+    elif kind == "general-protection":
+        expected = (
+            "fault injection: triggering general protection with invalid DS selector",
+            "FATAL EXCEPTION: vector 13 (general protection fault)",
+        )
+    elif kind == "divide-error":
+        expected = (
+            "fault injection: triggering divide error with a zero divisor",
+            "FATAL EXCEPTION: vector 0 (divide error)",
         )
     else:
         raise BuildError(f"unsupported fault-injection test: {kind}")
@@ -698,8 +708,10 @@ def process_smoke_workflow(timeout: int) -> None:
             "bundled init ELF validated:",
             "rustix-init: hello from ring 3",
             "rustix-init: invalid user buffer returned EFAULT",
+            "rustix-init: wait copied child status 7 after EFAULT retry",
+            "rustix-init: wait returned ENOTSUP for a running child",
             "init process exited with status 42 and was reaped by kernel wait",
-            "Ring 3 init passed: write/EFAULT/exit syscalls, kernel wait, and process-root teardown",
+            "Ring 3 init passed: write/EFAULT/ready-child wait/running-child ENOTSUP/exit syscalls, kernel wait, and process-root teardown",
         )
         missing = [marker for marker in markers if marker not in output]
         if missing:
@@ -708,7 +720,7 @@ def process_smoke_workflow(timeout: int) -> None:
                 + ", ".join(repr(marker) for marker in missing)
                 + f"\nSerial output:\n{output}"
             )
-        print("QEMU Ring 3 init write/EFAULT/exit, kernel wait, and process-root teardown passed.")
+        print("QEMU Ring 3 init write/EFAULT/ready-child wait/running-child ENOTSUP/exit, kernel wait, and process-root teardown passed.")
     except (BuildError, OSError, subprocess.SubprocessError) as error:
         failure = error
 
@@ -750,6 +762,8 @@ def user_fault_smoke_workflow(timeout: int) -> None:
                 f"user fault vector {vector} exited with status {128 + vector} and was reaped by kernel wait",
                 "Ring 3 user fault passed: process exited, was waited on, and its root was torn down",
             )
+            if vector == 14:
+                markers += ("user page fault address (CR2): 0x00007fffffffe000",)
             missing = [marker for marker in markers if marker not in output]
             if missing:
                 raise BuildError(
@@ -852,7 +866,9 @@ def thread_smoke_workflow(timeout: int) -> None:
 def fault_smoke_workflow(timeout: int) -> None:
     tests = (
         ("page-fault", "inject-page-fault"),
+        ("general-protection", "inject-general-protection"),
         ("invalid-opcode", "inject-invalid-opcode"),
+        ("divide-error", "inject-divide-error"),
     )
     failure: BuildError | OSError | subprocess.SubprocessError | None = None
     try:
@@ -962,7 +978,7 @@ def main() -> int:
     )
     process_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
     user_fault_smoke = subparsers.add_parser(
-        "user-fault-smoke", help="terminate a Ring 3 init on #UD and verify wait/teardown"
+        "user-fault-smoke", help="test Ring 3 #PF/#GP/#UD/#DE termination and process teardown"
     )
     user_fault_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
     active_map_smoke = subparsers.add_parser(

@@ -42,7 +42,7 @@ The optimized ELF is written to `target/x86_64-unknown-none/release/rustix`. `ca
 
 ## Target-specific linker setup
 
-`.cargo/config.toml` applies the Rustix linker script and x86_64 kernel constraints only to `x86_64-unknown-none`. `linker.ld` emits an ELF64 x86_64 image at the higher-half base, retains Limine request sections in a writable load segment for bootloader response pointers, defines `_start` as an assembly entry shim, and exports the load-image boundary symbols consumed by `BootInfo`. The shim captures the initial stack pointer before entering Rust. The build uses no third-party Rust crates; the boot protocol is represented by small in-tree Rust structures and constants.
+`.cargo/config.toml` applies the Rustix linker script and x86_64 kernel constraints only to `x86_64-unknown-none`. `linker.ld` emits an ELF64 x86_64 image at the higher-half base, retains Limine request sections in a writable load segment for bootloader response pointers, defines `_start` as an assembly entry shim, and exports the load-image boundary symbols consumed by `BootInfo`. The shim captures the initial stack pointer before entering Rust. The build uses no third-party Rust crates; the boot protocol is represented by small in-tree Rust structures and constants. The workspace includes `crates/rustix-user`, a `no_std` syscall-wrapper library; the kernel build script compiles it for `x86_64-unknown-none` and links it into the static diagnostic init ELF.
 
 Changing the target, virtual base, relocation model, or request ABI requires updating the linker script, protocol documentation, and validation plan together. Do not use host builds of the kernel binary as evidence that the freestanding target links correctly.
 

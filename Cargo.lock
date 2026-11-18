@@ -12,3 +12,7 @@ version = "0.1.0-milestone4-delta"
 dependencies = [
  "crabshell",
 ]
+
+[[package]]
+name = "rustix-user"
+version = "0.1.0"

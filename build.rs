@@ -6,8 +6,12 @@ fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let source = root.join("crates/rustix-init/src/main.rs");
     let linker_script = root.join("crates/rustix-init/linker.ld");
+    let runtime_source = root.join("crates/rustix-user/src/lib.rs");
+    let runtime_manifest = root.join("crates/rustix-user/Cargo.toml");
     println!("cargo:rerun-if-changed={}", source.display());
     println!("cargo:rerun-if-changed={}", linker_script.display());
+    println!("cargo:rerun-if-changed={}", runtime_source.display());
+    println!("cargo:rerun-if-changed={}", runtime_manifest.display());
     println!("cargo:rerun-if-env-changed=RUSTC");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("none") {
@@ -15,8 +19,31 @@ fn main() {
     }
 
     let rustc = env::var_os("RUSTC").expect("Cargo provides RUSTC");
-    let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"))
-        .join("rustix-init.elf");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"));
+    let runtime = out_dir.join("librustix_user.rlib");
+    let runtime_status = Command::new(&rustc)
+        .current_dir(&root)
+        .arg("--crate-name")
+        .arg("rustix_user")
+        .arg("--edition=2021")
+        .arg("--crate-type=rlib")
+        .arg("--target=x86_64-unknown-none")
+        .arg("-Cpanic=abort")
+        .arg("-Copt-level=2")
+        .arg("-Ccode-model=small")
+        .arg("-Crelocation-model=static")
+        .arg("-Ctarget-feature=-avx,-avx2,-avx512f")
+        .arg(&runtime_source)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .status()
+        .expect("failed to invoke rustc for the rustix-user runtime");
+    assert!(
+        runtime_status.success(),
+        "failed to build rustix-user runtime"
+    );
+
+    let output = out_dir.join("rustix-init.elf");
     let linker_arg = format!("-T{}", linker_script.display());
     let mut command = Command::new(rustc);
     command
@@ -38,6 +65,8 @@ fn main() {
         .arg("-Ctarget-feature=-avx,-avx2,-avx512f")
         .arg(format!("-Clink-arg={linker_arg}"))
         .arg("-Clink-arg=--build-id=none")
+        .arg("--extern")
+        .arg(format!("rustix_user={}", runtime.display()))
         .arg(&source)
         .arg("-o")
         .arg(&output);

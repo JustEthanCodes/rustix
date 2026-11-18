@@ -24,7 +24,7 @@ pub enum ProcessState {
     Exited(i32),
 }
 
-/// A nonblocking observation of a child. `Exited` is returned once and reaps it.
+/// A nonblocking observation of a child. `try_wait` reaps an exited child; `peek_wait` does not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WaitResult {
     Running { pid: ProcessId },
@@ -40,6 +40,7 @@ pub enum ProcessTableError {
     ParentExited,
     AlreadyExited,
     NoChild,
+    ChildStillRunning,
     ProcessIdExhausted,
 }
 
@@ -115,12 +116,12 @@ impl ProcessTable {
         Ok(())
     }
 
-    /// Inspect or reap a matching child without blocking.
+    /// Inspect a matching child without consuming an exited record.
     ///
-    /// `child_pid == 0` selects any child, preferring the lowest-PID exited child
-    /// so a wait-any caller never sleeps while a zombie is ready to reap.
-    pub fn try_wait(
-        &mut self,
+    /// `child_pid == 0` selects any child, preferring the lowest-PID exited child.
+    /// This split lets callers validate/copy exit status before reaping a zombie.
+    pub fn peek_wait(
+        &self,
         parent: ProcessId,
         child_pid: u64,
     ) -> Result<WaitResult, ProcessTableError> {
@@ -134,40 +135,72 @@ impl ProcessTable {
         }
 
         let mut found_child = false;
-        let mut running: Option<(usize, ProcessId)> = None;
-        let mut exited: Option<(usize, ProcessId, i32)> = None;
-        for (index, record) in self.records.iter().enumerate() {
-            let Some(record) = record.filter(|record| {
-                record.parent == parent && (child_pid == 0 || record.pid.get() == child_pid)
-            }) else {
-                continue;
-            };
+        let mut running: Option<ProcessId> = None;
+        let mut exited: Option<(ProcessId, i32)> = None;
+        for record in self.records.iter().flatten().filter(|record| {
+            record.parent == parent && (child_pid == 0 || record.pid.get() == child_pid)
+        }) {
             found_child = true;
             match record.state {
                 ProcessState::Running => {
-                    if running.is_none_or(|(_, pid)| record.pid < pid) {
-                        running = Some((index, record.pid));
+                    if running.is_none_or(|pid| record.pid < pid) {
+                        running = Some(record.pid);
                     }
                 }
                 ProcessState::Exited(status) => {
-                    if exited.is_none_or(|(_, pid, _)| record.pid < pid) {
-                        exited = Some((index, record.pid, status));
+                    if exited.is_none_or(|(pid, _)| record.pid < pid) {
+                        exited = Some((record.pid, status));
                     }
                 }
             }
         }
 
-        if let Some((index, pid, status)) = exited {
-            self.records[index] = None;
+        if let Some((pid, status)) = exited {
             return Ok(WaitResult::Exited { pid, status });
         }
-        if let Some((_, pid)) = running {
+        if let Some(pid) = running {
             return Ok(WaitResult::Running { pid });
         }
         if found_child {
             unreachable!("a matching child must be running or exited");
         }
         Err(ProcessTableError::NoChild)
+    }
+
+    /// Reap one specific exited child after its status has been consumed.
+    pub fn reap_exited(
+        &mut self,
+        parent: ProcessId,
+        child_pid: ProcessId,
+    ) -> Result<WaitResult, ProcessTableError> {
+        let result = self.peek_wait(parent, child_pid.get())?;
+        let WaitResult::Exited { pid, status } = result else {
+            return Err(ProcessTableError::ChildStillRunning);
+        };
+        let index = self
+            .records
+            .iter()
+            .position(|record| {
+                record.is_some_and(|record| record.pid == pid && record.parent == parent)
+            })
+            .ok_or(ProcessTableError::NoChild)?;
+        self.records[index] = None;
+        Ok(WaitResult::Exited { pid, status })
+    }
+
+    /// Inspect or reap a matching child without blocking.
+    ///
+    /// `child_pid == 0` selects any child, preferring the lowest-PID exited child.
+    pub fn try_wait(
+        &mut self,
+        parent: ProcessId,
+        child_pid: u64,
+    ) -> Result<WaitResult, ProcessTableError> {
+        let result = self.peek_wait(parent, child_pid)?;
+        if let WaitResult::Exited { pid, .. } = result {
+            let _ = self.reap_exited(parent, pid)?;
+        }
+        Ok(result)
     }
 
     pub fn state(&self, pid: ProcessId) -> Option<ProcessState> {
@@ -239,6 +272,48 @@ mod tests {
             processes.try_wait(init, child.get()),
             Err(ProcessTableError::NoChild)
         );
+    }
+
+    #[test]
+    fn peek_wait_keeps_a_zombie_until_status_consumption_succeeds() {
+        let mut processes = ProcessTable::new();
+        let parent = processes.create_initial().unwrap();
+        let child = processes.spawn(parent).unwrap();
+        processes.exit(child, 41).unwrap();
+
+        assert_eq!(
+            processes.peek_wait(parent, child.get()),
+            Ok(WaitResult::Exited {
+                pid: child,
+                status: 41,
+            })
+        );
+        assert_eq!(processes.state(child), Some(ProcessState::Exited(41)));
+        assert_eq!(
+            processes.reap_exited(parent, child),
+            Ok(WaitResult::Exited {
+                pid: child,
+                status: 41,
+            })
+        );
+        assert_eq!(processes.state(child), None);
+        assert_eq!(
+            processes.reap_exited(parent, child),
+            Err(ProcessTableError::NoChild)
+        );
+    }
+
+    #[test]
+    fn reaping_a_running_child_is_rejected_without_mutation() {
+        let mut processes = ProcessTable::new();
+        let parent = processes.create_initial().unwrap();
+        let child = processes.spawn(parent).unwrap();
+
+        assert_eq!(
+            processes.reap_exited(parent, child),
+            Err(ProcessTableError::ChildStillRunning)
+        );
+        assert_eq!(processes.state(child), Some(ProcessState::Running));
     }
 
     #[test]

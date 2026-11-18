@@ -52,7 +52,7 @@ frame-smoke:
 process-smoke:
     python3 scripts/boot.py process-smoke
 
-# Terminate a Ring 3 process on #UD and verify wait/reap plus root teardown in QEMU.
+# Terminate Ring 3 processes on #PF/#GP/#UD/#DE and verify wait/reap plus teardown in QEMU.
 user-fault-smoke:
     python3 scripts/boot.py user-fault-smoke
 
@@ -77,4 +77,4 @@ test:
     cargo test --workspace --lib
 
 # Run formatting, host tests, target checks, and the boot, scheduler, input, and process QEMU smokes.
-verify: fmt test check smoke uefi-smoke active-map-smoke thread-smoke input-smoke process-smoke user-fault-smoke
+verify: fmt test check smoke uefi-smoke active-map-smoke thread-smoke input-smoke fault-smoke process-smoke user-fault-smoke

@@ -14,6 +14,28 @@
     all(feature = "probe-user-process", feature = "probe-kernel-threads"),
     all(feature = "probe-user-process", feature = "probe-hhdm-frame"),
     all(feature = "probe-user-process", feature = "probe-active-mapping"),
+    all(feature = "inject-page-fault", feature = "inject-general-protection"),
+    all(feature = "inject-page-fault", feature = "inject-divide-error"),
+    all(
+        feature = "inject-invalid-opcode",
+        feature = "inject-general-protection"
+    ),
+    all(feature = "inject-invalid-opcode", feature = "inject-divide-error"),
+    all(feature = "inject-general-protection", feature = "inject-divide-error"),
+    all(feature = "inject-general-protection", feature = "probe-hhdm-frame"),
+    all(
+        feature = "inject-general-protection",
+        feature = "probe-kernel-threads"
+    ),
+    all(
+        feature = "inject-general-protection",
+        feature = "probe-active-mapping"
+    ),
+    all(feature = "inject-general-protection", feature = "probe-user-process"),
+    all(feature = "inject-divide-error", feature = "probe-hhdm-frame"),
+    all(feature = "inject-divide-error", feature = "probe-kernel-threads"),
+    all(feature = "inject-divide-error", feature = "probe-active-mapping"),
+    all(feature = "inject-divide-error", feature = "probe-user-process"),
     all(feature = "probe-user-fault", feature = "probe-user-page-fault"),
     all(
         feature = "probe-user-fault",
@@ -701,7 +723,12 @@ pub extern "C" fn rustix_start(entry_rsp: u64) -> ! {
     #[cfg(feature = "probe-hhdm-frame")]
     probe_hhdm_frame(&mut boot_info);
 
-    #[cfg(any(feature = "inject-page-fault", feature = "inject-invalid-opcode"))]
+    #[cfg(any(
+        feature = "inject-page-fault",
+        feature = "inject-invalid-opcode",
+        feature = "inject-general-protection",
+        feature = "inject-divide-error"
+    ))]
     run_fault_injection();
 
     activate_cloned_page_tables_and_run(&mut boot_info)
@@ -1237,7 +1264,7 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
             feature = "probe-user-general-protection",
             feature = "probe-user-divide-error"
         )))]
-        kprintln!("Ring 3 init passed: write/EFAULT/exit syscalls, kernel wait, and process-root teardown");
+        kprintln!("Ring 3 init passed: write/EFAULT/ready-child wait/running-child ENOTSUP/exit syscalls, kernel wait, and process-root teardown");
         #[cfg(any(
             feature = "probe-user-fault",
             feature = "probe-user-page-fault",
@@ -2145,7 +2172,56 @@ extern "C" fn dispatch_active_user_process_syscall(
             }
         }
         SyscallRequest::Exit { status } => finish_active_user_process(state, roots, status),
-        SyscallRequest::Wait { .. } => SyscallError::NotSupported.return_value(),
+        SyscallRequest::Wait {
+            child_pid,
+            status_address,
+        } => {
+            // SAFETY: Process-table access is serialized by IF=0 on the single CPU.
+            let process_table = unsafe { &mut *state.process_table };
+            match process_table.peek_wait(state.process_id, child_pid) {
+                Ok(rustix_kernel::process::WaitResult::Running { .. }) => {
+                    SyscallError::NotSupported.return_value()
+                }
+                Ok(rustix_kernel::process::WaitResult::Exited { pid, status }) => {
+                    if let Some(user_address) = status_address {
+                        let status_bytes = status.to_le_bytes();
+                        // SAFETY: The local status bytes are kernel stack storage,
+                        // disjoint from this process's allocator-owned user frames.
+                        match unsafe {
+                            roots.copy_to_user(
+                                state.process,
+                                user_address,
+                                &status_bytes,
+                                user_memory,
+                            )
+                        } {
+                            Ok(4) => {}
+                            Ok(_) => return SyscallError::Fault.return_value(),
+                            Err(failure) => {
+                                return match failure.cause {
+                                    rustix_kernel::paging::ProcessUserCopyError::Memory(_) => {
+                                        SyscallError::Io.return_value()
+                                    }
+                                    _ => SyscallError::Fault.return_value(),
+                                };
+                            }
+                        }
+                    }
+                    match process_table.reap_exited(state.process_id, pid) {
+                        Ok(rustix_kernel::process::WaitResult::Exited { pid: reaped, .. })
+                            if reaped == pid =>
+                        {
+                            pid.get() as i64
+                        }
+                        _ => SyscallError::InvalidArgument.return_value(),
+                    }
+                }
+                Err(rustix_kernel::process::ProcessTableError::NoChild) => {
+                    SyscallError::NoChild.return_value()
+                }
+                Err(_) => SyscallError::InvalidArgument.return_value(),
+            }
+        }
     }
 }
 
@@ -2271,6 +2347,30 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
     }
 
     const USER_STACK_BASE: u64 = 0x0000_7fff_ffff_f000;
+    const USER_STACK_GUARD_BASE: u64 = USER_STACK_BASE - PAGE_SIZE;
+    let mut guard_probe = [0u8; 1];
+    // SAFETY: The destination is kernel stack storage and does not alias any
+    // user frame owned by this process. A valid guard must fail as unmapped.
+    match unsafe {
+        roots.copy_from_user(
+            process,
+            USER_STACK_GUARD_BASE,
+            &mut guard_probe,
+            &mut user_memory,
+        )
+    } {
+        Err(failure)
+            if matches!(
+                failure.cause,
+                rustix_kernel::paging::ProcessUserCopyError::Unmapped
+            ) => {}
+        _ => {
+            roots.destroy(allocator, process).map_err(|_| {
+                "process root could not be destroyed after stack-guard validation failed"
+            })?;
+            return Err("the page below the user stack is not an unmapped guard");
+        }
+    }
     let stack_frame = match allocator.allocate() {
         Some(frame) => frame,
         None => {
@@ -2280,6 +2380,15 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
             return Err("no frame available for the user stack");
         }
     };
+    if rustix_kernel::paging::zero_user_frame(&stack_frame, &mut user_memory).is_err() {
+        allocator
+            .deallocate(stack_frame)
+            .map_err(|_| "partially zeroed stack frame could not be reclaimed")?;
+        roots
+            .destroy(allocator, process)
+            .map_err(|_| "process root could not be destroyed after stack zeroing failed")?;
+        return Err("user stack frame could not be zeroed");
+    }
     let stack_mapping = match validate_mapping_range(
         USER_STACK_BASE,
         stack_frame.address(),
@@ -2342,6 +2451,30 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
     let process_id = process_table
         .create_initial()
         .map_err(|_| "initial process record could not be created")?;
+    let wait_child = match process_table.spawn(process_id) {
+        Ok(child) => child,
+        Err(_) => {
+            roots
+                .destroy(allocator, process)
+                .map_err(|_| "process root could not be destroyed after wait-child setup failed")?;
+            return Err("wait-syscall child fixture could not be created");
+        }
+    };
+    if process_table.exit(wait_child, 7).is_err() {
+        roots.destroy(allocator, process).map_err(|_| {
+            "process root could not be destroyed after wait-child exit setup failed"
+        })?;
+        return Err("wait-syscall child fixture could not be marked exited");
+    }
+    let running_wait_child = match process_table.spawn(process_id) {
+        Ok(child) => child,
+        Err(_) => {
+            roots.destroy(allocator, process).map_err(|_| {
+                "process root could not be destroyed after running-child setup failed"
+            })?;
+            return Err("running-child wait fixture could not be created");
+        }
+    };
     let root_address = match roots.root_physical_address(process) {
         Ok(address) => address,
         Err(_) => {
@@ -2479,10 +2612,50 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
         rustix_kernel::process::WaitResult::Exited { pid, status }
             if pid == process_id && status == exit_status && status == expected_status
     ) {
+        kprintln!(
+            "process wait validation mismatch: result={:?}, init pid={}, trampoline status={}, expected status={}",
+            wait_result,
+            process_id.get(),
+            exit_status,
+            expected_status
+        );
         roots
             .destroy(allocator, process)
             .map_err(|_| "inactive process root could not be destroyed after wait mismatch")?;
         return Err("init exit status was not retained and reaped as expected");
+    }
+    for fixture_child in [wait_child, running_wait_child] {
+        if matches!(
+            process_table.state(fixture_child),
+            Some(rustix_kernel::process::ProcessState::Running)
+        ) && process_table.exit(fixture_child, 0).is_err()
+        {
+            roots.destroy(allocator, process).map_err(|_| {
+                "inactive process root could not be destroyed after child-fixture exit failed"
+            })?;
+            return Err("running-child wait fixture could not be exited during cleanup");
+        }
+        if process_table.state(fixture_child).is_some()
+            && !matches!(
+                process_table.try_wait(
+                    rustix_kernel::process::KERNEL_PROCESS_ID,
+                    fixture_child.get()
+                ),
+                Ok(rustix_kernel::process::WaitResult::Exited { pid, .. })
+                    if pid == fixture_child
+            )
+        {
+            roots.destroy(allocator, process).map_err(|_| {
+                "inactive process root could not be destroyed after child-fixture reap failed"
+            })?;
+            return Err("child wait fixture could not be reaped during cleanup");
+        }
+    }
+    if process_table.live_records() != 0 {
+        roots
+            .destroy(allocator, process)
+            .map_err(|_| "inactive process root could not be destroyed after process-table leak")?;
+        return Err("process wait fixtures remained after teardown");
     }
     roots
         .destroy(allocator, process)
@@ -3401,6 +3574,43 @@ fn run_fault_injection() {
     // SAFETY: This is an opt-in QEMU test that deliberately raises #UD; the
     // installed invalid-opcode handler is expected to halt.
     unsafe { core::arch::asm!("ud2", options(nomem, nostack)) };
+    kprintln!("fault injection unexpectedly returned");
+    halt_forever();
+}
+
+#[cfg(feature = "inject-general-protection")]
+fn run_fault_injection() {
+    kprintln!("fault injection: triggering general protection with invalid DS selector");
+    // SAFETY: The selector index is outside the installed GDT limit, so loading
+    // it into DS deliberately raises a kernel-origin #GP in QEMU.
+    unsafe {
+        core::arch::asm!(
+            "mov ax, 0xffff",
+            "mov ds, ax",
+            out("ax") _,
+            options(nostack)
+        )
+    };
+    kprintln!("fault injection unexpectedly returned");
+    halt_forever();
+}
+
+#[cfg(feature = "inject-divide-error")]
+fn run_fault_injection() {
+    kprintln!("fault injection: triggering divide error with a zero divisor");
+    // SAFETY: Integer division by zero deliberately raises kernel-origin #DE.
+    unsafe {
+        core::arch::asm!(
+            "xor edx, edx",
+            "xor eax, eax",
+            "xor ecx, ecx",
+            "div ecx",
+            out("eax") _,
+            out("edx") _,
+            out("ecx") _,
+            options(nostack)
+        )
+    };
     kprintln!("fault injection unexpectedly returned");
     halt_forever();
 }

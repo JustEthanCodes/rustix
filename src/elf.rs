@@ -682,6 +682,26 @@ mod tests {
     }
 
     #[test]
+    fn zero_user_frame_clears_the_complete_frame() {
+        let memory_map = MemoryMap::from_raw(&[RawMemoryRegion {
+            base: 0x10_0000,
+            length: PAGE_SIZE,
+            kind: 0,
+        }])
+        .unwrap();
+        let mut allocator = FrameAllocator::from_memory_map(&memory_map).unwrap();
+        let frame = allocator.allocate().unwrap();
+        let mut user_memory = SyntheticFrameMemory {
+            frame_address: frame.address(),
+            bytes: [0xa5; PAGE_SIZE as usize],
+        };
+
+        crate::paging::zero_user_frame(&frame, &mut user_memory).unwrap();
+
+        assert!(user_memory.bytes.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
     fn parses_static_x86_64_load_segments_and_exposes_file_bytes() {
         let bytes = valid_elf();
         let image = Elf64Image::parse(&bytes, 48).unwrap();

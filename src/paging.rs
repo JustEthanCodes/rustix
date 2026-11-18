@@ -1994,6 +1994,23 @@ pub unsafe trait UserFrameMemory {
     ) -> Result<(), Self::Error>;
 }
 
+/// Clear an allocator-owned user frame before exposing it to Ring 3.
+///
+/// The writes are bounded to small chunks to avoid placing a full page on the
+/// kernel stack. On failure, the frame may be partially cleared and must not be
+/// mapped into a process.
+pub fn zero_user_frame<U: UserFrameMemory>(
+    frame: &Frame,
+    user_memory: &mut U,
+) -> Result<(), U::Error> {
+    const ZERO_CHUNK: [u8; 128] = [0; 128];
+
+    for offset in (0..PAGE_SIZE as usize).step_by(ZERO_CHUNK.len()) {
+        user_memory.copy_to_frame(frame, offset, &ZERO_CHUNK)?;
+    }
+    Ok(())
+}
+
 struct ProcessMapping {
     virtual_address: u64,
     frame: Frame,
