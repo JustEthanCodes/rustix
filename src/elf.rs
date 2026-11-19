@@ -702,6 +702,70 @@ mod tests {
     }
 
     #[test]
+    fn reserves_validated_elf_regions_with_a_stack_and_guard_transactionally() {
+        use crate::process::{UserRegionKind, UserRegionTable};
+
+        let bytes = valid_elf();
+        let image = Elf64Image::parse(&bytes, 48).unwrap();
+        let mut regions = UserRegionTable::new();
+        let layout = regions
+            .reserve_elf_layout(&image, 0x0000_7fff_ffff_f000, 1, 1, 48)
+            .unwrap();
+
+        assert_eq!(layout.stack_region().start(), 0x0000_7fff_ffff_f000);
+        assert_eq!(layout.stack_region().length(), PAGE_SIZE);
+        assert_eq!(layout.stack_pointer(), 0x0000_8000_0000_0000);
+        assert_eq!(layout.guard_region().start(), 0x0000_7fff_ffff_e000);
+        assert_eq!(layout.guard_region().kind(), UserRegionKind::Guard);
+        let mut image_regions = regions
+            .regions()
+            .filter(|region| region.kind() == UserRegionKind::Image);
+        let text = image_regions.next().unwrap();
+        assert_eq!(text.start(), 0x4000_0000);
+        assert_eq!(text.length(), PAGE_SIZE);
+        let data = image_regions.next().unwrap();
+        assert_eq!(data.start(), 0x4000_1000);
+        assert_eq!(data.length(), 2 * PAGE_SIZE);
+        assert!(image_regions.next().is_none());
+
+        let mut overlapping = UserRegionTable::new();
+        let reserved = overlapping
+            .reserve(
+                0x0000_7fff_ffff_f000,
+                PAGE_SIZE,
+                UserRegionKind::Anonymous,
+                48,
+            )
+            .unwrap();
+        assert_eq!(
+            overlapping.reserve_elf_layout(&image, 0x0000_7fff_ffff_f000, 1, 1, 48),
+            Err(crate::process::UserRegionError::Overlap)
+        );
+        assert_eq!(overlapping.regions().count(), 1);
+        assert_eq!(overlapping.regions().next(), Some(reserved));
+    }
+
+    #[test]
+    fn rejects_invalid_stack_layout_without_mutating_region_reservations() {
+        use crate::process::UserRegionTable;
+
+        let bytes = valid_elf();
+        let image = Elf64Image::parse(&bytes, 48).unwrap();
+        let mut regions = UserRegionTable::new();
+
+        assert_eq!(
+            regions.reserve_elf_layout(&image, 0, 1, 1, 48),
+            Err(crate::process::UserRegionError::AddressOverflow)
+        );
+        assert_eq!(regions.regions().count(), 0);
+        assert_eq!(
+            regions.reserve_elf_layout(&image, 0x0000_7fff_ffff_f000, 0, 1, 48),
+            Err(crate::process::UserRegionError::EmptyRange)
+        );
+        assert_eq!(regions.regions().count(), 0);
+    }
+
+    #[test]
     fn parses_static_x86_64_load_segments_and_exposes_file_bytes() {
         let bytes = valid_elf();
         let image = Elf64Image::parse(&bytes, 48).unwrap();

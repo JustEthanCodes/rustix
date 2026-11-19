@@ -8,6 +8,7 @@ pub const ABI_MAJOR: u16 = 1;
 pub const ABI_MINOR: u16 = 0;
 pub const ABI_VERSION: u64 = (ABI_MAJOR as u64) << 16 | ABI_MINOR as u64;
 pub const MAX_WRITE_BYTES: u64 = 4096;
+pub const USER_ANONYMOUS_PAGE_BYTES: u64 = crate::paging::PAGE_SIZE;
 pub const USER_SYSCALL_VECTOR: u8 = 0x80;
 pub const USER_DATA_SELECTOR: u16 = 0x2b;
 pub const USER_CODE_SELECTOR: u16 = 0x33;
@@ -22,6 +23,10 @@ pub mod number {
     pub const EXIT: u64 = 1;
     pub const WRITE: u64 = 2;
     pub const WAIT: u64 = 3;
+    pub const MMAP: u64 = 4;
+    pub const MUNMAP: u64 = 5;
+    pub const CLOSE: u64 = 6;
+    pub const DUP: u64 = 7;
 }
 
 /// Stable v1 error numbers. Syscall returns encode these as negative `i64`s.
@@ -39,6 +44,7 @@ pub enum SyscallError {
     TooBig = 9,
     Overflow = 10,
     NotSupported = 11,
+    TooManyOpenFiles = 12,
 }
 
 impl SyscallError {
@@ -213,6 +219,18 @@ pub enum SyscallRequest {
         child_pid: u64,
         status_address: Option<u64>,
     },
+    Mmap {
+        length: u64,
+    },
+    Munmap {
+        address: u64,
+    },
+    Close {
+        fd: u64,
+    },
+    Duplicate {
+        fd: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,13 +271,48 @@ where
     U: crate::paging::UserFrameMemory,
     O: ConsoleOutput,
 {
-    use crate::paging::{ProcessUserCopyError, MAX_PROCESS_USER_COPY_BYTES};
-
     let stream = match fd {
         1 => ConsoleStream::Stdout,
         2 => ConsoleStream::Stderr,
         _ => return Err(SyscallError::BadFileDescriptor),
     };
+    // SAFETY: The caller's stack/user-frame disjointness contract applies to the
+    // shared stream-based copy-and-write implementation below.
+    unsafe {
+        write_user_buffer_to_stream(
+            roots,
+            process,
+            stream,
+            user_buffer,
+            length,
+            user_memory,
+            output,
+        )
+    }
+}
+
+/// Copy and write one bounded user buffer to an already-authorized console stream.
+///
+/// # Safety
+/// The current kernel stack, including the fixed scratch buffer, must not be
+/// mapped as a user frame in `process`. The caller must authorize `stream` for
+/// this process before calling; this function does not validate descriptor state.
+pub unsafe fn write_user_buffer_to_stream<M, U, O>(
+    roots: &crate::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+    process: crate::paging::ProcessAddressSpaceHandle,
+    stream: ConsoleStream,
+    user_buffer: u64,
+    length: usize,
+    user_memory: &mut U,
+    output: &mut O,
+) -> Result<usize, SyscallError>
+where
+    M: crate::paging::CandidatePageTableMemory,
+    U: crate::paging::UserFrameMemory,
+    O: ConsoleOutput,
+{
+    use crate::paging::{ProcessUserCopyError, MAX_PROCESS_USER_COPY_BYTES};
+
     if length > MAX_WRITE_BYTES as usize {
         return Err(SyscallError::TooBig);
     }
@@ -333,6 +386,29 @@ pub const fn decode_syscall(
                 Some(arguments.rsi)
             },
         }),
+        number::MMAP => {
+            if arguments.rdi == 0 {
+                return Err(SyscallError::InvalidArgument);
+            }
+            if arguments.rdi > USER_ANONYMOUS_PAGE_BYTES {
+                return Err(SyscallError::TooBig);
+            }
+            Ok(SyscallRequest::Mmap {
+                length: arguments.rdi,
+            })
+        }
+        number::MUNMAP => {
+            if arguments.rsi != USER_ANONYMOUS_PAGE_BYTES
+                || arguments.rdi & (crate::paging::PAGE_SIZE - 1) != 0
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            Ok(SyscallRequest::Munmap {
+                address: arguments.rdi,
+            })
+        }
+        number::CLOSE => Ok(SyscallRequest::Close { fd: arguments.rdi }),
+        number::DUP => Ok(SyscallRequest::Duplicate { fd: arguments.rdi }),
         _ => Err(SyscallError::NoSys),
     }
 }
@@ -342,7 +418,8 @@ mod tests {
     use super::{
         decode_syscall, number, sanitize_user_iret_frame, sanitize_user_syscall_return_frame,
         SyscallArguments, SyscallError, SyscallRequest, UserIretFrame, UserIretFrameError,
-        ABI_VERSION, MAX_WRITE_BYTES, SAFE_USER_RFLAGS, USER_CODE_SELECTOR, USER_DATA_SELECTOR,
+        ABI_VERSION, MAX_WRITE_BYTES, SAFE_USER_RFLAGS, USER_ANONYMOUS_PAGE_BYTES,
+        USER_CODE_SELECTOR, USER_DATA_SELECTOR,
     };
 
     const EMPTY_ARGUMENTS: SyscallArguments = SyscallArguments {
@@ -371,6 +448,10 @@ mod tests {
         assert_eq!(number::EXIT, 1);
         assert_eq!(number::WRITE, 2);
         assert_eq!(number::WAIT, 3);
+        assert_eq!(number::MMAP, 4);
+        assert_eq!(number::MUNMAP, 5);
+        assert_eq!(number::CLOSE, 6);
+        assert_eq!(number::DUP, 7);
         assert_eq!(
             decode_syscall(number::ABI_VERSION, EMPTY_ARGUMENTS),
             Ok(SyscallRequest::AbiVersion)
@@ -390,6 +471,23 @@ mod tests {
         assert_eq!(SyscallError::TooBig.return_value(), -9);
         assert_eq!(SyscallError::Overflow.return_value(), -10);
         assert_eq!(SyscallError::NotSupported.return_value(), -11);
+        assert_eq!(SyscallError::TooManyOpenFiles.return_value(), -12);
+    }
+
+    #[test]
+    fn close_and_duplicate_decode_the_descriptor_argument() {
+        let arguments = SyscallArguments {
+            rdi: 3,
+            ..EMPTY_ARGUMENTS
+        };
+        assert_eq!(
+            decode_syscall(number::CLOSE, arguments),
+            Ok(SyscallRequest::Close { fd: 3 })
+        );
+        assert_eq!(
+            decode_syscall(number::DUP, arguments),
+            Ok(SyscallRequest::Duplicate { fd: 3 })
+        );
     }
 
     #[test]
@@ -473,6 +571,79 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_mapping_requests_are_page_bounded_and_unmap_is_exactly_one_page() {
+        assert_eq!(
+            decode_syscall(
+                number::MMAP,
+                SyscallArguments {
+                    rdi: 1,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Ok(SyscallRequest::Mmap { length: 1 })
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MMAP,
+                SyscallArguments {
+                    rdi: USER_ANONYMOUS_PAGE_BYTES,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Ok(SyscallRequest::Mmap {
+                length: USER_ANONYMOUS_PAGE_BYTES
+            })
+        );
+        assert_eq!(
+            decode_syscall(number::MMAP, EMPTY_ARGUMENTS),
+            Err(SyscallError::InvalidArgument)
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MMAP,
+                SyscallArguments {
+                    rdi: USER_ANONYMOUS_PAGE_BYTES + 1,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Err(SyscallError::TooBig)
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MUNMAP,
+                SyscallArguments {
+                    rdi: 0x4000,
+                    rsi: USER_ANONYMOUS_PAGE_BYTES,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Ok(SyscallRequest::Munmap { address: 0x4000 })
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MUNMAP,
+                SyscallArguments {
+                    rdi: 0x4001,
+                    rsi: USER_ANONYMOUS_PAGE_BYTES,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Err(SyscallError::InvalidArgument)
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MUNMAP,
+                SyscallArguments {
+                    rdi: 0x4000,
+                    rsi: USER_ANONYMOUS_PAGE_BYTES * 2,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Err(SyscallError::InvalidArgument)
+        );
+    }
+
+    #[test]
     fn user_iret_frame_checks_selectors_addresses_alignment_and_sanitizes_flags() {
         let mut frame = valid_iret_frame();
         let sanitized = sanitize_user_iret_frame(frame, 48).unwrap().into_raw();
@@ -548,7 +719,7 @@ mod tests {
 
     #[test]
     fn unassigned_numbers_return_enosys() {
-        assert_eq!(decode_syscall(4, EMPTY_ARGUMENTS), Err(SyscallError::NoSys));
+        assert_eq!(decode_syscall(8, EMPTY_ARGUMENTS), Err(SyscallError::NoSys));
         assert_eq!(
             decode_syscall(u64::MAX, EMPTY_ARGUMENTS),
             Err(SyscallError::NoSys)

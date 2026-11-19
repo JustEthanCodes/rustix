@@ -5,6 +5,7 @@
 //! state change; a `Running` result means a syscall caller still has to block.
 
 pub const MAX_PROCESSES: usize = 4;
+pub const MAX_PROCESS_DESCRIPTORS: usize = 8;
 
 /// ID zero belongs to the kernel supervisor and is never assigned to userspace.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -17,6 +18,310 @@ impl ProcessId {
 }
 
 pub const KERNEL_PROCESS_ID: ProcessId = ProcessId(0);
+
+pub const MAX_USER_REGIONS: usize = 32;
+pub const USER_ANONYMOUS_MAP_START: u64 = 0x0000_4000_0000_0000;
+pub const USER_ANONYMOUS_MAP_END: u64 = 0x0000_4000_0100_0000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserRegionKind {
+    Image,
+    Stack,
+    Guard,
+    Anonymous,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserRegion {
+    start: u64,
+    end: u64,
+    kind: UserRegionKind,
+}
+
+impl UserRegion {
+    pub const fn start(self) -> u64 {
+        self.start
+    }
+
+    pub const fn end(self) -> u64 {
+        self.end
+    }
+
+    pub const fn length(self) -> u64 {
+        self.end - self.start
+    }
+
+    pub const fn kind(self) -> UserRegionKind {
+        self.kind
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserStackLayout {
+    stack_region: UserRegion,
+    guard_region: UserRegion,
+    stack_pointer: u64,
+}
+
+impl UserStackLayout {
+    pub const fn stack_region(self) -> UserRegion {
+        self.stack_region
+    }
+
+    pub const fn guard_region(self) -> UserRegion {
+        self.guard_region
+    }
+
+    pub const fn stack_pointer(self) -> u64 {
+        self.stack_pointer
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserRegionError {
+    InvalidAddressWidth,
+    EmptyRange,
+    UnalignedRange,
+    AddressOverflow,
+    NonCanonicalRange,
+    Overlap,
+    Capacity,
+    AnonymousAddressSpaceExhausted,
+    NotAnonymousRegion,
+}
+
+/// Bounded user virtual-region reservations for one address space.
+///
+/// Region reservations are metadata only: page ownership and page-table changes
+/// remain the responsibility of the process-root mapping APIs. Guard regions are
+/// reserved here but intentionally have no backing mapping.
+#[derive(Clone, Copy)]
+pub struct UserRegionTable {
+    regions: [Option<UserRegion>; MAX_USER_REGIONS],
+}
+
+impl UserRegionTable {
+    pub const fn new() -> Self {
+        Self {
+            regions: [None; MAX_USER_REGIONS],
+        }
+    }
+
+    /// Reserve a page-aligned lower-half range, including an unmapped guard range.
+    pub fn reserve(
+        &mut self,
+        start: u64,
+        length: u64,
+        kind: UserRegionKind,
+        virtual_address_bits: u8,
+    ) -> Result<UserRegion, UserRegionError> {
+        validate_user_region_range(start, length, virtual_address_bits)?;
+        let end = start
+            .checked_add(length)
+            .ok_or(UserRegionError::AddressOverflow)?;
+        if self
+            .regions
+            .iter()
+            .flatten()
+            .any(|region| start < region.end && region.start < end)
+        {
+            return Err(UserRegionError::Overlap);
+        }
+        let slot = self
+            .regions
+            .iter()
+            .position(Option::is_none)
+            .ok_or(UserRegionError::Capacity)?;
+        let region = UserRegion { start, end, kind };
+        self.regions[slot] = Some(region);
+        Ok(region)
+    }
+
+    /// Transactionally reserve validated ELF load pages, a stack, and its guard.
+    ///
+    /// `stack_base` is the low address of the mapped stack. The initial stack
+    /// pointer is the one-past end address. No page tables or backing frames are
+    /// changed; the caller remains responsible for loading the image and mapping
+    /// the stack. At least one stack and one guard page are required.
+    pub fn reserve_elf_layout(
+        &mut self,
+        image: &crate::elf::Elf64Image<'_>,
+        stack_base: u64,
+        stack_pages: u64,
+        guard_pages: u64,
+        virtual_address_bits: u8,
+    ) -> Result<UserStackLayout, UserRegionError> {
+        if stack_pages == 0 || guard_pages == 0 {
+            return Err(UserRegionError::EmptyRange);
+        }
+        let page_size = crate::paging::PAGE_SIZE;
+        let stack_length = stack_pages
+            .checked_mul(page_size)
+            .ok_or(UserRegionError::AddressOverflow)?;
+        let guard_length = guard_pages
+            .checked_mul(page_size)
+            .ok_or(UserRegionError::AddressOverflow)?;
+        let guard_base = stack_base
+            .checked_sub(guard_length)
+            .ok_or(UserRegionError::AddressOverflow)?;
+        let stack_pointer = stack_base
+            .checked_add(stack_length)
+            .ok_or(UserRegionError::AddressOverflow)?;
+
+        let mut staged = *self;
+        for segment in image.segments() {
+            let page_count = u64::try_from(segment.page_count())
+                .map_err(|_| UserRegionError::AddressOverflow)?;
+            let length = page_count
+                .checked_mul(page_size)
+                .ok_or(UserRegionError::AddressOverflow)?;
+            staged.reserve(
+                segment.virtual_start(),
+                length,
+                UserRegionKind::Image,
+                virtual_address_bits,
+            )?;
+        }
+        let guard_region = staged.reserve(
+            guard_base,
+            guard_length,
+            UserRegionKind::Guard,
+            virtual_address_bits,
+        )?;
+        let stack_region = staged.reserve(
+            stack_base,
+            stack_length,
+            UserRegionKind::Stack,
+            virtual_address_bits,
+        )?;
+        *self = staged;
+        Ok(UserStackLayout {
+            stack_region,
+            guard_region,
+            stack_pointer,
+        })
+    }
+
+    /// Reserve the first free range in the bounded anonymous-map window.
+    ///
+    /// The requested byte length is rounded up to a page. Allocations are
+    /// read/write, non-executable by policy; this table does not install PTEs.
+    pub fn allocate_anonymous(
+        &mut self,
+        requested_length: u64,
+        virtual_address_bits: u8,
+    ) -> Result<UserRegion, UserRegionError> {
+        if requested_length == 0 {
+            return Err(UserRegionError::EmptyRange);
+        }
+        if !matches!(virtual_address_bits, 48 | 57) {
+            return Err(UserRegionError::InvalidAddressWidth);
+        }
+        if self.regions.iter().all(Option::is_some) {
+            return Err(UserRegionError::Capacity);
+        }
+        let page_size = crate::paging::PAGE_SIZE;
+        let length = requested_length
+            .checked_add(page_size - 1)
+            .ok_or(UserRegionError::AddressOverflow)?
+            & !(page_size - 1);
+        let mut candidate = USER_ANONYMOUS_MAP_START;
+        loop {
+            let end = candidate
+                .checked_add(length)
+                .ok_or(UserRegionError::AddressOverflow)?;
+            if end > USER_ANONYMOUS_MAP_END {
+                return Err(UserRegionError::AnonymousAddressSpaceExhausted);
+            }
+            let overlap = self
+                .regions
+                .iter()
+                .flatten()
+                .filter(|region| candidate < region.end && region.start < end)
+                .min_by_key(|region| region.end);
+            if let Some(region) = overlap {
+                candidate = region.end;
+                continue;
+            }
+            return self.reserve(
+                candidate,
+                length,
+                UserRegionKind::Anonymous,
+                virtual_address_bits,
+            );
+        }
+    }
+
+    /// Release only an exact anonymous reservation; image, stack, and guard
+    /// regions cannot be released through this operation.
+    pub fn release_anonymous(
+        &mut self,
+        start: u64,
+        length: u64,
+    ) -> Result<UserRegion, UserRegionError> {
+        if length == 0 {
+            return Err(UserRegionError::EmptyRange);
+        }
+        if (start | length) & (crate::paging::PAGE_SIZE - 1) != 0 {
+            return Err(UserRegionError::UnalignedRange);
+        }
+        let end = start
+            .checked_add(length)
+            .ok_or(UserRegionError::AddressOverflow)?;
+        let slot = self.regions.iter().position(|region| {
+            region.is_some_and(|region| {
+                region.start == start
+                    && region.end == end
+                    && region.kind == UserRegionKind::Anonymous
+            })
+        });
+        let Some(slot) = slot else {
+            return Err(UserRegionError::NotAnonymousRegion);
+        };
+        Ok(self.regions[slot]
+            .take()
+            .expect("matching anonymous reservation remains present"))
+    }
+
+    pub fn regions(&self) -> impl Iterator<Item = UserRegion> + '_ {
+        self.regions.iter().flatten().copied()
+    }
+}
+
+impl Default for UserRegionTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn validate_user_region_range(
+    start: u64,
+    length: u64,
+    virtual_address_bits: u8,
+) -> Result<(), UserRegionError> {
+    if !matches!(virtual_address_bits, 48 | 57) {
+        return Err(UserRegionError::InvalidAddressWidth);
+    }
+    if length == 0 {
+        return Err(UserRegionError::EmptyRange);
+    }
+    let page_size = crate::paging::PAGE_SIZE;
+    if (start | length) & (page_size - 1) != 0 {
+        return Err(UserRegionError::UnalignedRange);
+    }
+    let end = start
+        .checked_add(length)
+        .ok_or(UserRegionError::AddressOverflow)?;
+    let lower_half_end = 1u64 << (virtual_address_bits - 1);
+    if start >= lower_half_end
+        || end > lower_half_end
+        || !crate::memory::is_canonical_virtual_address(start, virtual_address_bits)
+        || !crate::memory::is_canonical_virtual_address(end - 1, virtual_address_bits)
+    {
+        return Err(UserRegionError::NonCanonicalRange);
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessState {
@@ -41,6 +346,8 @@ pub enum ProcessTableError {
     AlreadyExited,
     NoChild,
     ChildStillRunning,
+    BadFileDescriptor,
+    DescriptorTableFull,
     ProcessIdExhausted,
 }
 
@@ -49,14 +356,23 @@ struct ProcessRecord {
     pid: ProcessId,
     parent: ProcessId,
     state: ProcessState,
+    descriptors: [Option<crate::syscall::ConsoleStream>; MAX_PROCESS_DESCRIPTORS],
+}
+
+fn initial_console_descriptors() -> [Option<crate::syscall::ConsoleStream>; MAX_PROCESS_DESCRIPTORS]
+{
+    let mut descriptors = [None; MAX_PROCESS_DESCRIPTORS];
+    descriptors[1] = Some(crate::syscall::ConsoleStream::Stdout);
+    descriptors[2] = Some(crate::syscall::ConsoleStream::Stderr);
+    descriptors
 }
 
 /// Bounded, allocation-free process lifecycle records for the first user slice.
 ///
 /// Exited records remain waitable zombies until their parent calls `try_wait`.
 /// If a parent exits first, its children are reparented to the kernel supervisor
-/// so their exit records remain reapable. Process roots and descriptor tables are
-/// owned by a future runtime layer, not by this policy table.
+/// so their exit records remain reapable. This table models only inherited console
+/// stream descriptors; file objects and address-space ownership live elsewhere.
 pub struct ProcessTable {
     records: [Option<ProcessRecord>; MAX_PROCESSES],
     next_pid: Option<u64>,
@@ -80,7 +396,7 @@ impl ProcessTable {
         {
             return Err(ProcessTableError::InitialProcessAlreadyExists);
         }
-        self.insert(KERNEL_PROCESS_ID)
+        self.insert(KERNEL_PROCESS_ID, initial_console_descriptors())
     }
 
     /// Register a child of a currently running process.
@@ -91,7 +407,7 @@ impl ProcessTable {
         if parent_record.state != ProcessState::Running {
             return Err(ProcessTableError::ParentExited);
         }
-        self.insert(parent)
+        self.insert(parent, parent_record.descriptors)
     }
 
     /// Record an exit status without reclaiming the process identity.
@@ -108,6 +424,7 @@ impl ProcessTable {
             return Err(ProcessTableError::AlreadyExited);
         }
         record.state = ProcessState::Exited(status);
+        record.descriptors = [None; MAX_PROCESS_DESCRIPTORS];
         for child in self.records.iter_mut().flatten() {
             if child.parent == pid {
                 child.parent = KERNEL_PROCESS_ID;
@@ -211,7 +528,79 @@ impl ProcessTable {
         self.records.iter().flatten().count()
     }
 
-    fn insert(&mut self, parent: ProcessId) -> Result<ProcessId, ProcessTableError> {
+    /// Resolve one live descriptor to its bounded console-stream target.
+    pub fn descriptor_stream(
+        &self,
+        pid: ProcessId,
+        descriptor: u64,
+    ) -> Option<crate::syscall::ConsoleStream> {
+        let descriptor = usize::try_from(descriptor).ok()?;
+        self.record(pid)?
+            .descriptors
+            .get(descriptor)
+            .copied()
+            .flatten()
+    }
+
+    /// Close one descriptor without affecting duplicated descriptors to the same stream.
+    pub fn close_descriptor(
+        &mut self,
+        pid: ProcessId,
+        descriptor: u64,
+    ) -> Result<(), ProcessTableError> {
+        let descriptor =
+            usize::try_from(descriptor).map_err(|_| ProcessTableError::BadFileDescriptor)?;
+        let record = self
+            .records
+            .iter_mut()
+            .flatten()
+            .find(|record| record.pid == pid)
+            .ok_or(ProcessTableError::InvalidProcess)?;
+        if record.state != ProcessState::Running {
+            return Err(ProcessTableError::AlreadyExited);
+        }
+        let entry = record
+            .descriptors
+            .get_mut(descriptor)
+            .ok_or(ProcessTableError::BadFileDescriptor)?;
+        entry.take().ok_or(ProcessTableError::BadFileDescriptor)?;
+        Ok(())
+    }
+
+    /// Duplicate a descriptor into the lowest free slot at or above descriptor 3.
+    pub fn duplicate_descriptor(
+        &mut self,
+        pid: ProcessId,
+        descriptor: u64,
+    ) -> Result<u64, ProcessTableError> {
+        let source = self
+            .descriptor_stream(pid, descriptor)
+            .ok_or(ProcessTableError::BadFileDescriptor)?;
+        let record = self
+            .records
+            .iter_mut()
+            .flatten()
+            .find(|record| record.pid == pid)
+            .ok_or(ProcessTableError::InvalidProcess)?;
+        if record.state != ProcessState::Running {
+            return Err(ProcessTableError::AlreadyExited);
+        }
+        let slot = record
+            .descriptors
+            .iter()
+            .enumerate()
+            .skip(3)
+            .find_map(|(index, descriptor)| descriptor.is_none().then_some(index))
+            .ok_or(ProcessTableError::DescriptorTableFull)?;
+        record.descriptors[slot] = Some(source);
+        Ok(slot as u64)
+    }
+
+    fn insert(
+        &mut self,
+        parent: ProcessId,
+        descriptors: [Option<crate::syscall::ConsoleStream>; MAX_PROCESS_DESCRIPTORS],
+    ) -> Result<ProcessId, ProcessTableError> {
         let slot = self
             .records
             .iter()
@@ -224,6 +613,7 @@ impl ProcessTable {
             pid,
             parent,
             state: ProcessState::Running,
+            descriptors,
         });
         Ok(pid)
     }
@@ -245,7 +635,9 @@ impl Default for ProcessTable {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessState, ProcessTable, ProcessTableError, WaitResult, KERNEL_PROCESS_ID, MAX_PROCESSES,
+        ProcessState, ProcessTable, ProcessTableError, UserRegionError, UserRegionKind,
+        UserRegionTable, WaitResult, KERNEL_PROCESS_ID, MAX_PROCESSES, MAX_PROCESS_DESCRIPTORS,
+        USER_ANONYMOUS_MAP_START,
     };
 
     #[test]
@@ -389,5 +781,212 @@ mod tests {
             Err(ProcessTableError::AlreadyExited)
         );
         assert_eq!(processes.spawn(child), Err(ProcessTableError::ParentExited));
+    }
+
+    #[test]
+    fn descriptors_start_with_console_streams_and_are_inherited_by_children() {
+        use crate::syscall::ConsoleStream;
+
+        let mut processes = ProcessTable::new();
+        let parent = processes.create_initial().unwrap();
+        assert_eq!(processes.descriptor_stream(parent, 0), None);
+        assert_eq!(
+            processes.descriptor_stream(parent, 1),
+            Some(ConsoleStream::Stdout)
+        );
+        assert_eq!(
+            processes.descriptor_stream(parent, 2),
+            Some(ConsoleStream::Stderr)
+        );
+
+        let duplicate = processes.duplicate_descriptor(parent, 1).unwrap();
+        assert_eq!(duplicate, 3);
+        let child = processes.spawn(parent).unwrap();
+        assert_eq!(
+            processes.descriptor_stream(child, 1),
+            Some(ConsoleStream::Stdout)
+        );
+        assert_eq!(
+            processes.descriptor_stream(child, 3),
+            Some(ConsoleStream::Stdout)
+        );
+
+        processes.close_descriptor(parent, 1).unwrap();
+        assert_eq!(processes.descriptor_stream(parent, 1), None);
+        assert_eq!(
+            processes.descriptor_stream(parent, 3),
+            Some(ConsoleStream::Stdout)
+        );
+        assert_eq!(
+            processes.descriptor_stream(child, 1),
+            Some(ConsoleStream::Stdout)
+        );
+    }
+
+    #[test]
+    fn descriptor_operations_reject_invalid_entries_reuse_slots_and_report_capacity() {
+        let mut processes = ProcessTable::new();
+        let process = processes.create_initial().unwrap();
+        assert_eq!(processes.descriptor_stream(process, u64::MAX), None);
+        assert_eq!(
+            processes.close_descriptor(process, 0),
+            Err(ProcessTableError::BadFileDescriptor)
+        );
+        assert_eq!(
+            processes.duplicate_descriptor(process, 0),
+            Err(ProcessTableError::BadFileDescriptor)
+        );
+
+        let first = processes.duplicate_descriptor(process, 1).unwrap();
+        processes.close_descriptor(process, first).unwrap();
+        assert_eq!(processes.descriptor_stream(process, first), None);
+        assert_eq!(processes.duplicate_descriptor(process, 2), Ok(first));
+        for descriptor in [4, 5, 6, 7] {
+            assert_eq!(processes.duplicate_descriptor(process, 1), Ok(descriptor));
+        }
+        assert_eq!(
+            processes.duplicate_descriptor(process, 1),
+            Err(ProcessTableError::DescriptorTableFull)
+        );
+        assert_eq!(
+            processes.close_descriptor(process, u64::MAX),
+            Err(ProcessTableError::BadFileDescriptor)
+        );
+    }
+
+    #[test]
+    fn exiting_process_closes_all_descriptors_and_children_keep_their_copies() {
+        let mut processes = ProcessTable::new();
+        let parent = processes.create_initial().unwrap();
+        let child = processes.spawn(parent).unwrap();
+        processes.duplicate_descriptor(parent, 1).unwrap();
+
+        processes.exit(parent, 0).unwrap();
+        for descriptor in 0..MAX_PROCESS_DESCRIPTORS as u64 {
+            assert_eq!(processes.descriptor_stream(parent, descriptor), None);
+        }
+        assert_eq!(
+            processes.descriptor_stream(child, 1),
+            Some(crate::syscall::ConsoleStream::Stdout)
+        );
+    }
+
+    #[test]
+    fn anonymous_regions_round_up_skip_reserved_ranges_and_reuse_after_release() {
+        let mut regions = UserRegionTable::new();
+        regions
+            .reserve(
+                USER_ANONYMOUS_MAP_START,
+                crate::paging::PAGE_SIZE,
+                UserRegionKind::Guard,
+                48,
+            )
+            .unwrap();
+
+        let anonymous = regions.allocate_anonymous(1, 48).unwrap();
+        assert_eq!(
+            anonymous.start(),
+            USER_ANONYMOUS_MAP_START + crate::paging::PAGE_SIZE
+        );
+        assert_eq!(anonymous.length(), crate::paging::PAGE_SIZE);
+        assert_eq!(anonymous.kind(), UserRegionKind::Anonymous);
+        assert_eq!(
+            regions.release_anonymous(anonymous.start(), anonymous.length()),
+            Ok(anonymous)
+        );
+
+        let reused = regions
+            .allocate_anonymous(crate::paging::PAGE_SIZE, 48)
+            .unwrap();
+        assert_eq!(reused.start(), anonymous.start());
+    }
+
+    #[test]
+    fn anonymous_regions_cannot_overlap_reserved_or_release_nonanonymous_ranges() {
+        let mut regions = UserRegionTable::new();
+        let stack = regions
+            .reserve(
+                0x7000_0000,
+                crate::paging::PAGE_SIZE,
+                UserRegionKind::Stack,
+                48,
+            )
+            .unwrap();
+        assert_eq!(
+            regions.reserve(stack.start(), stack.length(), UserRegionKind::Anonymous, 48),
+            Err(UserRegionError::Overlap)
+        );
+        assert_eq!(
+            regions.release_anonymous(stack.start(), stack.length()),
+            Err(UserRegionError::NotAnonymousRegion)
+        );
+    }
+
+    #[test]
+    fn user_regions_reject_invalid_width_alignment_overflow_and_upper_half() {
+        let mut regions = UserRegionTable::new();
+        assert_eq!(
+            regions.reserve(0x1000, crate::paging::PAGE_SIZE, UserRegionKind::Image, 47),
+            Err(UserRegionError::InvalidAddressWidth)
+        );
+        assert_eq!(
+            regions.reserve(0x1001, crate::paging::PAGE_SIZE, UserRegionKind::Image, 48),
+            Err(UserRegionError::UnalignedRange)
+        );
+        assert_eq!(
+            regions.reserve(
+                u64::MAX - (crate::paging::PAGE_SIZE - 1),
+                crate::paging::PAGE_SIZE,
+                UserRegionKind::Image,
+                48
+            ),
+            Err(UserRegionError::AddressOverflow)
+        );
+        assert_eq!(
+            regions.reserve(
+                0x0000_8000_0000_0000,
+                crate::paging::PAGE_SIZE,
+                UserRegionKind::Image,
+                48
+            ),
+            Err(UserRegionError::NonCanonicalRange)
+        );
+        assert_eq!(
+            regions.allocate_anonymous(0, 48),
+            Err(UserRegionError::EmptyRange)
+        );
+    }
+
+    #[test]
+    fn anonymous_region_capacity_and_window_exhaustion_are_explicit() {
+        let mut regions = UserRegionTable::new();
+        for slot in 0..super::MAX_USER_REGIONS {
+            regions
+                .reserve(
+                    0x1000_0000 + slot as u64 * crate::paging::PAGE_SIZE,
+                    crate::paging::PAGE_SIZE,
+                    UserRegionKind::Image,
+                    48,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            regions.allocate_anonymous(crate::paging::PAGE_SIZE, 48),
+            Err(UserRegionError::Capacity)
+        );
+
+        let mut full_window = UserRegionTable::new();
+        full_window
+            .reserve(
+                USER_ANONYMOUS_MAP_START,
+                super::USER_ANONYMOUS_MAP_END - USER_ANONYMOUS_MAP_START,
+                UserRegionKind::Guard,
+                48,
+            )
+            .unwrap();
+        assert_eq!(
+            full_window.allocate_anonymous(crate::paging::PAGE_SIZE, 48),
+            Err(UserRegionError::AnonymousAddressSpaceExhausted)
+        );
     }
 }

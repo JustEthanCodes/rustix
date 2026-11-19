@@ -655,7 +655,11 @@ fn fallback_syscall_result(
         Ok(
             SyscallRequest::Exit { .. }
             | SyscallRequest::Write { .. }
-            | SyscallRequest::Wait { .. },
+            | SyscallRequest::Wait { .. }
+            | SyscallRequest::Mmap { .. }
+            | SyscallRequest::Munmap { .. }
+            | SyscallRequest::Close { .. }
+            | SyscallRequest::Duplicate { .. },
         ) => SyscallError::NotSupported.return_value(),
         Err(error) => error.return_value(),
     }

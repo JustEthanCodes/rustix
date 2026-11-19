@@ -28,6 +28,75 @@ pub extern "C" fn _start() -> ! {
             exit(120);
         }
 
+        if !matches!(
+            rustix_user::mmap(0),
+            Err(rustix_user::SyscallError::InvalidArgument)
+        ) {
+            exit(136);
+        }
+        if !matches!(
+            rustix_user::mmap(rustix_user::USER_PAGE_SIZE + 1),
+            Err(rustix_user::SyscallError::ArgumentListTooLong)
+        ) {
+            exit(137);
+        }
+        let protected_stack_unmap = rustix_user::syscall(
+            rustix_user::SYS_MUNMAP,
+            [
+                USER_STACK_BASE,
+                rustix_user::USER_PAGE_SIZE as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        if protected_stack_unmap != -1 {
+            exit(138);
+        }
+
+        let anonymous_page = match rustix_user::mmap(1) {
+            Ok(region) => region,
+            Err(_) => exit(131),
+        };
+        let anonymous_pointer = anonymous_page.as_mut_ptr();
+        // SAFETY: The kernel returns one mapped, zeroed, writable user page, and
+        // this process has exclusive access to its new anonymous region.
+        unsafe {
+            if anonymous_pointer.read_volatile() != 0 {
+                exit(132);
+            }
+            anonymous_pointer.write_volatile(0x5a);
+            if anonymous_pointer.read_volatile() != 0x5a {
+                exit(133);
+            }
+        }
+        let anonymous_address = anonymous_page.address();
+        if rustix_user::munmap(anonymous_page).is_err() {
+            exit(134);
+        }
+        let unmapped_write = rustix_user::syscall(
+            rustix_user::SYS_WRITE,
+            [rustix_user::STDOUT, anonymous_address, 1, 0, 0, 0],
+        );
+        if unmapped_write != -3 {
+            exit(135);
+        }
+        let repeated_unmap = rustix_user::syscall(
+            rustix_user::SYS_MUNMAP,
+            [
+                anonymous_address,
+                rustix_user::USER_PAGE_SIZE as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        if repeated_unmap != -1 {
+            exit(139);
+        }
+
         if rustix_user::write_fmt(
             rustix_user::STDOUT,
             format_args!("rustix-init: hello from ring {}\n", 3),
@@ -65,6 +134,38 @@ pub extern "C" fn _start() -> ! {
         if rustix_user::write_all(rustix_user::STDOUT, WAIT_MESSAGE).is_err() {
             exit(126);
         }
+
+        let duplicate_stdout = match rustix_user::dup(rustix_user::STDOUT) {
+            Ok(fd) if fd >= 3 => fd,
+            _ => exit(140),
+        };
+        if rustix_user::write_all(duplicate_stdout, b"rustix-init: duplicated stdout works\n")
+            .is_err()
+        {
+            exit(141);
+        }
+        if rustix_user::close(duplicate_stdout).is_err() {
+            exit(142);
+        }
+        if !matches!(
+            rustix_user::write(duplicate_stdout, b"closed"),
+            Err(rustix_user::SyscallError::BadFileDescriptor)
+        ) {
+            exit(143);
+        }
+        if !matches!(
+            rustix_user::dup(duplicate_stdout),
+            Err(rustix_user::SyscallError::BadFileDescriptor)
+        ) {
+            exit(144);
+        }
+        if !matches!(
+            rustix_user::close(duplicate_stdout),
+            Err(rustix_user::SyscallError::BadFileDescriptor)
+        ) {
+            exit(145);
+        }
+
         if !matches!(
             rustix_user::wait(0, None),
             Err(rustix_user::SyscallError::NotSupported)

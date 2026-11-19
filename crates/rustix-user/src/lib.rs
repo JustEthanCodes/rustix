@@ -16,6 +16,11 @@ pub const SYS_ABI_VERSION: u64 = 0;
 pub const SYS_EXIT: u64 = 1;
 pub const SYS_WRITE: u64 = 2;
 pub const SYS_WAIT: u64 = 3;
+pub const SYS_MMAP: u64 = 4;
+pub const SYS_MUNMAP: u64 = 5;
+pub const SYS_CLOSE: u64 = 6;
+pub const SYS_DUP: u64 = 7;
+pub const USER_PAGE_SIZE: usize = 4096;
 
 pub const STDOUT: u64 = 1;
 pub const STDERR: u64 = 2;
@@ -33,6 +38,7 @@ pub enum SyscallError {
     ArgumentListTooLong,
     Overflow,
     NotSupported,
+    TooManyOpenFiles,
     ResultOutOfRange,
     Unknown(i64),
 }
@@ -84,6 +90,62 @@ pub fn write(file_descriptor: u64, bytes: &[u8]) -> Result<usize, SyscallError> 
         ],
     ))?;
     usize::try_from(result).map_err(|_| SyscallError::ResultOutOfRange)
+}
+
+/// Close a process-local descriptor.
+pub fn close(file_descriptor: u64) -> Result<(), SyscallError> {
+    match decode_result(syscall(SYS_CLOSE, [file_descriptor, 0, 0, 0, 0, 0]))? {
+        0 => Ok(()),
+        _ => Err(SyscallError::ResultOutOfRange),
+    }
+}
+
+/// Duplicate a descriptor into the lowest available descriptor slot.
+pub fn dup(file_descriptor: u64) -> Result<u64, SyscallError> {
+    decode_result(syscall(SYS_DUP, [file_descriptor, 0, 0, 0, 0, 0]))
+}
+
+/// A single page returned by the anonymous mapping syscall.
+///
+/// The pointer is raw: callers must not dereference it unless they uphold the
+/// normal pointer validity and aliasing requirements. `munmap` consumes the
+/// handle so safe code cannot accidentally release the same mapping twice.
+pub struct MappedRegion {
+    address: u64,
+}
+
+impl MappedRegion {
+    pub const fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub const fn length(&self) -> usize {
+        USER_PAGE_SIZE
+    }
+
+    pub const fn as_mut_ptr(&self) -> *mut u8 {
+        self.address as *mut u8
+    }
+}
+
+/// Map one zero-filled read/write, non-executable anonymous user page.
+///
+/// `requested_length` must be in `1..=USER_PAGE_SIZE`; the kernel maps one page
+/// and returns a `MappedRegion` whose length is exactly one page.
+pub fn mmap(requested_length: usize) -> Result<MappedRegion, SyscallError> {
+    let address = decode_result(syscall(SYS_MMAP, [requested_length as u64, 0, 0, 0, 0, 0]))?;
+    Ok(MappedRegion { address })
+}
+
+/// Unmap one page previously returned by [`mmap`].
+pub fn munmap(region: MappedRegion) -> Result<(), SyscallError> {
+    match decode_result(syscall(
+        SYS_MUNMAP,
+        [region.address, USER_PAGE_SIZE as u64, 0, 0, 0, 0],
+    ))? {
+        0 => Ok(()),
+        _ => Err(SyscallError::ResultOutOfRange),
+    }
 }
 
 /// Write all bytes, retrying successful short writes.
@@ -192,6 +254,7 @@ fn decode_result(result: i64) -> Result<u64, SyscallError> {
         Some(9) => Err(SyscallError::ArgumentListTooLong),
         Some(10) => Err(SyscallError::Overflow),
         Some(11) => Err(SyscallError::NotSupported),
+        Some(12) => Err(SyscallError::TooManyOpenFiles),
         _ => Err(SyscallError::Unknown(result)),
     }
 }
@@ -207,7 +270,8 @@ mod tests {
         assert_eq!(decode_result(-3), Err(SyscallError::Fault));
         assert_eq!(decode_result(-5), Err(SyscallError::NoChild));
         assert_eq!(decode_result(-11), Err(SyscallError::NotSupported));
-        assert_eq!(decode_result(-12), Err(SyscallError::Unknown(-12)));
+        assert_eq!(decode_result(-12), Err(SyscallError::TooManyOpenFiles));
+        assert_eq!(decode_result(-13), Err(SyscallError::Unknown(-13)));
         assert_eq!(
             decode_result(i64::MIN),
             Err(SyscallError::Unknown(i64::MIN))

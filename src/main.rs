@@ -2052,10 +2052,18 @@ impl rustix_kernel::syscall::ConsoleOutput for SerialProcessProbeOutput {
 struct ActiveUserProcessSyscallContext {
     roots: *mut (),
     user_memory: *mut (),
+    allocator: *mut rustix_kernel::frame::FrameAllocator,
+    user_regions: *mut rustix_kernel::process::UserRegionTable,
     process_table: *mut rustix_kernel::process::ProcessTable,
+    mtrr_layout: *const rustix_kernel::paging::ValidatedMtrrLayout,
     process: rustix_kernel::paging::ProcessAddressSpaceHandle,
     process_id: rustix_kernel::process::ProcessId,
     kernel_cr3: u64,
+    process_cr3: u64,
+    pat: rustix_kernel::paging::PatLayout,
+    normal_caching: bool,
+    physical_address_bits: u8,
+    virtual_address_bits: u8,
 }
 
 #[cfg(feature = "probe-user-process")]
@@ -2153,14 +2161,21 @@ extern "C" fn dispatch_active_user_process_syscall(
             user_buffer,
             length,
         } => {
+            let stream =
+                // SAFETY: The process table remains live and IF is clear for this
+                // synchronous single-vCPU dispatch.
+                unsafe { &*state.process_table }.descriptor_stream(state.process_id, fd);
+            let Some(stream) = stream else {
+                return SyscallError::BadFileDescriptor.return_value();
+            };
             let mut output = SerialProcessProbeOutput;
             // SAFETY: The kernel stack is not allocator-usable user memory; the
             // service copies via owned frame tokens and never dereferences user VA.
             match unsafe {
-                rustix_kernel::syscall::write_user_buffer(
+                rustix_kernel::syscall::write_user_buffer_to_stream(
                     roots,
                     state.process,
-                    fd,
+                    stream,
                     user_buffer,
                     length,
                     user_memory,
@@ -2171,7 +2186,33 @@ extern "C" fn dispatch_active_user_process_syscall(
                 Err(error) => error.return_value(),
             }
         }
+        SyscallRequest::Close { fd } => {
+            // SAFETY: Process-table mutation is serialized by IF=0 on the single CPU.
+            match unsafe { &mut *state.process_table }.close_descriptor(state.process_id, fd) {
+                Ok(()) => 0,
+                Err(error) => descriptor_error_to_syscall(error).return_value(),
+            }
+        }
+        SyscallRequest::Duplicate { fd } => {
+            // SAFETY: Process-table mutation is serialized by IF=0 on the single CPU.
+            match unsafe { &mut *state.process_table }.duplicate_descriptor(state.process_id, fd) {
+                Ok(duplicate) => duplicate as i64,
+                Err(error) => descriptor_error_to_syscall(error).return_value(),
+            }
+        }
         SyscallRequest::Exit { status } => finish_active_user_process(state, roots, status),
+        SyscallRequest::Mmap { length } => {
+            match map_anonymous_user_page(state, roots, user_memory, length) {
+                Ok(address) => address as i64,
+                Err(error) => error.return_value(),
+            }
+        }
+        SyscallRequest::Munmap { address } => {
+            match unmap_anonymous_user_page(state, roots, user_memory, address) {
+                Ok(()) => 0,
+                Err(error) => error.return_value(),
+            }
+        }
         SyscallRequest::Wait {
             child_pid,
             status_address,
@@ -2226,6 +2267,296 @@ extern "C" fn dispatch_active_user_process_syscall(
 }
 
 #[cfg(feature = "probe-user-process")]
+fn descriptor_error_to_syscall(
+    error: rustix_kernel::process::ProcessTableError,
+) -> rustix_kernel::syscall::SyscallError {
+    use rustix_kernel::process::ProcessTableError;
+    use rustix_kernel::syscall::SyscallError;
+
+    match error {
+        ProcessTableError::BadFileDescriptor => SyscallError::BadFileDescriptor,
+        ProcessTableError::DescriptorTableFull => SyscallError::TooManyOpenFiles,
+        _ => SyscallError::InvalidArgument,
+    }
+}
+
+#[cfg(feature = "probe-user-process")]
+fn map_anonymous_user_page<M, U>(
+    state: &mut ActiveUserProcessSyscallContext,
+    roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+    user_memory: &mut U,
+    requested_length: u64,
+) -> Result<u64, rustix_kernel::syscall::SyscallError>
+where
+    M: rustix_kernel::paging::CandidatePageTableMemory,
+    U: rustix_kernel::paging::UserFrameMemory,
+{
+    let Some(regions) = (unsafe { state.user_regions.as_mut() }) else {
+        halt_forever();
+    };
+    let region = regions
+        .allocate_anonymous(requested_length, state.virtual_address_bits)
+        .map_err(user_region_error_to_syscall)?;
+
+    switch_process_to_kernel_root(state, roots);
+    let map_result = allocate_and_map_user_page(state, roots, user_memory, region.start());
+    switch_kernel_to_process_root(state, roots);
+
+    if map_result.is_err() {
+        let Some(regions) = (unsafe { state.user_regions.as_mut() }) else {
+            halt_forever();
+        };
+        if regions
+            .release_anonymous(region.start(), region.length())
+            .is_err()
+        {
+            halt_forever();
+        }
+    }
+    map_result.map(|()| region.start())
+}
+
+#[cfg(feature = "probe-user-process")]
+fn allocate_and_map_user_page<M, U>(
+    state: &mut ActiveUserProcessSyscallContext,
+    roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+    user_memory: &mut U,
+    virtual_address: u64,
+) -> Result<(), rustix_kernel::syscall::SyscallError>
+where
+    M: rustix_kernel::paging::CandidatePageTableMemory,
+    U: rustix_kernel::paging::UserFrameMemory,
+{
+    use rustix_kernel::paging::zero_user_frame;
+    use rustix_kernel::syscall::SyscallError;
+
+    let Some(allocator) = (unsafe { state.allocator.as_mut() }) else {
+        halt_forever();
+    };
+    let frame = allocator.allocate().ok_or(SyscallError::OutOfMemory)?;
+    if zero_user_frame(&frame, user_memory).is_err() {
+        if allocator.deallocate(frame).is_err() {
+            halt_forever();
+        }
+        return Err(SyscallError::Io);
+    }
+    let (mapping, cache_attributes) = match user_mapping_attributes(state, virtual_address, &frame)
+    {
+        Ok(attributes) => attributes,
+        Err(error) => {
+            if allocator.deallocate(frame).is_err() {
+                halt_forever();
+            }
+            return Err(error);
+        }
+    };
+    match roots.map_user_page(allocator, state.process, frame, mapping, cache_attributes) {
+        Ok(()) => Ok(()),
+        Err(failure) => {
+            let error = page_map_error_to_syscall(failure.cause);
+            if allocator.deallocate(failure.frame).is_err() {
+                halt_forever();
+            }
+            Err(error)
+        }
+    }
+}
+
+#[cfg(feature = "probe-user-process")]
+fn unmap_anonymous_user_page<M, U>(
+    state: &mut ActiveUserProcessSyscallContext,
+    roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+    user_memory: &mut U,
+    virtual_address: u64,
+) -> Result<(), rustix_kernel::syscall::SyscallError>
+where
+    M: rustix_kernel::paging::CandidatePageTableMemory,
+    U: rustix_kernel::paging::UserFrameMemory,
+{
+    use rustix_kernel::paging::PAGE_SIZE;
+    use rustix_kernel::process::UserRegionKind;
+    use rustix_kernel::syscall::SyscallError;
+
+    let Some(regions) = (unsafe { state.user_regions.as_mut() }) else {
+        halt_forever();
+    };
+    let is_anonymous = regions.regions().any(|region| {
+        region.start() == virtual_address
+            && region.length() == PAGE_SIZE
+            && region.kind() == UserRegionKind::Anonymous
+    });
+    if !is_anonymous {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    let mut probe = [0u8; 1];
+    // SAFETY: This kernel-stack byte is disjoint from all allocator-owned user
+    // frames; copy_from_user validates and accesses the user frame by token.
+    if let Err(failure) =
+        unsafe { roots.copy_from_user(state.process, virtual_address, &mut probe, user_memory) }
+    {
+        return Err(match failure.cause {
+            rustix_kernel::paging::ProcessUserCopyError::Memory(_) => SyscallError::Io,
+            _ => SyscallError::Fault,
+        });
+    }
+
+    switch_process_to_kernel_root(state, roots);
+    let Some(allocator) = (unsafe { state.allocator.as_mut() }) else {
+        halt_forever();
+    };
+    let frame = match roots.unmap_user_page(state.process, virtual_address) {
+        Ok(frame) => frame,
+        Err(_) => {
+            switch_kernel_to_process_root(state, roots);
+            return Err(SyscallError::Io);
+        }
+    };
+    if let Err(failure) = allocator.deallocate(frame) {
+        let frame = failure.frame;
+        let (mapping, cache_attributes) =
+            match user_mapping_attributes(state, virtual_address, &frame) {
+                Ok(attributes) => attributes,
+                Err(_) => halt_forever(),
+            };
+        if let Err(failure) =
+            roots.map_user_page(allocator, state.process, frame, mapping, cache_attributes)
+        {
+            let _owned_frame = failure.frame;
+            halt_forever();
+        }
+        switch_kernel_to_process_root(state, roots);
+        return Err(SyscallError::Io);
+    }
+    let Some(regions) = (unsafe { state.user_regions.as_mut() }) else {
+        halt_forever();
+    };
+    if regions
+        .release_anonymous(virtual_address, PAGE_SIZE)
+        .is_err()
+    {
+        halt_forever();
+    }
+    switch_kernel_to_process_root(state, roots);
+    Ok(())
+}
+
+#[cfg(feature = "probe-user-process")]
+fn user_mapping_attributes(
+    state: &ActiveUserProcessSyscallContext,
+    virtual_address: u64,
+    frame: &rustix_kernel::frame::Frame,
+) -> Result<
+    (
+        rustix_kernel::paging::ValidatedMappingRange,
+        rustix_kernel::paging::SelectedCacheAttributes,
+    ),
+    rustix_kernel::syscall::SyscallError,
+> {
+    use rustix_kernel::paging::{CachePolicy, PagePermissions, PAGE_SIZE};
+    use rustix_kernel::syscall::SyscallError;
+
+    let mapping = rustix_kernel::paging::validate_mapping_range(
+        virtual_address,
+        frame.address(),
+        PAGE_SIZE,
+        PagePermissions {
+            writable: true,
+            executable: false,
+            user_accessible: true,
+        },
+        Some(state.physical_address_bits),
+        state.virtual_address_bits,
+    )
+    .map_err(|_| SyscallError::InvalidArgument)?;
+    // SAFETY: The validated register snapshot lives in the synchronous process
+    // probe stack until the callback is cleared and the process returns.
+    let Some(mtrr_layout) = (unsafe { state.mtrr_layout.as_ref() }) else {
+        halt_forever();
+    };
+    let cache_attributes = mapping
+        .select_cache_attributes(
+            CachePolicy::WriteBack,
+            state.pat,
+            mtrr_layout,
+            state.normal_caching,
+        )
+        .map_err(|_| SyscallError::Io)?;
+    Ok((mapping, cache_attributes))
+}
+
+#[cfg(feature = "probe-user-process")]
+fn switch_process_to_kernel_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
+    state: &ActiveUserProcessSyscallContext,
+    roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+) {
+    // SAFETY: Syscall entry has IF clear and runs on a stack mapped in both roots.
+    unsafe { arch::x86_64::cpu::write_cr3_with_global_flush(state.kernel_cr3) };
+    if arch::x86_64::cpu::read_cr3_raw() != state.kernel_cr3 {
+        halt_forever();
+    }
+    // SAFETY: The kernel root is active and no other CPU can use this process root.
+    if unsafe { roots.mark_inactive(state.process) }.is_err() {
+        halt_forever();
+    }
+}
+
+#[cfg(feature = "probe-user-process")]
+fn switch_kernel_to_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
+    state: &ActiveUserProcessSyscallContext,
+    roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+) {
+    // SAFETY: The process root is owned and mapped for this synchronous run;
+    // the kernel/TSS stacks are shared and IF remains clear across the switch.
+    unsafe { arch::x86_64::cpu::write_cr3_with_global_flush(state.process_cr3) };
+    if arch::x86_64::cpu::read_cr3_raw() != state.process_cr3 {
+        halt_forever();
+    }
+    // SAFETY: CR3 now names this process root, and the shared kernel owner and
+    // root set remain live until this synchronous process exits.
+    if unsafe { roots.mark_active(state.process) }.is_err() {
+        halt_forever();
+    }
+}
+
+#[cfg(feature = "probe-user-process")]
+fn user_region_error_to_syscall(
+    error: rustix_kernel::process::UserRegionError,
+) -> rustix_kernel::syscall::SyscallError {
+    use rustix_kernel::process::UserRegionError;
+    use rustix_kernel::syscall::SyscallError;
+
+    match error {
+        UserRegionError::Capacity | UserRegionError::AnonymousAddressSpaceExhausted => {
+            SyscallError::OutOfMemory
+        }
+        UserRegionError::AddressOverflow => SyscallError::Overflow,
+        _ => SyscallError::InvalidArgument,
+    }
+}
+
+#[cfg(feature = "probe-user-process")]
+fn page_map_error_to_syscall<E>(
+    error: rustix_kernel::paging::ProcessPageMapError<E>,
+) -> rustix_kernel::syscall::SyscallError {
+    use rustix_kernel::paging::{CandidateMapErrorKind, ProcessPageMapError};
+    use rustix_kernel::syscall::SyscallError;
+
+    match error {
+        ProcessPageMapError::Candidate(
+            CandidateMapErrorKind::OutOfFrames
+            | CandidateMapErrorKind::MappingCapacity
+            | CandidateMapErrorKind::TableCapacity,
+        ) => SyscallError::OutOfMemory,
+        ProcessPageMapError::Candidate(CandidateMapErrorKind::TableMemory(_)) => SyscallError::Io,
+        ProcessPageMapError::Candidate(CandidateMapErrorKind::Mapping(_)) => {
+            SyscallError::InvalidArgument
+        }
+        _ => SyscallError::InvalidArgument,
+    }
+}
+
+#[cfg(feature = "probe-user-process")]
 extern "C" fn dispatch_active_user_process_exception(vector: u64, opaque: *mut ()) -> bool {
     if vector >= 128 {
         return false;
@@ -2259,7 +2590,7 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
 ) -> Result<(), &'static str> {
     use rustix_kernel::paging::{
         validate_mapping_range, CachePolicy, MtrrState, PagePermissions, PatLayout,
-        ProcessAddressSpaceRoots, PAGE_SIZE,
+        ProcessAddressSpaceRoots,
     };
 
     let init_image =
@@ -2327,6 +2658,23 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
         physical_address_bits: Some(physical_address_bits),
         virtual_address_bits: cpu_info.active_linear_address_bits,
     };
+    let mut user_regions = rustix_kernel::process::UserRegionTable::new();
+    const USER_STACK_BASE: u64 = 0x0000_7fff_ffff_f000;
+    let stack_layout = match user_regions.reserve_elf_layout(
+        &init_image,
+        USER_STACK_BASE,
+        1,
+        1,
+        cpu_info.active_linear_address_bits,
+    ) {
+        Ok(layout) => layout,
+        Err(_) => {
+            roots.destroy(allocator, process).map_err(|_| {
+                "process root could not be destroyed after image/stack reservation failed"
+            })?;
+            return Err("ELF image, stack, or guard could not be reserved");
+        }
+    };
 
     if let Err(failure) = init_image.load_into_process_root(
         &mut roots,
@@ -2346,15 +2694,13 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
         return Err("bundled init ELF could not be loaded into the process root");
     }
 
-    const USER_STACK_BASE: u64 = 0x0000_7fff_ffff_f000;
-    const USER_STACK_GUARD_BASE: u64 = USER_STACK_BASE - PAGE_SIZE;
     let mut guard_probe = [0u8; 1];
     // SAFETY: The destination is kernel stack storage and does not alias any
     // user frame owned by this process. A valid guard must fail as unmapped.
     match unsafe {
         roots.copy_from_user(
             process,
-            USER_STACK_GUARD_BASE,
+            stack_layout.guard_region().start(),
             &mut guard_probe,
             &mut user_memory,
         )
@@ -2390,9 +2736,9 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
         return Err("user stack frame could not be zeroed");
     }
     let stack_mapping = match validate_mapping_range(
-        USER_STACK_BASE,
+        stack_layout.stack_region().start(),
         stack_frame.address(),
-        PAGE_SIZE,
+        stack_layout.stack_region().length(),
         PagePermissions {
             writable: true,
             executable: false,
@@ -2436,9 +2782,12 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
         return Err("user stack page could not be mapped");
     }
 
-    let stack_pointer = USER_STACK_BASE + PAGE_SIZE;
     if roots
-        .validate_initial_user_state(process, init_image.entry_point(), stack_pointer)
+        .validate_initial_user_state(
+            process,
+            init_image.entry_point(),
+            stack_layout.stack_pointer(),
+        )
         .is_err()
     {
         roots
@@ -2515,7 +2864,7 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
         instruction_pointer: init_image.entry_point(),
         code_selector: u64::from(arch::x86_64::interrupts::USER_CODE_SELECTOR),
         flags: rustix_kernel::syscall::SAFE_USER_RFLAGS,
-        stack_pointer,
+        stack_pointer: stack_layout.stack_pointer(),
         stack_selector: u64::from(arch::x86_64::interrupts::USER_DATA_SELECTOR),
     };
     let user_frame = match rustix_kernel::syscall::sanitize_user_iret_frame(
@@ -2534,10 +2883,18 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
     let mut process_context = ActiveUserProcessSyscallContext {
         roots: core::ptr::addr_of_mut!(roots).cast(),
         user_memory: core::ptr::addr_of_mut!(user_memory).cast(),
+        allocator: core::ptr::addr_of_mut!(*allocator),
+        user_regions: core::ptr::addr_of_mut!(user_regions),
         process_table: core::ptr::addr_of_mut!(process_table),
+        mtrr_layout: core::ptr::addr_of!(mtrr_layout),
         process,
         process_id,
         kernel_cr3,
+        process_cr3,
+        pat,
+        normal_caching: cpu_info.normal_caching,
+        physical_address_bits,
+        virtual_address_bits: cpu_info.active_linear_address_bits,
     };
     // SAFETY: IF was disabled by the caller; all pointer targets remain live
     // until the synchronous user entry returns through its exit syscall.
@@ -2555,20 +2912,15 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
         })?;
         return Err("user syscall handler setup failed");
     }
-    // SAFETY: IF remains disabled, and this complete root was prevalidated.
-    if unsafe { roots.mark_active(process) }.is_err() {
-        // SAFETY: No user callback is in flight and the root is not installed.
-        unsafe { arch::x86_64::interrupts::clear_user_syscall_handler() };
-        roots
-            .destroy(allocator, process)
-            .map_err(|_| "process root could not be destroyed after activation failed")?;
-        return Err("process root could not be marked active");
-    }
-
     // SAFETY: The process root shares the validated supervisor kernel half and
     // the kernel/TSS stacks are mapped in both roots; interrupts remain disabled.
     unsafe { arch::x86_64::cpu::write_cr3_with_global_flush(process_cr3) };
     if arch::x86_64::cpu::read_cr3_raw() != process_cr3 {
+        halt_forever();
+    }
+    // SAFETY: CR3 now names the process root, and this synchronous caller keeps
+    // both the shared kernel owner and process-root set alive through exit.
+    if unsafe { roots.mark_active(process) }.is_err() {
         halt_forever();
     }
     // SAFETY: The mapped entry/stack were validated above; syscall/fault dispatch
