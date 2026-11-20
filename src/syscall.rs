@@ -9,6 +9,9 @@ pub const ABI_MINOR: u16 = 0;
 pub const ABI_VERSION: u64 = (ABI_MAJOR as u64) << 16 | ABI_MINOR as u64;
 pub const MAX_WRITE_BYTES: u64 = 4096;
 pub const USER_ANONYMOUS_PAGE_BYTES: u64 = crate::paging::PAGE_SIZE;
+pub const MAX_USER_ANONYMOUS_REGION_BYTES: u64 = 1 << 20;
+pub const MAX_SPAWN_IMAGE_BYTES: u64 = 1 << 20;
+pub const MAX_SPAWN_STACK_PAGES: u64 = 16;
 pub const USER_SYSCALL_VECTOR: u8 = 0x80;
 pub const USER_DATA_SELECTOR: u16 = 0x2b;
 pub const USER_CODE_SELECTOR: u16 = 0x33;
@@ -27,6 +30,9 @@ pub mod number {
     pub const MUNMAP: u64 = 5;
     pub const CLOSE: u64 = 6;
     pub const DUP: u64 = 7;
+    pub const MMAP_REGION: u64 = 8;
+    pub const MUNMAP_REGION: u64 = 9;
+    pub const SPAWN: u64 = 10;
 }
 
 /// Stable v1 error numbers. Syscall returns encode these as negative `i64`s.
@@ -219,11 +225,23 @@ pub enum SyscallRequest {
         child_pid: u64,
         status_address: Option<u64>,
     },
+    Spawn {
+        image_address: u64,
+        image_length: usize,
+        stack_pages: usize,
+    },
     Mmap {
         length: u64,
     },
     Munmap {
         address: u64,
+    },
+    MmapRegion {
+        length: u64,
+    },
+    MunmapRegion {
+        address: u64,
+        length: u64,
     },
     Close {
         fd: u64,
@@ -386,6 +404,22 @@ pub const fn decode_syscall(
                 Some(arguments.rsi)
             },
         }),
+        number::SPAWN => {
+            if arguments.rsi == 0 {
+                return Err(SyscallError::InvalidArgument);
+            }
+            if arguments.rsi > MAX_SPAWN_IMAGE_BYTES {
+                return Err(SyscallError::TooBig);
+            }
+            if arguments.rdx == 0 || arguments.rdx > MAX_SPAWN_STACK_PAGES {
+                return Err(SyscallError::InvalidArgument);
+            }
+            Ok(SyscallRequest::Spawn {
+                image_address: arguments.rdi,
+                image_length: arguments.rsi as usize,
+                stack_pages: arguments.rdx as usize,
+            })
+        }
         number::MMAP => {
             if arguments.rdi == 0 {
                 return Err(SyscallError::InvalidArgument);
@@ -407,6 +441,32 @@ pub const fn decode_syscall(
                 address: arguments.rdi,
             })
         }
+        number::MMAP_REGION => {
+            if arguments.rdi == 0 {
+                return Err(SyscallError::InvalidArgument);
+            }
+            if arguments.rdi > MAX_USER_ANONYMOUS_REGION_BYTES {
+                return Err(SyscallError::TooBig);
+            }
+            Ok(SyscallRequest::MmapRegion {
+                length: arguments.rdi,
+            })
+        }
+        number::MUNMAP_REGION => {
+            if arguments.rsi > MAX_USER_ANONYMOUS_REGION_BYTES {
+                return Err(SyscallError::TooBig);
+            }
+            if arguments.rsi == 0
+                || arguments.rdi & (crate::paging::PAGE_SIZE - 1) != 0
+                || arguments.rsi & (crate::paging::PAGE_SIZE - 1) != 0
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            Ok(SyscallRequest::MunmapRegion {
+                address: arguments.rdi,
+                length: arguments.rsi,
+            })
+        }
         number::CLOSE => Ok(SyscallRequest::Close { fd: arguments.rdi }),
         number::DUP => Ok(SyscallRequest::Duplicate { fd: arguments.rdi }),
         _ => Err(SyscallError::NoSys),
@@ -418,8 +478,9 @@ mod tests {
     use super::{
         decode_syscall, number, sanitize_user_iret_frame, sanitize_user_syscall_return_frame,
         SyscallArguments, SyscallError, SyscallRequest, UserIretFrame, UserIretFrameError,
-        ABI_VERSION, MAX_WRITE_BYTES, SAFE_USER_RFLAGS, USER_ANONYMOUS_PAGE_BYTES,
-        USER_CODE_SELECTOR, USER_DATA_SELECTOR,
+        ABI_VERSION, MAX_SPAWN_IMAGE_BYTES, MAX_SPAWN_STACK_PAGES, MAX_USER_ANONYMOUS_REGION_BYTES,
+        MAX_WRITE_BYTES, SAFE_USER_RFLAGS, USER_ANONYMOUS_PAGE_BYTES, USER_CODE_SELECTOR,
+        USER_DATA_SELECTOR,
     };
 
     const EMPTY_ARGUMENTS: SyscallArguments = SyscallArguments {
@@ -452,6 +513,9 @@ mod tests {
         assert_eq!(number::MUNMAP, 5);
         assert_eq!(number::CLOSE, 6);
         assert_eq!(number::DUP, 7);
+        assert_eq!(number::MMAP_REGION, 8);
+        assert_eq!(number::MUNMAP_REGION, 9);
+        assert_eq!(number::SPAWN, 10);
         assert_eq!(
             decode_syscall(number::ABI_VERSION, EMPTY_ARGUMENTS),
             Ok(SyscallRequest::AbiVersion)
@@ -544,6 +608,62 @@ mod tests {
             decode_syscall(number::WRITE, arguments),
             Err(SyscallError::TooBig)
         );
+    }
+
+    #[test]
+    fn spawn_decoding_accepts_bounded_image_and_stack_page_limits() {
+        for (image_length, stack_pages) in [(1, 1), (MAX_SPAWN_IMAGE_BYTES, MAX_SPAWN_STACK_PAGES)]
+        {
+            let arguments = SyscallArguments {
+                rdi: 0x4000,
+                rsi: image_length,
+                rdx: stack_pages,
+                ..EMPTY_ARGUMENTS
+            };
+            assert_eq!(
+                decode_syscall(number::SPAWN, arguments),
+                Ok(SyscallRequest::Spawn {
+                    image_address: 0x4000,
+                    image_length: image_length as usize,
+                    stack_pages: stack_pages as usize,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_decoding_rejects_empty_or_oversized_images_and_invalid_stack_pages() {
+        let empty_image = SyscallArguments {
+            rsi: 0,
+            rdx: 1,
+            ..EMPTY_ARGUMENTS
+        };
+        assert_eq!(
+            decode_syscall(number::SPAWN, empty_image),
+            Err(SyscallError::InvalidArgument)
+        );
+
+        let oversized_image = SyscallArguments {
+            rsi: MAX_SPAWN_IMAGE_BYTES + 1,
+            rdx: 1,
+            ..EMPTY_ARGUMENTS
+        };
+        assert_eq!(
+            decode_syscall(number::SPAWN, oversized_image),
+            Err(SyscallError::TooBig)
+        );
+
+        for stack_pages in [0, MAX_SPAWN_STACK_PAGES + 1] {
+            let invalid_stack = SyscallArguments {
+                rsi: 1,
+                rdx: stack_pages,
+                ..EMPTY_ARGUMENTS
+            };
+            assert_eq!(
+                decode_syscall(number::SPAWN, invalid_stack),
+                Err(SyscallError::InvalidArgument)
+            );
+        }
     }
 
     #[test]
@@ -644,6 +764,95 @@ mod tests {
     }
 
     #[test]
+    fn multi_page_mapping_requests_are_bounded_and_exactly_unmapped() {
+        assert_eq!(
+            decode_syscall(
+                number::MMAP_REGION,
+                SyscallArguments {
+                    rdi: USER_ANONYMOUS_PAGE_BYTES + 1,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Ok(SyscallRequest::MmapRegion {
+                length: USER_ANONYMOUS_PAGE_BYTES + 1,
+            })
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MMAP_REGION,
+                SyscallArguments {
+                    rdi: MAX_USER_ANONYMOUS_REGION_BYTES,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Ok(SyscallRequest::MmapRegion {
+                length: MAX_USER_ANONYMOUS_REGION_BYTES,
+            })
+        );
+        assert_eq!(
+            decode_syscall(number::MMAP_REGION, EMPTY_ARGUMENTS),
+            Err(SyscallError::InvalidArgument)
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MMAP_REGION,
+                SyscallArguments {
+                    rdi: MAX_USER_ANONYMOUS_REGION_BYTES + 1,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Err(SyscallError::TooBig)
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MUNMAP_REGION,
+                SyscallArguments {
+                    rdi: 0x4000,
+                    rsi: USER_ANONYMOUS_PAGE_BYTES * 2,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Ok(SyscallRequest::MunmapRegion {
+                address: 0x4000,
+                length: USER_ANONYMOUS_PAGE_BYTES * 2,
+            })
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MUNMAP_REGION,
+                SyscallArguments {
+                    rdi: 0x4001,
+                    rsi: USER_ANONYMOUS_PAGE_BYTES,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Err(SyscallError::InvalidArgument)
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MUNMAP_REGION,
+                SyscallArguments {
+                    rdi: 0x4000,
+                    rsi: 0,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Err(SyscallError::InvalidArgument)
+        );
+        assert_eq!(
+            decode_syscall(
+                number::MUNMAP_REGION,
+                SyscallArguments {
+                    rdi: 0x4000,
+                    rsi: MAX_USER_ANONYMOUS_REGION_BYTES + 1,
+                    ..EMPTY_ARGUMENTS
+                }
+            ),
+            Err(SyscallError::TooBig)
+        );
+    }
+
+    #[test]
     fn user_iret_frame_checks_selectors_addresses_alignment_and_sanitizes_flags() {
         let mut frame = valid_iret_frame();
         let sanitized = sanitize_user_iret_frame(frame, 48).unwrap().into_raw();
@@ -719,7 +928,10 @@ mod tests {
 
     #[test]
     fn unassigned_numbers_return_enosys() {
-        assert_eq!(decode_syscall(8, EMPTY_ARGUMENTS), Err(SyscallError::NoSys));
+        assert_eq!(
+            decode_syscall(11, EMPTY_ARGUMENTS),
+            Err(SyscallError::NoSys)
+        );
         assert_eq!(
             decode_syscall(u64::MAX, EMPTY_ARGUMENTS),
             Err(SyscallError::NoSys)

@@ -43,15 +43,44 @@ fn main() {
         "failed to build rustix-user runtime"
     );
 
+    let child_output = out_dir.join("rustix-child.elf");
+    let child_status = Command::new(&rustc)
+        .current_dir(&root)
+        .env("OUT_DIR", &out_dir)
+        .arg("--crate-name")
+        .arg("rustix_child")
+        .arg("--edition=2021")
+        .arg("--check-cfg=cfg(rustix_child_probe)")
+        .arg("--cfg=rustix_child_probe")
+        .arg("--crate-type=bin")
+        .arg("--target=x86_64-unknown-none")
+        .arg("-Cpanic=abort")
+        .arg("-Copt-level=2")
+        .arg("-Ccode-model=small")
+        .arg("-Crelocation-model=static")
+        .arg("-Ctarget-feature=-avx,-avx2,-avx512f")
+        .arg(format!("-Clink-arg=-T{}", linker_script.display()))
+        .arg("-Clink-arg=--build-id=none")
+        .arg("--extern")
+        .arg(format!("rustix_user={}", runtime.display()))
+        .arg(&source)
+        .arg("-o")
+        .arg(&child_output)
+        .status()
+        .expect("failed to invoke rustc for the child probe payload");
+    assert!(child_status.success(), "failed to build child probe ELF");
+
     let output = out_dir.join("rustix-init.elf");
     let linker_arg = format!("-T{}", linker_script.display());
     let mut command = Command::new(rustc);
     command
         .current_dir(&root)
+        .env("OUT_DIR", &out_dir)
         .arg("--crate-name")
         .arg("rustix_init")
         .arg("--edition=2021")
         .arg("--check-cfg=cfg(rustix_fault_probe)")
+        .arg("--check-cfg=cfg(rustix_child_probe)")
         .arg("--check-cfg=cfg(rustix_user_fault_ud)")
         .arg("--check-cfg=cfg(rustix_user_fault_page)")
         .arg("--check-cfg=cfg(rustix_user_fault_gp)")

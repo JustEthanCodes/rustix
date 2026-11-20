@@ -294,6 +294,341 @@ impl Default for UserRegionTable {
     }
 }
 
+/// Maximum number of pages accepted for a process's initial user stack.
+pub const MAX_INITIAL_USER_STACK_PAGES: u64 = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserProgramPrepareErrorKind {
+    InvalidElf,
+    RootCreation,
+    RegionReservation,
+    ElfLoad,
+    StackGuard,
+    StackAllocation,
+    StackInitialization,
+    StackMapping,
+    InvalidInitialState,
+    InvalidIretFrame,
+    CachePolicy(&'static str),
+}
+
+impl UserProgramPrepareErrorKind {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidElf => "ELF image validation failed",
+            Self::RootCreation => "process root creation failed",
+            Self::RegionReservation => "ELF, stack, or guard reservation failed",
+            Self::ElfLoad => "ELF image could not be loaded",
+            Self::StackGuard => "stack guard is not unmapped",
+            Self::StackAllocation => "no frame available for the user stack",
+            Self::StackInitialization => "user stack frame could not be zeroed",
+            Self::StackMapping => "user stack page could not be mapped",
+            Self::InvalidInitialState => "ELF entry or user stack failed validation",
+            Self::InvalidIretFrame => "initial user IRET frame was rejected",
+            Self::CachePolicy(message) => message,
+        }
+    }
+}
+
+/// Resources that a caller must retry cleaning up when preparation fails.
+/// `process` remains owned by `roots`; `frame` is an allocated frame that was
+/// not installed in that process root.
+#[must_use = "retry cleanup for any process root or frame retained by this error"]
+pub struct UserProgramPrepareError {
+    pub kind: UserProgramPrepareErrorKind,
+    pub process: Option<crate::paging::ProcessAddressSpaceHandle>,
+    pub frame: Option<crate::frame::Frame>,
+}
+
+impl UserProgramPrepareError {
+    /// Retry reclaiming every resource retained by this failure.
+    pub fn cleanup<M: crate::paging::CandidatePageTableMemory>(
+        mut self,
+        roots: &mut crate::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+        allocator: &mut crate::frame::FrameAllocator,
+    ) -> Result<(), Self> {
+        if let Some(process) = self.process.take() {
+            if roots.destroy(allocator, process).is_err() {
+                self.process = Some(process);
+                return Err(self);
+            }
+        }
+        if let Some(frame) = self.frame.take() {
+            if let Err(error) = allocator.deallocate(frame) {
+                self.frame = Some(error.frame);
+                return Err(self);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Debug for UserProgramPrepareError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("UserProgramPrepareError")
+            .field("kind", &self.kind)
+            .field("process_retained", &self.process.is_some())
+            .field("frame_retained", &self.frame.is_some())
+            .finish()
+    }
+}
+
+/// A loaded ELF image and its validated initial Ring 3 entry state.
+pub struct PreparedUserProgram {
+    pub process: crate::paging::ProcessAddressSpaceHandle,
+    pub regions: UserRegionTable,
+    pub user_frame: crate::syscall::ValidatedUserIretFrame,
+}
+
+fn cleanup_failed_user_program<M: crate::paging::CandidatePageTableMemory>(
+    roots: &mut crate::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+    allocator: &mut crate::frame::FrameAllocator,
+    process: crate::paging::ProcessAddressSpaceHandle,
+    kind: UserProgramPrepareErrorKind,
+    frame: Option<crate::frame::Frame>,
+) -> UserProgramPrepareError {
+    let retained_process = roots.destroy(allocator, process).err().map(|_| process);
+    let retained_frame = frame.and_then(|frame| match allocator.deallocate(frame) {
+        Ok(()) => None,
+        Err(error) => Some(error.frame),
+    });
+    UserProgramPrepareError {
+        kind,
+        process: retained_process,
+        frame: retained_frame,
+    }
+}
+
+/// Load a static ELF image into a fresh process root and prepare its guarded,
+/// zero-filled initial user stack. All limits are explicit and failures return
+/// any root or frame whose ownership could not be reclaimed.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_user_program<M, U, F>(
+    roots: &mut crate::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+    allocator: &mut crate::frame::FrameAllocator,
+    user_memory: &mut U,
+    image_bytes: &[u8],
+    stack_base: u64,
+    stack_pages: u64,
+    guard_pages: u64,
+    physical_address_bits: u8,
+    virtual_address_bits: u8,
+    user_code_selector: u16,
+    user_data_selector: u16,
+    select_cache: &mut F,
+) -> Result<PreparedUserProgram, UserProgramPrepareError>
+where
+    M: crate::paging::CandidatePageTableMemory,
+    U: crate::paging::UserFrameMemory,
+    F: FnMut(
+        crate::paging::ValidatedMappingRange,
+    ) -> Result<crate::paging::SelectedCacheAttributes, &'static str>,
+{
+    use crate::paging::{validate_mapping_range, PagePermissions, PAGE_SIZE};
+
+    let image = crate::elf::Elf64Image::parse(image_bytes, virtual_address_bits).map_err(|_| {
+        UserProgramPrepareError {
+            kind: UserProgramPrepareErrorKind::InvalidElf,
+            process: None,
+            frame: None,
+        }
+    })?;
+    if stack_pages == 0 || stack_pages > MAX_INITIAL_USER_STACK_PAGES || guard_pages == 0 {
+        return Err(UserProgramPrepareError {
+            kind: UserProgramPrepareErrorKind::RegionReservation,
+            process: None,
+            frame: None,
+        });
+    }
+    let process = match roots.create(allocator) {
+        Ok(process) => process,
+        Err(failure) => {
+            let frame = failure.frame;
+            let frame = frame.and_then(|frame| match allocator.deallocate(frame) {
+                Ok(()) => None,
+                Err(error) => Some(error.frame),
+            });
+            return Err(UserProgramPrepareError {
+                kind: UserProgramPrepareErrorKind::RootCreation,
+                process: None,
+                frame,
+            });
+        }
+    };
+    let mut regions = UserRegionTable::new();
+    let stack_layout = match regions.reserve_elf_layout(
+        &image,
+        stack_base,
+        stack_pages,
+        guard_pages,
+        virtual_address_bits,
+    ) {
+        Ok(layout) => layout,
+        Err(_) => {
+            return Err(cleanup_failed_user_program(
+                roots,
+                allocator,
+                process,
+                UserProgramPrepareErrorKind::RegionReservation,
+                None,
+            ));
+        }
+    };
+    if let Err(failure) =
+        image.load_into_process_root(roots, allocator, process, user_memory, &mut *select_cache)
+    {
+        return Err(cleanup_failed_user_program(
+            roots,
+            allocator,
+            process,
+            UserProgramPrepareErrorKind::ElfLoad,
+            failure.frame,
+        ));
+    }
+
+    let mut guard_probe = [0u8; 1];
+    // SAFETY: The scratch byte is kernel stack storage, disjoint from user frames.
+    // The reserved guard range must have no mapped user backing.
+    match unsafe {
+        roots.copy_from_user(
+            process,
+            stack_layout.guard_region().start(),
+            &mut guard_probe,
+            user_memory,
+        )
+    } {
+        Err(failure) if matches!(failure.cause, crate::paging::ProcessUserCopyError::Unmapped) => {}
+        _ => {
+            return Err(cleanup_failed_user_program(
+                roots,
+                allocator,
+                process,
+                UserProgramPrepareErrorKind::StackGuard,
+                None,
+            ));
+        }
+    }
+
+    for offset in (0..stack_layout.stack_region().length()).step_by(PAGE_SIZE as usize) {
+        let frame = match allocator.allocate() {
+            Some(frame) => frame,
+            None => {
+                return Err(cleanup_failed_user_program(
+                    roots,
+                    allocator,
+                    process,
+                    UserProgramPrepareErrorKind::StackAllocation,
+                    None,
+                ));
+            }
+        };
+        if crate::paging::zero_user_frame(&frame, user_memory).is_err() {
+            return Err(cleanup_failed_user_program(
+                roots,
+                allocator,
+                process,
+                UserProgramPrepareErrorKind::StackInitialization,
+                Some(frame),
+            ));
+        }
+        let Some(virtual_address) = stack_layout.stack_region().start().checked_add(offset) else {
+            return Err(cleanup_failed_user_program(
+                roots,
+                allocator,
+                process,
+                UserProgramPrepareErrorKind::StackMapping,
+                Some(frame),
+            ));
+        };
+        let mapping = match validate_mapping_range(
+            virtual_address,
+            frame.address(),
+            PAGE_SIZE,
+            PagePermissions {
+                writable: true,
+                executable: false,
+                user_accessible: true,
+            },
+            Some(physical_address_bits),
+            virtual_address_bits,
+        ) {
+            Ok(mapping) => mapping,
+            Err(_) => {
+                return Err(cleanup_failed_user_program(
+                    roots,
+                    allocator,
+                    process,
+                    UserProgramPrepareErrorKind::StackMapping,
+                    Some(frame),
+                ));
+            }
+        };
+        let cache_attributes = match select_cache(mapping) {
+            Ok(attributes) => attributes,
+            Err(message) => {
+                return Err(cleanup_failed_user_program(
+                    roots,
+                    allocator,
+                    process,
+                    UserProgramPrepareErrorKind::CachePolicy(message),
+                    Some(frame),
+                ));
+            }
+        };
+        if let Err(failure) =
+            roots.map_user_page(allocator, process, frame, mapping, cache_attributes)
+        {
+            return Err(cleanup_failed_user_program(
+                roots,
+                allocator,
+                process,
+                UserProgramPrepareErrorKind::StackMapping,
+                Some(failure.frame),
+            ));
+        }
+    }
+
+    if roots
+        .validate_initial_user_state(process, image.entry_point(), stack_layout.stack_pointer())
+        .is_err()
+    {
+        return Err(cleanup_failed_user_program(
+            roots,
+            allocator,
+            process,
+            UserProgramPrepareErrorKind::InvalidInitialState,
+            None,
+        ));
+    }
+    let raw_frame = crate::syscall::UserIretFrame {
+        instruction_pointer: image.entry_point(),
+        code_selector: u64::from(user_code_selector),
+        flags: crate::syscall::SAFE_USER_RFLAGS,
+        stack_pointer: stack_layout.stack_pointer(),
+        stack_selector: u64::from(user_data_selector),
+    };
+    let user_frame = match crate::syscall::sanitize_user_iret_frame(raw_frame, virtual_address_bits)
+    {
+        Ok(frame) => frame,
+        Err(_) => {
+            return Err(cleanup_failed_user_program(
+                roots,
+                allocator,
+                process,
+                UserProgramPrepareErrorKind::InvalidIretFrame,
+                None,
+            ));
+        }
+    };
+
+    Ok(PreparedUserProgram {
+        process,
+        regions,
+        user_frame,
+    })
+}
+
 fn validate_user_region_range(
     start: u64,
     length: u64,

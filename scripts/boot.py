@@ -706,12 +706,15 @@ def process_smoke_workflow(timeout: int) -> None:
         output = serial_log.read_text(encoding="latin-1") if serial_log.exists() else ""
         markers = (
             "bundled init ELF validated:",
+            "Ring 3 entry stack validated: pid=1,",
             "rustix-init: hello from ring 3",
             "rustix-init: invalid user buffer returned EFAULT",
-            "rustix-init: wait copied child status 7 after EFAULT retry",
-            "rustix-init: wait returned ENOTSUP for a running child",
+            "rustix-child: real child entered ring 3 and is exiting",
+            "rustix-init: blocking wait copied child status 7 after EFAULT retry",
+            "rustix-init: heap Vec and Box round-trip ok",
+            "rustix-init: multi-page mmap zero/write/unmap ok",
             "init process exited with status 42 and was reaped by kernel wait",
-            "Ring 3 init passed: write/EFAULT/ready-child wait/running-child ENOTSUP/exit syscalls, kernel wait, and process-root teardown",
+            "Ring 3 init passed: write/EFAULT/blocking child wait/exit syscalls, kernel wait, and process-root teardown",
         )
         missing = [marker for marker in markers if marker not in output]
         if missing:
@@ -720,7 +723,7 @@ def process_smoke_workflow(timeout: int) -> None:
                 + ", ".join(repr(marker) for marker in missing)
                 + f"\nSerial output:\n{output}"
             )
-        print("QEMU Ring 3 init write/EFAULT/ready-child wait/running-child ENOTSUP/exit, kernel wait, and process-root teardown passed.")
+        print("QEMU Ring 3 init write/EFAULT/blocking child wait/exit, kernel wait, and process-root teardown passed.")
     except (BuildError, OSError, subprocess.SubprocessError) as error:
         failure = error
 

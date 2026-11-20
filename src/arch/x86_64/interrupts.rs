@@ -144,26 +144,59 @@ pub(crate) type UserSyscallHandler =
 #[cfg(feature = "probe-user-process")]
 pub(crate) type UserExceptionHandler = extern "C" fn(u64, *mut ()) -> bool;
 
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct UserKernelFxState([u8; 512]);
+
+/// State retained by one suspended or running Ring 3 entry.
+///
+/// The scheduler may later select among these records, so continuation, exit,
+/// callback, and kernel FPU state must not be shared between processes.
+#[repr(C, align(16))]
+pub(crate) struct UserEntryState {
+    resume_rsp: u64,
+    exit_status: i32,
+    exit_pending: u8,
+    reserved: [u8; 3],
+    previous: *mut UserEntryState,
+    syscall_context: *mut (),
+    kernel_fx_state: UserKernelFxState,
+}
+
+#[cfg(feature = "probe-user-process")]
+impl UserEntryState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            resume_rsp: 0,
+            exit_status: 0,
+            exit_pending: 0,
+            reserved: [0; 3],
+            previous: core::ptr::null_mut(),
+            syscall_context: core::ptr::null_mut(),
+            kernel_fx_state: UserKernelFxState([0; 512]),
+        }
+    }
+}
+
+const _: [(); 0] = [(); core::mem::offset_of!(UserEntryState, resume_rsp)];
+const _: [(); 8] = [(); core::mem::offset_of!(UserEntryState, exit_status)];
+const _: [(); 12] = [(); core::mem::offset_of!(UserEntryState, exit_pending)];
+const _: [(); 16] = [(); core::mem::offset_of!(UserEntryState, previous)];
+const _: [(); 24] = [(); core::mem::offset_of!(UserEntryState, syscall_context)];
+const _: [(); 32] = [(); core::mem::offset_of!(UserEntryState, kernel_fx_state)];
+
+#[no_mangle]
+static mut RUSTIX_ACTIVE_USER_ENTRY: *mut UserEntryState = core::ptr::null_mut();
+
 #[cfg(feature = "probe-user-process")]
 #[derive(Clone, Copy)]
 struct UserSyscallRuntime {
     handler: UserSyscallHandler,
     exception_handler: UserExceptionHandler,
-    context: *mut (),
 }
 
 #[cfg(feature = "probe-user-process")]
 static mut USER_SYSCALL_RUNTIME: Option<UserSyscallRuntime> = None;
-#[no_mangle]
-static mut RUSTIX_USER_RESUME_RSP: u64 = 0;
-#[no_mangle]
-static mut RUSTIX_USER_EXIT_PENDING: u8 = 0;
-#[no_mangle]
-static mut RUSTIX_USER_EXIT_STATUS: i32 = 0;
-#[repr(C, align(16))]
-struct UserKernelFxState([u8; 512]);
-#[no_mangle]
-static mut RUSTIX_USER_KERNEL_FX_STATE: UserKernelFxState = UserKernelFxState([0; 512]);
 
 /// A device interrupt callback. The callback is responsible for issuing EOI.
 pub type IrqHandler = extern "C" fn();
@@ -225,9 +258,13 @@ extern "C" {
     fn rustix_load_gdt(descriptor_table_pointer: *const DescriptorTablePointer);
     fn rustix_syscall_stub();
     #[cfg(feature = "probe-user-process")]
-    fn rustix_enter_user(frame: *const rustix_kernel::syscall::UserIretFrame) -> i32;
+    fn rustix_enter_user(
+        frame: *const rustix_kernel::syscall::UserIretFrame,
+        state: *mut UserEntryState,
+    ) -> i32;
     #[cfg(feature = "probe-user-process")]
     fn rustix_user_exception_exit() -> !;
+
 }
 
 /// Install a private kernel GDT/TSS, exception gates, and device IRQ gates.
@@ -388,6 +425,7 @@ pub enum UserRuntimeError {
     InterruptsEnabled,
     AlreadyInstalled,
     NotInstalled,
+    InvalidEntryState,
 }
 
 /// Select the stack used by the next privilege transition from CPL3 to CPL0.
@@ -424,6 +462,22 @@ pub unsafe fn set_kernel_entry_stack(
     Ok(())
 }
 
+/// Restore TSS.RSP0 to the bootstrap ring-0 stack.
+///
+/// # Safety
+/// The TSS must be initialized, local interrupts must be disabled, and the
+/// caller must be executing on a different live stack before the restore.
+#[allow(dead_code)]
+pub unsafe fn restore_bootstrap_kernel_entry_stack(
+    virtual_address_bits: u8,
+) -> Result<(), KernelEntryStackError> {
+    let ring0_stack = core::ptr::addr_of_mut!(RING0_STACK).cast::<u8>();
+    // SAFETY: `RING0_STACK` is the initialized, fixed-size bootstrap entry stack.
+    let ring0_top = unsafe { ring0_stack.add(STACK_SIZE) } as u64;
+    // SAFETY: This function's contract establishes TSS initialization and IF=0.
+    unsafe { set_kernel_entry_stack(ring0_top, virtual_address_bits) }
+}
+
 /// Install the syscall callback for one synchronously entered user process.
 ///
 /// # Safety
@@ -433,7 +487,6 @@ pub unsafe fn set_kernel_entry_stack(
 pub(crate) unsafe fn install_user_syscall_handler(
     handler: UserSyscallHandler,
     exception_handler: UserExceptionHandler,
-    context: *mut (),
 ) -> Result<(), UserRuntimeError> {
     let flags: u64;
     // SAFETY: The temporary stack operation is balanced at CPL 0.
@@ -451,14 +504,11 @@ pub(crate) unsafe fn install_user_syscall_handler(
         runtime.write(Some(UserSyscallRuntime {
             handler,
             exception_handler,
-            context,
         }))
     };
-    // SAFETY: IF is clear and assembly reads these values only on this CPU.
-    unsafe {
-        core::ptr::addr_of_mut!(RUSTIX_USER_EXIT_PENDING).write(0);
-        core::ptr::addr_of_mut!(RUSTIX_USER_EXIT_STATUS).write(0);
-    }
+    // SAFETY: IF is clear and assembly reads this single-vCPU pointer only while
+    // a Ring 3 entry is active.
+    unsafe { core::ptr::addr_of_mut!(RUSTIX_ACTIVE_USER_ENTRY).write(core::ptr::null_mut()) };
     Ok(())
 }
 
@@ -468,6 +518,11 @@ pub(crate) unsafe fn install_user_syscall_handler(
 /// Local interrupts must be disabled, and no syscall callback may be in flight.
 #[cfg(feature = "probe-user-process")]
 pub(crate) unsafe fn clear_user_syscall_handler() {
+    // SAFETY: IF is clear and no user-entry trampoline may remain active when
+    // clearing the callback or its process-local state.
+    if !unsafe { core::ptr::addr_of!(RUSTIX_ACTIVE_USER_ENTRY).read() }.is_null() {
+        fatal_irq_halt();
+    }
     let runtime = core::ptr::addr_of_mut!(USER_SYSCALL_RUNTIME);
     // SAFETY: The API contract guarantees single-vCPU exclusion with IF clear.
     unsafe { runtime.write(None) };
@@ -480,14 +535,23 @@ pub(crate) unsafe fn clear_user_syscall_handler() {
 /// and execution must be on this single CPU with maskable interrupts disabled.
 #[cfg(feature = "probe-user-process")]
 pub(crate) unsafe fn request_user_process_exit(status: i32) {
-    // SAFETY: The caller satisfies the documented ordering and single-vCPU contract.
+    // SAFETY: IF is clear and the active entry points to the live process state
+    // whose syscall or exception callback is currently executing.
+    let state = unsafe { core::ptr::addr_of!(RUSTIX_ACTIVE_USER_ENTRY).read() };
+    if state.is_null() {
+        fatal_irq_halt();
+    }
     unsafe {
-        core::ptr::addr_of_mut!(RUSTIX_USER_EXIT_STATUS).write(status);
+        core::ptr::addr_of_mut!((*state).exit_status).write(status);
         core::sync::atomic::compiler_fence(Ordering::Release);
-        core::ptr::addr_of_mut!(RUSTIX_USER_EXIT_PENDING).write(1);
+        core::ptr::addr_of_mut!((*state).exit_pending).write(1);
     }
 }
 
+/// Run a callback on a distinct live supervisor stack and return on the
+/// original stack. The callback must return normally.
+///
+/// # Safety
 /// Enter a validated user frame and return only through the process-exit path.
 ///
 /// # Safety
@@ -497,6 +561,8 @@ pub(crate) unsafe fn request_user_process_exit(status: i32) {
 #[cfg(feature = "probe-user-process")]
 pub(crate) unsafe fn enter_user(
     frame: rustix_kernel::syscall::ValidatedUserIretFrame,
+    state: *mut UserEntryState,
+    syscall_context: *mut (),
 ) -> Result<i32, UserRuntimeError> {
     let flags: u64;
     // SAFETY: The temporary stack operation is balanced at CPL 0.
@@ -509,10 +575,16 @@ pub(crate) unsafe fn enter_user(
     if unsafe { runtime.read() }.is_none() {
         return Err(UserRuntimeError::NotInstalled);
     }
+    if state.is_null() || (state as usize) & 0xf != 0 || syscall_context.is_null() {
+        return Err(UserRuntimeError::InvalidEntryState);
+    }
+    // SAFETY: The caller provides one unique, aligned, live state record for
+    // this user entry; it remains writable until the entry returns.
+    unsafe { core::ptr::addr_of_mut!((*state).syscall_context).write(syscall_context) };
     let frame = frame.into_raw();
-    // SAFETY: The caller establishes the root, stack, TSS, callback, and fault
-    // policy invariants. The assembly returns only after a process exit request.
-    Ok(unsafe { rustix_enter_user(&frame) })
+    // SAFETY: The caller establishes the root, stack, callback, and fault
+    // policy invariants. The assembly returns only after this entry exits.
+    Ok(unsafe { rustix_enter_user(&frame, state) })
 }
 
 /// Register one callback for an allocated device IRQ vector.
@@ -631,10 +703,17 @@ pub extern "C" fn rustix_syscall_dispatch(context: *mut rustix_kernel::syscall::
     #[cfg(feature = "probe-user-process")]
     let result = {
         let runtime = core::ptr::addr_of!(USER_SYSCALL_RUNTIME);
-        // SAFETY: IF is clear and only this CPU can update the runtime slot.
+        // SAFETY: IF is clear and only this CPU can update the function table.
         let runtime = unsafe { runtime.read() };
         if let Some(runtime) = runtime {
-            (runtime.handler)(context, runtime.context)
+            let state = unsafe { core::ptr::addr_of!(RUSTIX_ACTIVE_USER_ENTRY).read() };
+            if state.is_null() {
+                fatal_irq_halt();
+            }
+            // SAFETY: The active process state was installed by `enter_user` and
+            // remains live on its kernel context while this syscall is handled.
+            let callback_context = unsafe { core::ptr::addr_of!((*state).syscall_context).read() };
+            (runtime.handler)(context, callback_context)
         } else {
             fallback_syscall_result(context.rax, arguments)
         }
@@ -656,8 +735,11 @@ fn fallback_syscall_result(
             SyscallRequest::Exit { .. }
             | SyscallRequest::Write { .. }
             | SyscallRequest::Wait { .. }
+            | SyscallRequest::Spawn { .. }
             | SyscallRequest::Mmap { .. }
             | SyscallRequest::Munmap { .. }
+            | SyscallRequest::MmapRegion { .. }
+            | SyscallRequest::MunmapRegion { .. }
             | SyscallRequest::Close { .. }
             | SyscallRequest::Duplicate { .. },
         ) => SyscallError::NotSupported.return_value(),
@@ -684,6 +766,13 @@ pub extern "C" fn rustix_exception_dispatch(context: *const ExceptionContext) ->
         // SAFETY: Exceptions arrive with IF clear; the diagnostic process runtime
         // is installed only for the synchronous single-vCPU user entry.
         if let Some(runtime) = unsafe { runtime.read() } {
+            let state = unsafe { core::ptr::addr_of!(RUSTIX_ACTIVE_USER_ENTRY).read() };
+            if state.is_null() {
+                fatal_irq_halt();
+            }
+            // SAFETY: The active process entry remains live through its exception
+            // callback and exit trampoline.
+            let callback_context = unsafe { core::ptr::addr_of!((*state).syscall_context).read() };
             let depth = InterruptContextGuard::enter();
             crate::kprintln!(
                 "USER EXCEPTION: vector {} ({}) error={:#018x}; terminating process",
@@ -703,12 +792,12 @@ pub extern "C" fn rustix_exception_dispatch(context: *const ExceptionContext) ->
                 };
                 crate::kprintln!("user page fault address (CR2): {:#018x}", fault_address);
             }
-            if (runtime.exception_handler)(context.vector, runtime.context) {
+            if (runtime.exception_handler)(context.vector, callback_context) {
                 core::sync::atomic::compiler_fence(Ordering::Acquire);
                 // SAFETY: The callback's contract guarantees it has restored the
                 // kernel root and marked the process root inactive before setting
-                // this single-vCPU exit flag.
-                if unsafe { core::ptr::addr_of!(RUSTIX_USER_EXIT_PENDING).read() } != 0 {
+                // this entry's exit flag.
+                if unsafe { core::ptr::addr_of!((*state).exit_pending).read() } != 0 {
                     drop(depth);
                     // SAFETY: The exit callback restored CR3, completed teardown
                     // ownership transitions, and IF remains disabled. The asm
@@ -1050,8 +1139,12 @@ rustix_syscall_stub:
     mov rdi, rbx
     call rustix_syscall_dispatch
     fxrstor64 [rsp]
-    cmp byte ptr [rip + RUSTIX_USER_EXIT_PENDING], 0
+    mov rax, qword ptr [rip + RUSTIX_ACTIVE_USER_ENTRY]
+    test rax, rax
+    jz .Lrustix_syscall_return_to_user
+    cmp byte ptr [rax + 12], 0
     jne rustix_user_exit_return
+.Lrustix_syscall_return_to_user:
     mov rsp, rbx
     pop r15
     pop r14
@@ -1070,6 +1163,7 @@ rustix_syscall_stub:
     pop rax
     iretq
 
+
     .global rustix_enter_user
     .type rustix_enter_user, @function
 rustix_enter_user:
@@ -1081,9 +1175,15 @@ rustix_enter_user:
     push r13
     push r14
     push r15
-    mov qword ptr [rip + RUSTIX_USER_RESUME_RSP], rsp
-    fxsave64 [rip + RUSTIX_USER_KERNEL_FX_STATE]
     mov rbx, rdi
+    mov r12, rsi
+    test r12, r12
+    jz rustix_syscall_fatal_entry
+    mov qword ptr [r12], rsp
+    fxsave64 [r12 + 32]
+    mov rax, qword ptr [rip + RUSTIX_ACTIVE_USER_ENTRY]
+    mov qword ptr [r12 + 16], rax
+    mov qword ptr [rip + RUSTIX_ACTIVE_USER_ENTRY], r12
     push qword ptr [rbx + 32]
     push qword ptr [rbx + 24]
     push qword ptr [rbx + 16]
@@ -1114,17 +1214,23 @@ rustix_user_exception_exit:
 
 rustix_user_exit_return:
     # The handler already restored the kernel CR3 and marked the process root
-    # inactive. Restore the kernel's pre-user x87/SSE state and continuation.
-    fxrstor64 [rip + RUSTIX_USER_KERNEL_FX_STATE]
-    mov rsp, qword ptr [rip + RUSTIX_USER_RESUME_RSP]
+    # inactive. Restore this entry's kernel FPU state and continuation.
+    mov rax, qword ptr [rip + RUSTIX_ACTIVE_USER_ENTRY]
+    test rax, rax
+    jz rustix_syscall_fatal_entry
+    mov r8, rax
+    mov eax, dword ptr [r8 + 8]
+    mov byte ptr [r8 + 12], 0
+    mov rdx, qword ptr [r8 + 16]
+    mov qword ptr [rip + RUSTIX_ACTIVE_USER_ENTRY], rdx
+    fxrstor64 [r8 + 32]
+    mov rsp, qword ptr [r8]
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbp
     pop rbx
-    mov eax, dword ptr [rip + RUSTIX_USER_EXIT_STATUS]
-    mov byte ptr [rip + RUSTIX_USER_EXIT_PENDING], 0
     ret
 
 rustix_syscall_fatal_entry:

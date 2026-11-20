@@ -1,21 +1,52 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+#[cfg(not(rustix_child_probe))]
+use alloc::boxed::Box;
+#[cfg(not(rustix_child_probe))]
+use alloc::vec::Vec;
 use core::arch::asm;
 use core::panic::PanicInfo;
 
+#[global_allocator]
+static ALLOCATOR: rustix_user::UserAllocator = rustix_user::UserAllocator::new();
+
 const FAULT_MESSAGE: &[u8] = b"rustix-init: invalid user buffer returned EFAULT\n";
-const WAIT_MESSAGE: &[u8] = b"rustix-init: wait copied child status 7 after EFAULT retry\n";
-const RUNNING_WAIT_MESSAGE: &[u8] = b"rustix-init: wait returned ENOTSUP for a running child\n";
+const WAIT_MESSAGE: &[u8] =
+    b"rustix-init: blocking wait copied child status 7 after EFAULT retry\n";
 const USER_STACK_BASE: u64 = 0x0000_7fff_ffff_f000;
 const USER_STACK_GUARD_ADDRESS: u64 = USER_STACK_BASE - 0x1000;
+const HEAP_MESSAGE: &[u8] = b"rustix-init: heap Vec and Box round-trip ok\n";
+const MULTI_PAGE_MESSAGE: &[u8] = b"rustix-init: multi-page mmap zero/write/unmap ok\n";
 
+#[cfg(rustix_child_probe)]
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    if rustix_user::write_all(
+        rustix_user::STDOUT,
+        b"rustix-child: real child entered ring 3 and is exiting\n",
+    )
+    .is_err()
+    {
+        exit(70);
+    }
+    rustix_user::exit(7)
+}
+
+#[cfg(not(rustix_child_probe))]
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     #[cfg(rustix_fault_probe)]
     trigger_user_fault();
 
     #[cfg(not(rustix_fault_probe))]
+    rustix_user::run_main(init_main)
+}
+
+#[cfg(all(not(rustix_fault_probe), not(rustix_child_probe)))]
+fn init_main() -> i32 {
     {
         // SAFETY: The kernel maps this byte in the newly allocated initial stack
         // page and clears the page before entering this diagnostic process.
@@ -97,6 +128,63 @@ pub extern "C" fn _start() -> ! {
             exit(139);
         }
 
+        let multi_page = match rustix_user::mmap_region(rustix_user::USER_PAGE_SIZE + 1) {
+            Ok(region) if region.length() == rustix_user::USER_PAGE_SIZE * 2 => region,
+            _ => exit(148),
+        };
+        let multi_page_address = multi_page.address();
+        // SAFETY: mmap_region returns two zeroed, writable pages, and these
+        // accesses straddle their boundary while remaining within the mapping.
+        unsafe {
+            let first = multi_page.as_mut_ptr().add(rustix_user::USER_PAGE_SIZE - 1);
+            let second = multi_page.as_mut_ptr().add(rustix_user::USER_PAGE_SIZE);
+            if first.read_volatile() != 0 || second.read_volatile() != 0 {
+                exit(149);
+            }
+            first.write_volatile(0xa5);
+            second.write_volatile(0x5a);
+            if first.read_volatile() != 0xa5 || second.read_volatile() != 0x5a {
+                exit(150);
+            }
+        }
+        let partial_multi_page_unmap = rustix_user::syscall(
+            rustix_user::SYS_MUNMAP_REGION,
+            [
+                multi_page_address,
+                rustix_user::USER_PAGE_SIZE as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        if partial_multi_page_unmap != -1 {
+            exit(154);
+        }
+        // SAFETY: Rejected partial unmaps must leave the complete region mapped.
+        unsafe {
+            if (multi_page_address as *const u8)
+                .add(rustix_user::USER_PAGE_SIZE - 1)
+                .read_volatile()
+                != 0xa5
+            {
+                exit(155);
+            }
+        }
+        if rustix_user::munmap_region(multi_page).is_err() {
+            exit(151);
+        }
+        let stale_multi_page_write = rustix_user::syscall(
+            rustix_user::SYS_WRITE,
+            [rustix_user::STDOUT, multi_page_address, 1, 0, 0, 0],
+        );
+        if stale_multi_page_write != -3 {
+            exit(152);
+        }
+        if rustix_user::write_all(rustix_user::STDOUT, MULTI_PAGE_MESSAGE).is_err() {
+            exit(153);
+        }
+
         if rustix_user::write_fmt(
             rustix_user::STDOUT,
             format_args!("rustix-init: hello from ring {}\n", 3),
@@ -166,20 +254,22 @@ pub extern "C" fn _start() -> ! {
             exit(145);
         }
 
-        if !matches!(
-            rustix_user::wait(0, None),
-            Err(rustix_user::SyscallError::NotSupported)
-        ) {
-            exit(128);
+        let values: Vec<u32> = (0..64).collect();
+        let boxed = Box::new(values.iter().map(|value| u64::from(*value)).sum::<u64>());
+        if *boxed != 2016 || values.len() != 64 {
+            exit(146);
         }
-        if rustix_user::write_all(rustix_user::STDOUT, RUNNING_WAIT_MESSAGE).is_err() {
-            exit(129);
+        drop(values);
+        drop(boxed);
+        if rustix_user::write_all(rustix_user::STDOUT, HEAP_MESSAGE).is_err() {
+            exit(147);
         }
-        rustix_user::exit(42)
+
+        42
     }
 }
 
-#[cfg(rustix_fault_probe)]
+#[cfg(all(rustix_fault_probe, not(rustix_child_probe)))]
 fn trigger_user_fault() -> ! {
     #[cfg(rustix_user_fault_ud)]
     // SAFETY: This payload variant deliberately raises user-mode #UD in QEMU.

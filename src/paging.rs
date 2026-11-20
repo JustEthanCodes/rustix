@@ -4898,6 +4898,227 @@ mod tests {
 
     #[allow(clippy::drop_non_drop)]
     #[test]
+    fn reusable_user_program_preparation_maps_bounded_stack_and_cleans_up_failures() {
+        let mut elf_bytes = [0; 0x2000];
+        elf_bytes[..4].copy_from_slice(b"\x7fELF");
+        elf_bytes[4] = 2;
+        elf_bytes[5] = 1;
+        elf_bytes[6] = 1;
+        elf_bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf_bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        elf_bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf_bytes[24..32].copy_from_slice(&0x4000_0000u64.to_le_bytes());
+        elf_bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf_bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf_bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf_bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        elf_bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+        elf_bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
+        elf_bytes[72..80].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf_bytes[80..88].copy_from_slice(&0x4000_0000u64.to_le_bytes());
+        elf_bytes[96..104].copy_from_slice(&16u64.to_le_bytes());
+        elf_bytes[104..112].copy_from_slice(&(PAGE_SIZE * 2).to_le_bytes());
+        elf_bytes[112..120].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+        elf_bytes[0x1000..0x1010].fill(0x90);
+
+        let config = four_level_walk_config();
+        let mut allocator = candidate_allocator(48);
+        let initial_free_frames = allocator.free_frames();
+        let mut kernel_memory = CandidateTestMemory::new();
+        let mut kernel =
+            CandidatePageTables::new(&mut allocator, &mut kernel_memory, config).unwrap();
+        kernel
+            .clone_inherited_hierarchy(
+                &mut allocator,
+                &SyntheticReader::new(),
+                parse_cr3_root(0x8000, Some(40), false).unwrap(),
+            )
+            .unwrap();
+        let shared = kernel.share_supervisor_kernel_half().unwrap();
+        let mut process_memory = CandidateTestMemory::new();
+        let mut roots =
+            ProcessAddressSpaceRoots::new(&shared, &mut process_memory, config).unwrap();
+        let mut user_memory = SyntheticUserMemory::new();
+        let pat = PatLayout::from_msr_value(0x0606_0606_0606_0606).unwrap();
+        let mtrrs = empty_mtrr_registers(0, (1 << 11) | MtrrMemoryType::WriteBack as u64)
+            .validated_layout(40)
+            .unwrap();
+        let free_before_prepare = allocator.free_frames();
+        let stack_base = 0x7000_0000;
+        let mut select_cache = |mapping: ValidatedMappingRange| {
+            mapping
+                .select_cache_attributes(CachePolicy::WriteBack, pat, &mtrrs, true)
+                .map_err(|_| "cache policy selection failed")
+        };
+        let program = crate::process::prepare_user_program(
+            &mut roots,
+            &mut allocator,
+            &mut user_memory,
+            &elf_bytes,
+            stack_base,
+            2,
+            1,
+            40,
+            48,
+            crate::syscall::USER_CODE_SELECTOR,
+            crate::syscall::USER_DATA_SELECTOR,
+            &mut select_cache,
+        )
+        .unwrap();
+        let stack_region = program
+            .regions
+            .regions()
+            .find(|region| region.kind() == crate::process::UserRegionKind::Stack)
+            .unwrap();
+        assert_eq!(stack_region.start(), stack_base);
+        assert_eq!(stack_region.length(), 2 * PAGE_SIZE);
+        assert_eq!(
+            program.user_frame.into_raw().stack_pointer,
+            stack_base + 2 * PAGE_SIZE
+        );
+        let mut stack_bytes = [0xff; PAGE_SIZE as usize];
+        for offset in [0, PAGE_SIZE] {
+            stack_bytes.fill(0xff);
+            // SAFETY: This scratch array is disjoint from the synthetic user-frame backend.
+            assert_eq!(
+                unsafe {
+                    roots.copy_from_user(
+                        program.process,
+                        stack_region.start() + offset,
+                        &mut stack_bytes,
+                        &mut user_memory,
+                    )
+                },
+                Ok(stack_bytes.len())
+            );
+            assert!(stack_bytes.iter().all(|byte| *byte == 0));
+        }
+        let frames_needed = free_before_prepare - allocator.free_frames();
+        roots.destroy(&mut allocator, program.process).unwrap();
+        assert_eq!(allocator.free_frames(), free_before_prepare);
+
+        let mut cache_calls = 0;
+        let failure = match crate::process::prepare_user_program(
+            &mut roots,
+            &mut allocator,
+            &mut user_memory,
+            &elf_bytes,
+            stack_base,
+            2,
+            1,
+            40,
+            48,
+            crate::syscall::USER_CODE_SELECTOR,
+            crate::syscall::USER_DATA_SELECTOR,
+            &mut |mapping| {
+                let call = cache_calls;
+                cache_calls += 1;
+                if call == 3 {
+                    Err("injected stack cache-policy failure")
+                } else {
+                    mapping
+                        .select_cache_attributes(CachePolicy::WriteBack, pat, &mtrrs, true)
+                        .map_err(|_| "cache-policy selection failed")
+                }
+            },
+        ) {
+            Ok(_) => panic!("injected cache-policy failure unexpectedly succeeded"),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.kind,
+            crate::process::UserProgramPrepareErrorKind::CachePolicy(
+                "injected stack cache-policy failure"
+            )
+        );
+        assert!(failure.process.is_none());
+        assert!(failure.frame.is_none());
+        assert_eq!(roots.root_count(), 0);
+        assert_eq!(allocator.free_frames(), free_before_prepare);
+
+        drop(roots);
+        process_memory = CandidateTestMemory::new();
+        process_memory.fail_prepare_at = Some(2);
+        let mut roots =
+            ProcessAddressSpaceRoots::new(&shared, &mut process_memory, config).unwrap();
+        let failure = match crate::process::prepare_user_program(
+            &mut roots,
+            &mut allocator,
+            &mut user_memory,
+            &elf_bytes,
+            stack_base,
+            2,
+            1,
+            40,
+            48,
+            crate::syscall::USER_CODE_SELECTOR,
+            crate::syscall::USER_DATA_SELECTOR,
+            &mut select_cache,
+        ) {
+            Ok(_) => panic!("injected page-table preparation failure unexpectedly succeeded"),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure.kind,
+            crate::process::UserProgramPrepareErrorKind::ElfLoad
+        );
+        assert!(failure.process.is_none());
+        assert!(failure.frame.is_none());
+        assert_eq!(roots.root_count(), 0);
+        assert_eq!(allocator.free_frames(), free_before_prepare);
+
+        drop(roots);
+        for remaining_for_attempt in 0..frames_needed {
+            process_memory = CandidateTestMemory::new();
+            let mut roots =
+                ProcessAddressSpaceRoots::new(&shared, &mut process_memory, config).unwrap();
+            let mut held_frames: [Option<Frame>; 48] = core::array::from_fn(|_| None);
+            let mut held_count = 0;
+            while allocator.free_frames() > remaining_for_attempt {
+                held_frames[held_count] = Some(allocator.allocate().unwrap());
+                held_count += 1;
+            }
+            let failure = match crate::process::prepare_user_program(
+                &mut roots,
+                &mut allocator,
+                &mut user_memory,
+                &elf_bytes,
+                stack_base,
+                2,
+                1,
+                40,
+                48,
+                crate::syscall::USER_CODE_SELECTOR,
+                crate::syscall::USER_DATA_SELECTOR,
+                &mut select_cache,
+            ) {
+                Ok(_) => panic!("frame-exhausted preparation unexpectedly succeeded"),
+                Err(failure) => failure,
+            };
+            assert!(matches!(
+                failure.kind,
+                crate::process::UserProgramPrepareErrorKind::RootCreation
+                    | crate::process::UserProgramPrepareErrorKind::ElfLoad
+                    | crate::process::UserProgramPrepareErrorKind::StackAllocation
+                    | crate::process::UserProgramPrepareErrorKind::StackMapping
+            ));
+            assert!(failure.process.is_none());
+            assert!(failure.frame.is_none());
+            assert_eq!(roots.root_count(), 0);
+            assert_eq!(allocator.free_frames(), remaining_for_attempt);
+            for frame in held_frames.iter_mut().filter_map(Option::take) {
+                allocator.deallocate(frame).unwrap();
+            }
+            assert_eq!(allocator.free_frames(), free_before_prepare);
+        }
+
+        drop(shared);
+        kernel.release(&mut allocator).unwrap();
+        assert_eq!(allocator.free_frames(), initial_free_frames);
+    }
+
+    #[allow(clippy::drop_non_drop)]
+    #[test]
     fn parsed_elf_page_population_maps_into_process_root_and_copies_back() {
         let mut elf_bytes = [0; 0x2000];
         elf_bytes[..4].copy_from_slice(b"\x7fELF");
