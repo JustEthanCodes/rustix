@@ -1,6 +1,6 @@
 # Security and unsafe-code policy
 
-Rustix is an early kernel prototype, not a security-reviewed operating system. It has no user/kernel separation implementation, process isolation, security boundary, or supported deployment profile today.
+Rustix is an experimental kernel prototype, not a security-reviewed operating system or supported deployment profile. It has a bounded Ring 3 process runtime with separate lower-half user mappings and checked syscall copies, but process roots share supervisor-only upper-half mappings derived from Limine. This is not a curated kernel mapping policy, comprehensive isolation guarantee, or protection against all kernel bugs and side channels. The kernel-mode shell and VFS are trusted in-kernel code, not sandboxed applications.
 
 ## Current unsafe boundaries
 

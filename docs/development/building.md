@@ -31,9 +31,12 @@ just active-map-smoke # probe active mapping/TLB invalidation, then restore the 
 just frame-smoke     # probe one owned frame through the HHDM, then restore the default image
 just thread-smoke    # test IRQ locks, cooperative waits, timer preemption and FPU state; restores default image
 just input-smoke     # test UART/PS/2 IRQ input and shell wakeup under OVMF
-just fault-smoke     # inject page fault and invalid opcode, then restore the default image
-just run             # interactive serial shell in QEMU (Ctrl+C to stop)
-just verify          # formatting, tests, target check, BIOS/OVMF, mapping, thread, and input smokes
+just fault-smoke          # inject CPL0 faults; verify fatal handling
+just process-smoke        # exercise bounded Ring 3 process and syscall lifecycle
+just user-fault-smoke     # exercise supported CPL3 termination and teardown
+just userspace-failure-smoke # verify init-launch failure is reported and shell fallback works
+just run                  # interactive QEMU (Ctrl+C to stop)
+just verify               # full formatting, test, build, boot, scheduler, input, and process checks
 ```
 
 Equivalent Rust checks are `cargo fmt --all -- --check`, `cargo test --workspace --lib`, `cargo check --target x86_64-unknown-none`, and `cargo build --release --target x86_64-unknown-none`. Image creation and QEMU validation are provided by `scripts/boot.py` and are intentionally part of `just verify`.
@@ -54,7 +57,7 @@ Changing the target, virtual base, relocation model, or request ABI requires upd
 
 `just uefi-smoke` boots the same ISO under OVMF with the same deadline and checks the normal boot markers plus `ACPI MADT copied: LAPIC=0xfee00000, 1 local APICs, 1 I/O APICs, 5 overrides`. It finds combined or split OVMF firmware only in standard system directories; for split CODE/VARS firmware it copies the variables template to a temporary directory under `target/` so the installed template is never written. On Ubuntu/WSL, install OVMF with `sudo apt install ovmf`. `just verify` runs the BIOS/OVMF boot checks as well as active-map, cooperative-thread, and UART/PS/2 input smokes; the BIOS test independently checks the non-UEFI boot path.
 
-`just run` launches the same image with the serial port attached to the host terminal, allowing interactive shell use. Stop the emulator with `Ctrl+C`.
+`just run` launches the normal image with the serial port attached to the host terminal. Default boot starts the bundled userspace init; the kernel-mode Crabshell is a fallback/development shell. Stop the emulator with `Ctrl+C`. Process and fault probes are separate opt-in targets and do not replace the normal image.
 
 ## Debugging the kernel from Zed
 

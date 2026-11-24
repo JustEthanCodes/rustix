@@ -1,69 +1,68 @@
 # Rustix
 
-> [!Note]
-> **Yes**. This project is pretty much 100% AI coded. If you don't like or support AI, feel free to leave. 
+> **Experimental operating system.** Rustix is a 64-bit, Unix-like OS project with its own Rust kernel. Limine is the external bootloader/protocol; it is not the Rustix kernel.
 
-Rustix (Rust-unix) is an experimental, 64-bit, Unix-like operating system whose kernel is written in Rust. This repository builds the kernel itself; Limine is used only as the external boot protocol/loader, not as a substitute for a Rustix kernel.
+> **AI-assisted project:** most of this repository has been written with AI assistance. Contributions and review are welcome; please follow the project guidance in [`AGENTS.md`](AGENTS.md).
 
-Rustix now boots into **Crabshell**, a small kernel-mode shell on the COM1 serial terminal. It includes basic navigation and file commands backed by a fixed-capacity RAM filesystem. The filesystem is volatile and reset at every boot; this is an early kernel shell, not a userspace process or POSIX shell. The command parser lives in a separate, allocation-free `crabshell` crate so a future GUI terminal can reuse it. Single-vCPU cooperative waits/yields, timer preemption, and bounded UART/PS/2 IRQ input are present; process isolation, persistent storage, a syscall ABI, networking, and userspace remain future work. See [`docs/roadmap/README.md`](docs/roadmap/README.md) for the staged plan.
+## What works today
+
+Rustix targets `x86_64-unknown-none` and runs as a freestanding `no_std` kernel. The current implementation includes:
+
+- Limine boot handoff validation, serial diagnostics, and an owned snapshot of selected boot metadata.
+- A bounded frame allocator, cloned active page-table hierarchy, and a small frame-backed heap extension.
+- Single-vCPU APIC/PIT interrupt routing, cooperative kernel tasks, timer preemption, and bounded UART/PS/2 input queues.
+- A controlled Ring 3 `rustix-init` using a versioned syscall ABI. The runtime supports a limited static ELF format, up to four cooperative processes, selected descriptor operations, anonymous mappings, spawn/exec/wait/exit, and bounded user-memory copying.
+- Crabshell, a kernel-mode serial development shell, with a separate allocation-free parser and a fixed-capacity volatile RAM filesystem.
+
+These are experimental, bounded capabilities—not general-purpose userspace, POSIX compatibility, or production security guarantees. Process address spaces share supervisor-only kernel mappings derived from Limine. Persistent storage, SMP, networking, and physical-hardware validation remain outstanding. See [current status and roadmap](docs/index.md) for details and evidence.
 
 ## Quick start
 
-Prerequisites: a Rust stable toolchain, `just`, Python 3, `xorriso`, QEMU (`qemu-system-x86_64`), and the target installed by `rust-toolchain.toml` (or `rustup target add x86_64-unknown-none`). The first image build downloads a pinned Limine binary release and verifies its SHA-256.
+The easiest setup is the repository's Dev Container, based on Ubuntu 24.04. Otherwise install the pinned Rust toolchain and `x86_64-unknown-none` target, `just`, Python 3, `xorriso`, and QEMU (`qemu-system-x86_64`). `just verify` also needs OVMF; on Linux/WSL, a C compiler is needed to build Limine's host utility. The first image build downloads the pinned Limine archive and verifies its SHA-256.
 
-For a ready-to-use environment with these tools installed, open the repository in a Dev Container using `.devcontainer/`. The container uses Ubuntu 24.04 and includes the Rust target and `rustfmt` component from `rust-toolchain.toml`.
+From the repository root:
 
 ```sh
-just help
-just fmt
-just test
-just check
-just build
-just image
-just smoke
-just run       # interactive serial shell in QEMU; exit with Ctrl+C
-just verify
+just help       # list available tasks
+just test       # host-side unit tests
+just check      # check the freestanding target
+just build      # build the kernel and bundled user payloads
+just smoke      # build image and check BIOS boot
+just run        # run interactively in QEMU; Ctrl+C stops the emulator
+just verify     # full prescribed test/build/boot validation
 ```
 
-`just build` produces `target/x86_64-unknown-none/release/rustix`. `just image` creates `target/rustix.iso`, a hybrid BIOS/UEFI image; `just smoke` checks that Crabshell reaches its prompt; and `just run` starts an interactive QEMU session attached to the current terminal.
+`just image` creates the hybrid BIOS/UEFI image at `target/rustix.iso`. `just process-smoke` and `just user-fault-smoke` run additional bounded userspace lifecycle/fault probes. Refer to [Building Rustix](docs/development/building.md) for prerequisites, debug setup, and all targets, and [Testing and verification](docs/development/testing.md) for what each check does—and does not—prove.
 
-Try `pwd`, `ls /`, `mkdir notes`, `write notes/hello.txt "hello from Rustix"`, `cat notes/hello.txt`, and `cd ..` in Crabshell. Commands include `help`, `clear`, `pwd`, `meminfo`, `ls`, `cd`, `mkdir`, `touch`, `write`, `append`, `cp`, `mv`, `cat`, `rm`, and `rmdir`. The RAM filesystem holds at most 31 entries plus its root, with files capped at 1024 bytes. See [`docs/architecture/crabshell.md`](docs/architecture/crabshell.md) for the shell and filesystem contract, [`docs/development/building.md`](docs/development/building.md) for build/emulator details, and [`docs/index.md`](docs/index.md) for the documentation map.
+## Exploring the system
+
+The normal image launches the bundled init in Ring 3. Crabshell is a kernel-mode development/recovery shell, not the default userspace command interpreter. Its fixed-capacity RAM filesystem is volatile and disappears on reset. The shell supports `help`, `pwd`, `meminfo`, `ls`, `cd`, `mkdir`, `touch`, `write`, `append`, `cp`, `mv`, `cat`, `rm`, and `rmdir`.
+
+For a userspace walkthrough and constraints, see the [userspace development guide](docs/development/userspace.md). For shell behavior and filesystem limits, see [Crabshell](docs/architecture/crabshell.md). The [syscall ABI document](docs/architecture/syscall-abi.md) is the source of truth for supported calls and their exact limits.
 
 ## Project principles
 
-- The kernel and operating-system implementation are Rust-first and `no_std`; architecture-specific privileged operations are isolated under `src/arch/`.
-- The kernel is the product. A bootloader may initialize the machine and transfer control, but policy, memory management, scheduling, and Unix-like services belong to Rustix.
-- Keep unsafe code small, documented, and adjacent to its hardware/protocol boundary.
-- Build incrementally: every roadmap milestone should have build checks, tests where practical, and updated design documentation.
-- Unix-like behavior is an explicit compatibility goal, not a claim of POSIX compliance today.
+- Keep the kernel and OS implementation Rust-first and `no_std`; isolate privileged architecture code under `src/arch/`.
+- Treat the kernel as the product. The bootloader transfers control; Rustix owns its policies and services.
+- Keep unsafe code narrow, documented, and adjacent to its hardware or protocol boundary.
+- Implement incrementally, with tests and documentation that match verified behavior.
+- Treat Unix-like behavior as a compatibility goal, not a present claim of POSIX compliance.
+
+## Where to go next
+
+- [Documentation index](docs/index.md) — architecture, development, security, and roadmap.
+- [Architecture overview](docs/architecture/overview.md) — subsystem boundaries and current design.
+- [Boot protocol](docs/architecture/boot.md) and [memory management](docs/architecture/memory.md).
+- [Userspace guide](docs/development/userspace.md) and [syscall ABI](docs/architecture/syscall-abi.md).
+- [Security policy](docs/security.md) — trust boundaries and unsafe-code guidance.
+- [Contributing](CONTRIBUTING.md) — contribution workflow.
 
 ## Repository map
 
-- `src/main.rs` — freestanding kernel entry point and Crabshell handoff.
-- `src/shell.rs` — serial line editor and kernel command executor.
-- `src/vfs.rs` — fixed-capacity volatile RAM filesystem, with host-side tests.
-- `crates/crabshell/` — separate `no_std` command parser crate; no I/O or filesystem coupling.
-- `src/boot.rs` — mutable Limine response requests, validated owned boot snapshot, and diagnostics.
-- `src/arch/x86_64/serial.rs` — COM1 formatted output, early polling input, and bounded IRQ RX queue.
-- `src/arch/x86_64/cpu.rs` — baseline CPUID vendor and feature reporting.
-- `src/arch/x86_64/interrupts.rs` — bootstrap GDT/TSS/IDT, fatal exception diagnostics, and IRQ entry/dispatch.
-- `src/arch/x86_64/keyboard.rs` — bounded PS/2 IRQ scancode queue and non-blocking polling fallback.
-- `src/arch/x86_64/apic.rs` — validated single-vCPU xAPIC/I/O APIC routing and PIT ticks.
-- `src/arch/x86_64/context.rs` — cooperative x86_64 context-switch assembly.
-- `src/arch/x86_64/io.rs` — narrow x86 port-I/O wrappers.
-- `src/memory.rs` — fixed-capacity validated physical-memory-map snapshot and host tests.
-- `src/frame.rs` — bounded physical frame allocator initialized from `BootInfo`; paging, heap growth, and guarded thread stacks use allocator-issued frames.
-- `src/acpi.rs` — bounded ACPI table validation and MADT parsing helpers.
-- `src/heap.rs` — fixed-capacity global heap policy and host tests.
-- `src/input.rs` — bounded SPSC input queues and IRQ-to-scheduler event signaling.
-- `src/irq.rs` — host-tested IRQ vector allocation policy.
-- `src/kernel_threads.rs` — cooperative kernel-thread runtime and guarded-stack lifecycle.
-- `src/paging.rs` — validated page-table cloning, mappings, and cache policy.
-- `src/scheduler.rs` — host-tested cooperative scheduling and wait-queue policy.
-- `src/time.rs` — PIT divisor and monotonic tick arithmetic.
-- `.cargo/config.toml`, `linker.ld` — x86_64-none code generation and ELF layout.
-- `justfile` — formatting, tests, target checks, image creation, emulator smoke test, and aggregate verification.
-- `limine.conf` — pinned boot configuration for the Rustix kernel.
-- `scripts/boot.py` — checksum-verified Limine download, hybrid ISO assembly, and bounded QEMU validation.
-- `.github/workflows/ci.yml` — runs `just verify` on pushes and pull requests.
-- `docs/` — architecture, drivers, development, security, and roadmap documentation.
+- `src/main.rs`, `src/boot.rs` — kernel entry and validated boot snapshot.
+- `src/paging.rs`, `src/frame.rs`, `src/heap.rs` — page tables, physical frames, and bounded heap.
+- `src/process.rs`, `src/syscall.rs`, `src/elf.rs` — process preparation, ABI dispatch, and static ELF loading.
+- `src/arch/x86_64/` — CPU, interrupt, APIC, serial, keyboard, context-switch, and port-I/O code.
+- `src/shell.rs`, `src/vfs.rs`, `crates/crabshell/` — kernel shell, volatile RAM filesystem, and parser crate.
+- `crates/rustix-user/`, `crates/rustix-init/` — userspace syscall wrappers and bundled init payload.
+- `justfile`, `scripts/boot.py`, `limine.conf`, `linker.ld` — development tasks, image workflow, boot configuration, and ELF layout.

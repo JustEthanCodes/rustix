@@ -26,8 +26,11 @@ Reliable boot
     -> isolated processes + syscall ABI
     -> M5a PCI/DMA + block I/O + read-only/basic VFS
     -> M5b writable filesystem + permissions + platform services
-    -> userland utilities
-    -> graphical terminal and other optional services
+    -> M6 initial userland + separate Rust SDK crate
+    -> M7 ARM64 platform + M8 GUI and application interfaces
+    -> M9 expanded Rust SDK for established Rustix services
+    -> M10 networking + M11 installation/updates
+    -> M12 optional Linux guest VM environment
 ```
 
 Some device-driver work can proceed in parallel after the core ownership, locking, and testing rules exist. It must not bypass them with direct, unreviewed hardware access.
@@ -270,7 +273,15 @@ The planned filesystem layout is illustrated below. This is a directory-layout p
 
 ### Planned work
 
+#### M6a — standalone Rust application path
+
 - [ ] Build on the minimal `init` process and syscall/runtime foundations from Milestone 4. Establish executable search, environment, current directory, descriptor inheritance, and process startup rules using the VFS.
+- [ ] Create an initial Rust-only Rustix SDK as a separate workspace crate, independent of kernel internals and the bundled `rustix-init` payload. The SDK may build on the lower-level `rustix-user` syscall-wrapper crate, but must expose its own documented application-facing surface. Package the supported target/build configuration, linker/startup requirements, and a reproducible way to build a standalone Rust application outside the kernel build and run it through the normal application-launch path. Validate with a sample app and an end-to-end build/load/run test. Go, Java, C/C++, and other toolchains require separate compiler/runtime/ABI work and are deferred.
+
+**M6a exit criteria:** the separate SDK crate builds a standalone Rust application reproducibly outside the kernel build, and that application loads and runs through the documented application-launch path with an end-to-end test. Only interfaces backed by implemented Rustix services are exposed.
+
+#### M6b — user accounts, shell, and command-line environment
+
 - [ ] Design a local-account and privilege model. Reserve UID/GID 0 for root, IDs 1–999 for future system/service accounts, and assign regular users IDs starting at 1000; initially give each user a primary group with the same ID. Use local username/password authentication, with a reviewed password-hashing implementation, a unique salt, and the Milestone 5 CSPRNG; Argon2id is a candidate, but exact implementation and parameters require a later security review. Never store plaintext passwords.
 - [ ] Create the first regular account through installation or first-boot setup and grant it administrator privileges. Later accounts are standard users by default; root can explicitly grant or revoke administrator status. Run a text login prompt on the serial/terminal console and start the shell under the authenticated user's identity. Do not permit direct root login during normal operation; GUI login is deferred to the GUI milestone.
 - [ ] Create `/home/{username}/` for each regular user and `/root/` for the root account. Give regular-user homes `Apps/`, `Desktop/`, `Documents/`, `Downloads/`, `Pictures/`, `Videos/`, `.local/`, `.config/`, and `.bin/` directories. Homes and newly created files are private by default. Use owner/group/other read, write, and execute permissions initially; defer ACLs.
@@ -289,7 +300,7 @@ The planned filesystem layout is illustrated below. This is a directory-layout p
 - [ ] Add administrator-only `shutdown` and `reboot` user commands as separate `.bin` command crates, using the Milestone 5 kernel/platform operations.
 - [ ] Add integration tests for login identity, account-ID allocation, password verification and failure delays, private homes, `/home/Public/` sticky-directory behavior, `/etc` and `/usr` write restrictions, `sudo` authorization and trusted command lookup, `userctl` authorization, account recovery, process signals/wait status, pipes, foreground `Ctrl+C`, and launching tools as user processes. Verify password hashes are not exposed and credentials never appear in logs.
 
-**Exit criteria:** the userspace shell and basic `.bin` tools run as isolated processes from a reproducible filesystem image using the shared userspace runtime; local login and account administration enforce the documented identity and permission model; account, `sudo`, recovery, TTY, process-control, and command-launch tests pass; no shell command directly calls kernel-private VFS internals.
+**M6 exit criteria:** the M6a standalone Rust SDK/application path passes its end-to-end test. For M6b, the userspace shell and basic `.bin` tools run as separate processes from a reproducible filesystem image; process isolation claims are limited to explicitly documented and tested guarantees, including user/kernel mapping permissions, syscall pointer validation, process teardown, and the shared-kernel-mapping limitations. Local login and account administration enforce the documented identity and permission model; account, `sudo`, recovery, TTY, process-control, and command-launch tests pass; no shell command directly calls kernel-private VFS internals. The SDK remains Rust-only; additional programming languages are deferred.
 
 ---
 
@@ -329,7 +340,27 @@ A GUI is intentionally downstream of stable memory management, interrupts/input,
 
 ---
 
-## Milestone 9 — networking (long-term, after drivers and process isolation)
+## Milestone 9 — Rust SDK expansion (long-term)
+
+Milestone 6 establishes a separate Rust SDK crate and a small standalone-app workflow. This milestone turns that starting point into the comprehensive, well-documented Rust application platform for the Rustix services that earlier milestones actually provide. It is Rust-only: other language toolchains and runtimes are separate future projects, not source-to-Rust translation features.
+
+### Planned work
+
+- [ ] Stabilize and version the separate SDK crate's public API independently from kernel-private modules. Define compatibility policy, supported Rust toolchains/targets, release artifacts, and migration guidance.
+- [ ] Organize the SDK into clear layers: safe syscall wrappers, allocation/runtime support, and higher-level libraries. Keep raw ABI entry points small and make unsupported operations explicit.
+- [ ] Expand safe APIs to cover the implemented process, descriptor, filesystem, time, input/output, and memory services as those kernel interfaces become available; define ownership, error, partial-I/O, and resource-limit behavior for each.
+- [ ] Provide reusable application startup, panic/error reporting, allocation support, and common Rust utility abstractions without exposing kernel internals or requiring applications to link the kernel.
+- [ ] Provide project templates, build/link configuration, local run/debug workflows, and reproducible packaging for standalone Rust applications. Keep the normal kernel build and SDK application builds independently invocable.
+- [ ] After the GUI milestone's application interfaces exist, add Rust SDK bindings and examples for the documented window, event, and rendering APIs. Do not expose a GUI API before a supported windowing contract exists.
+- [ ] Keep Milestone 9 APIs limited to services implemented by this point. Networking bindings are added with Milestone 10 after its network interfaces exist; they are not a prerequisite for completing this SDK milestone. Do not promise general sockets or protocol support ahead of implementation.
+- [ ] Add runnable sample applications and compatibility tests that exercise SDK releases against supported Rustix images, including ABI mismatch and unsupported-call behavior.
+- [ ] Document SDK security boundaries: safe wrappers cannot compensate for kernel bugs, and all user pointers, handles, and external data remain subject to kernel validation.
+
+**Exit criteria:** developers can create, build, debug, package, and run standalone Rust applications using a separately versioned SDK without depending on kernel internals. Each published API is backed by an implemented Rustix service, documented semantics, and integration tests. The SDK remains Rust-only; Go, Java, C/C++, and other language support are deferred to separately scoped compiler/runtime work.
+
+---
+
+## Milestone 10 — networking (long-term, after drivers and process isolation)
 
 Networking is not implied by the current device drivers. The initial target should be a tightly scoped virtual-device path with clear ownership and bounded buffers.
 
@@ -346,7 +377,7 @@ Networking is not implied by the current device drivers. The initial target shou
 
 ---
 
-## Milestone 10 — installation, updates, and physical security (long-term)
+## Milestone 11 — installation, updates, and physical security (long-term)
 
 This milestone depends on persistent storage. Local installation and update workflows can precede networking; remote update-server integration additionally depends on the networking and GUI milestones. Recovery media by itself is not protection against physical attackers.
 
@@ -361,6 +392,31 @@ This milestone depends on persistent storage. Local installation and update work
 - [ ] Design secure boot, disk encryption, and key recovery as long-term physical-security goals. Specify the threat model and recovery-key policy before claiming protection against physical attackers.
 
 **Exit criteria:** a documented local installation and upgrade path recovers safely from interrupted or invalid updates; package signatures and repository trust are enforced; and physical-security claims match the implemented boot and key-protection mechanisms.
+
+---
+
+## Milestone 12 — Linux guest environments (WSL 2–inspired; exploratory, after Milestone 11)
+
+The long-term goal is to run Linux applications by hosting a real Linux kernel in a virtual machine, rather than translating Linux system calls into Rustix services. This is inspired by WSL 2's virtualized-kernel approach, not a promise to reproduce WSL's Windows integration or compatibility. Rustix would act as the host OS and hypervisor environment; the guest kernel would provide Linux's application ABI. This milestone depends on a mature Rustix host, persistent storage, device ownership, and a reviewed virtualization and isolation design. It is a separate direction from Rustix's native Rust SDK and does not make Linux applications native Rustix processes.
+
+### Feasibility gate
+
+- [ ] Survey x86_64 virtualization support (Intel VMX and AMD SVM), firmware/platform requirements, and the intended QEMU/physical-hardware test environments. Document how nested virtualization will be tested and what happens when hardware virtualization is unavailable.
+- [ ] Produce a VM lifecycle and threat-model design covering guest creation, vCPU state, memory ownership, teardown, failure handling, resource limits, and the host/guest isolation boundary.
+- [ ] Build a small proof of concept that enters and exits a minimal guest under the intended test setup, demonstrates bounded memory/vCPU resources, and leaves the host operational after a controlled guest failure.
+
+**Gate decision:** do not commit to the remaining VM/device/integration implementation until the design and proof-of-concept results demonstrate a supportable isolation model and repeatable validation path. If the gate fails, revise or defer the milestone rather than weakening the safety requirements.
+
+### Conditional implementation work
+
+- [ ] Establish required host foundations, including reliable memory reservation, interrupt/device ownership, timers, and persistent storage. Keep VM memory and CPU resources bounded and accounted for.
+- [ ] Define a narrow virtual-device set for the first guest, with explicit I/O, DMA or shared-memory policy, reset behavior, and timeouts. Prefer emulated or otherwise safely mediated devices until a reviewed device-assignment model exists.
+- [ ] Boot a reproducible Linux guest kernel and minimal test image in a bounded VM. Validate guest boot, vCPU execution, virtual console, shutdown, resource exhaustion, and host survival after guest failure.
+- [ ] Add a controlled host-to-guest file/console integration only after guest isolation and data-sharing semantics are specified. Keep guest filesystems and processes distinct from Rustix-native userspace unless an explicit sharing interface is implemented.
+- [ ] Document supported guest kernel/configuration and compatibility scope. Test a small representative Linux application set inside the guest; do not claim universal Linux application compatibility from successful guest boot.
+- [ ] Add adversarial and failure-injection tests for malformed guest images, VM resource exhaustion, device errors, guest crashes, and teardown/reclamation.
+
+**Exit criteria:** Rustix can reproducibly launch and stop a documented Linux guest on the supported virtualization target, run a stated test set of Linux applications inside that guest, enforce configured CPU/memory/device limits, and remain operational after guest failure. Security and compatibility claims must be limited to the tested host/guest configuration. This is not a Linux syscall-translation layer and does not imply support for Linux applications running directly as Rustix processes.
 
 ---
 
