@@ -4898,6 +4898,143 @@ mod tests {
 
     #[allow(clippy::drop_non_drop)]
     #[test]
+    fn process_mapping_and_table_metadata_exhaustion_return_ownership_unchanged() {
+        let config = four_level_walk_config();
+        let mut allocator = candidate_allocator(160);
+        let initial_free_frames = allocator.free_frames();
+        let mut kernel_memory = CandidateTestMemory::new();
+        let mut kernel =
+            CandidatePageTables::new(&mut allocator, &mut kernel_memory, config).unwrap();
+        kernel
+            .clone_inherited_hierarchy(
+                &mut allocator,
+                &SyntheticReader::new(),
+                parse_cr3_root(0x8000, Some(40), false).unwrap(),
+            )
+            .unwrap();
+        let kernel_owned_free_frames = allocator.free_frames();
+        let shared = kernel.share_supervisor_kernel_half().unwrap();
+
+        let mut process_memory = CandidateTestMemory::new();
+        let mut roots =
+            ProcessAddressSpaceRoots::new(&shared, &mut process_memory, config).unwrap();
+        let root_handles: [Option<super::ProcessAddressSpaceHandle>;
+            super::MAX_PROCESS_ADDRESS_SPACES] =
+            core::array::from_fn(|_| Some(roots.create(&mut allocator).unwrap()));
+        let free_before_root_overflow = allocator.free_frames();
+        let failure = roots.create(&mut allocator).unwrap_err();
+        assert_eq!(failure.cause, ProcessRootCreateErrorKind::Capacity);
+        assert!(failure.frame.is_none());
+        assert_eq!(allocator.free_frames(), free_before_root_overflow);
+        for handle in root_handles.into_iter().flatten() {
+            roots.destroy(&mut allocator, handle).unwrap();
+        }
+        assert_eq!(roots.root_count(), 0);
+        assert_eq!(allocator.free_frames(), kernel_owned_free_frames);
+        drop(roots);
+
+        process_memory = CandidateTestMemory::new();
+        let mut roots =
+            ProcessAddressSpaceRoots::new(&shared, &mut process_memory, config).unwrap();
+        let process = roots.create(&mut allocator).unwrap();
+        for index in 0..super::MAX_PROCESS_MAPPINGS {
+            let frame = allocator.allocate().unwrap();
+            let address = 0x4000_0000 + index as u64 * PAGE_SIZE;
+            let (mapping, attributes) = candidate_mapping(
+                &frame,
+                address,
+                PagePermissions {
+                    writable: true,
+                    executable: false,
+                    user_accessible: true,
+                },
+            );
+            roots
+                .map_user_page(&mut allocator, process, frame, mapping, attributes)
+                .unwrap();
+        }
+        let free_before_mapping_overflow = allocator.free_frames();
+        let frame = allocator.allocate().unwrap();
+        let (mapping, attributes) = candidate_mapping(
+            &frame,
+            0x4000_0000 + super::MAX_PROCESS_MAPPINGS as u64 * PAGE_SIZE,
+            PagePermissions {
+                writable: true,
+                executable: false,
+                user_accessible: true,
+            },
+        );
+        let failure = roots
+            .map_user_page(&mut allocator, process, frame, mapping, attributes)
+            .unwrap_err();
+        assert_eq!(
+            failure.cause,
+            super::ProcessPageMapError::Candidate(CandidateMapErrorKind::MappingCapacity)
+        );
+        assert_eq!(failure.rollback_retained_table_frames, 0);
+        allocator.deallocate(failure.frame).unwrap();
+        assert_eq!(allocator.free_frames(), free_before_mapping_overflow);
+        for index in 0..super::MAX_PROCESS_MAPPINGS {
+            let address = 0x4000_0000 + index as u64 * PAGE_SIZE;
+            let frame = roots.unmap_user_page(process, address).unwrap();
+            allocator.deallocate(frame).unwrap();
+        }
+        roots.destroy(&mut allocator, process).unwrap();
+        assert_eq!(allocator.free_frames(), kernel_owned_free_frames);
+        drop(roots);
+
+        process_memory = CandidateTestMemory::new();
+        let mut roots =
+            ProcessAddressSpaceRoots::new(&shared, &mut process_memory, config).unwrap();
+        let process = roots.create(&mut allocator).unwrap();
+        for index in 0..15u64 {
+            let frame = allocator.allocate().unwrap();
+            let address = 0x4000_0000 + index * (1u64 << 30);
+            let (mapping, attributes) = candidate_mapping(
+                &frame,
+                address,
+                PagePermissions {
+                    writable: true,
+                    executable: false,
+                    user_accessible: true,
+                },
+            );
+            roots
+                .map_user_page(&mut allocator, process, frame, mapping, attributes)
+                .unwrap();
+        }
+        let free_before_table_overflow = allocator.free_frames();
+        let frame = allocator.allocate().unwrap();
+        let (mapping, attributes) = candidate_mapping(
+            &frame,
+            0x4000_0000 + 15 * (1u64 << 30),
+            PagePermissions {
+                writable: true,
+                executable: false,
+                user_accessible: true,
+            },
+        );
+        let failure = roots
+            .map_user_page(&mut allocator, process, frame, mapping, attributes)
+            .unwrap_err();
+        assert_eq!(
+            failure.cause,
+            super::ProcessPageMapError::Candidate(CandidateMapErrorKind::TableCapacity)
+        );
+        assert_eq!(failure.rollback_retained_table_frames, 0);
+        allocator.deallocate(failure.frame).unwrap();
+        assert_eq!(allocator.free_frames(), free_before_table_overflow);
+        roots.destroy(&mut allocator, process).unwrap();
+        assert_eq!(allocator.free_frames(), kernel_owned_free_frames);
+
+        drop(roots);
+        drop(shared);
+        kernel.release(&mut allocator).unwrap();
+        assert_eq!(allocator.free_frames(), initial_free_frames);
+    }
+
+    #[allow(clippy::drop_non_drop)]
+    #[test]
     fn reusable_user_program_preparation_maps_bounded_stack_and_cleans_up_failures() {
         let mut elf_bytes = [0; 0x2000];
         elf_bytes[..4].copy_from_slice(b"\x7fELF");

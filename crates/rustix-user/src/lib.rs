@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("rustix-user currently supports x86_64 only");
 
-pub const ABI_VERSION: u64 = 0x0001_0000;
+pub const ABI_VERSION: u64 = 0x0001_0001;
 pub const SYS_ABI_VERSION: u64 = 0;
 pub const SYS_EXIT: u64 = 1;
 pub const SYS_WRITE: u64 = 2;
@@ -27,6 +27,7 @@ pub const SYS_DUP: u64 = 7;
 pub const SYS_MMAP_REGION: u64 = 8;
 pub const SYS_MUNMAP_REGION: u64 = 9;
 pub const SYS_SPAWN: u64 = 10;
+pub const SYS_EXEC: u64 = 11;
 pub const USER_PAGE_SIZE: usize = 4096;
 pub const MAX_MAPPED_REGION_SIZE: usize = 1024 * 1024;
 pub const MAX_SPAWN_IMAGE_SIZE: usize = 1024 * 1024;
@@ -144,6 +145,48 @@ fn spawn_with(
             0,
         ],
     ))
+}
+
+/// Replace the calling process's image with a static ELF (syscall 11).
+///
+/// On success this call never returns: the process resumes Ring 3 at the
+/// replacement image's entry with a fresh zero-filled stack, keeping its PID,
+/// descriptors, parent, and children. The returned `Ok` value is uninhabited.
+/// On failure the original image continues and the error is returned. The
+/// kernel preserves the user x87/SSE state across a successful exec.
+pub fn exec(image: &[u8], stack_pages: usize) -> Result<core::convert::Infallible, SyscallError> {
+    exec_with(image.as_ptr() as u64, image.len(), stack_pages, syscall)
+}
+
+fn exec_with(
+    image_address: u64,
+    image_length: usize,
+    stack_pages: usize,
+    invoke: impl FnOnce(u64, [u64; 6]) -> i64,
+) -> Result<core::convert::Infallible, SyscallError> {
+    if image_length == 0 || !(1..=MAX_INITIAL_STACK_PAGES).contains(&stack_pages) {
+        return Err(SyscallError::InvalidArgument);
+    }
+    if image_length > MAX_SPAWN_IMAGE_SIZE {
+        return Err(SyscallError::ArgumentListTooLong);
+    }
+    let result = invoke(
+        SYS_EXEC,
+        [
+            image_address,
+            image_length as u64,
+            stack_pages as u64,
+            0,
+            0,
+            0,
+        ],
+    );
+    // A successful exec replaces the process and never returns here; any
+    // nonnegative result would be a kernel contract violation.
+    match decode_result(result) {
+        Err(error) => Err(error),
+        Ok(_) => Err(SyscallError::NotImplemented),
+    }
 }
 
 /// A single page returned by the anonymous mapping syscall.
@@ -614,8 +657,8 @@ mod heap_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_result, spawn_with, write_all_with, write_fmt_with, SyscallError, ABI_VERSION,
-        MAX_INITIAL_STACK_PAGES, MAX_SPAWN_IMAGE_SIZE, SYS_SPAWN,
+        decode_result, exec_with, spawn_with, write_all_with, write_fmt_with, SyscallError,
+        ABI_VERSION, MAX_INITIAL_STACK_PAGES, MAX_SPAWN_IMAGE_SIZE, SYS_EXEC, SYS_SPAWN,
     };
 
     #[test]
@@ -697,6 +740,65 @@ mod tests {
             spawn_with(0x4000, 1, 1, |_, _| -3),
             Err(SyscallError::Fault)
         );
+    }
+
+    #[test]
+    fn exec_encodes_the_image_and_stack_arguments_and_reports_failures() {
+        let image_address = 0x4000;
+        let image_length = MAX_SPAWN_IMAGE_SIZE;
+        let stack_pages = MAX_INITIAL_STACK_PAGES;
+        let result = exec_with(
+            image_address,
+            image_length,
+            stack_pages,
+            |number, arguments| {
+                assert_eq!(number, SYS_EXEC);
+                assert_eq!(
+                    arguments,
+                    [
+                        image_address,
+                        image_length as u64,
+                        stack_pages as u64,
+                        0,
+                        0,
+                        0
+                    ]
+                );
+                -3
+            },
+        );
+        assert_eq!(result, Err(SyscallError::Fault));
+        assert_eq!(
+            exec_with(0x4000, 1, 1, |_, _| -1),
+            Err(SyscallError::InvalidArgument)
+        );
+        assert_eq!(
+            exec_with(0x4000, 1, 1, |_, _| -4),
+            Err(SyscallError::OutOfMemory)
+        );
+    }
+
+    #[test]
+    fn exec_rejects_invalid_bounds_before_invoking_the_syscall() {
+        for (image_length, stack_pages, expected) in [
+            (0, 1, SyscallError::InvalidArgument),
+            (
+                MAX_SPAWN_IMAGE_SIZE + 1,
+                1,
+                SyscallError::ArgumentListTooLong,
+            ),
+            (1, 0, SyscallError::InvalidArgument),
+            (
+                1,
+                MAX_INITIAL_STACK_PAGES + 1,
+                SyscallError::InvalidArgument,
+            ),
+        ] {
+            let result = exec_with(0x4000, image_length, stack_pages, |_, _| {
+                panic!("invalid exec arguments must not invoke the syscall")
+            });
+            assert_eq!(result, Err(expected));
+        }
     }
 
     #[test]

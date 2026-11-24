@@ -1,6 +1,62 @@
 use std::env;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Compile one static user payload from the shared rustix-init source with the
+/// given variant cfgs, linking the prebuilt rustix-user runtime.
+fn build_payload(
+    rustc: &OsStr,
+    root: &Path,
+    out_dir: &Path,
+    runtime: &Path,
+    source: &Path,
+    linker_script: &Path,
+    crate_name: &str,
+    output: &Path,
+    cfgs: &[&str],
+) {
+    let mut command = Command::new(rustc);
+    command
+        .current_dir(root)
+        .env("OUT_DIR", out_dir)
+        .arg("--crate-name")
+        .arg(crate_name)
+        .arg("--edition=2021")
+        .arg("--check-cfg=cfg(rustix_fault_probe)")
+        .arg("--check-cfg=cfg(rustix_child_probe)")
+        .arg("--check-cfg=cfg(rustix_spawner_probe)")
+        .arg("--check-cfg=cfg(rustix_exec_probe)")
+        .arg("--check-cfg=cfg(rustix_exec_target_probe)")
+        .arg("--check-cfg=cfg(rustix_user_fault_ud)")
+        .arg("--check-cfg=cfg(rustix_user_fault_page)")
+        .arg("--check-cfg=cfg(rustix_user_fault_gp)")
+        .arg("--check-cfg=cfg(rustix_user_fault_de)")
+        .arg("--check-cfg=cfg(rustix_invalid_syscall_return_probe)")
+        .arg("--crate-type=bin")
+        .arg("--target=x86_64-unknown-none")
+        .arg("-Cpanic=abort")
+        .arg("-Copt-level=2")
+        .arg("-Cdebuginfo=0")
+        .arg("-Ccode-model=small")
+        .arg("-Crelocation-model=static")
+        .arg("-Ctarget-feature=-avx,-avx2,-avx512f")
+        .arg(format!("-Clink-arg=-T{}", linker_script.display()))
+        .arg("-Clink-arg=--build-id=none")
+        .arg("-Clink-arg=--strip-debug")
+        .arg("--extern")
+        .arg(format!("rustix_user={}", runtime.display()))
+        .arg(source)
+        .arg("-o")
+        .arg(output);
+    for cfg in cfgs {
+        command.arg(format!("--cfg={cfg}"));
+    }
+    let status = command
+        .status()
+        .unwrap_or_else(|_| panic!("failed to invoke rustc for {crate_name}"));
+    assert!(status.success(), "failed to build {crate_name} ELF");
+}
 
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
@@ -30,6 +86,7 @@ fn main() {
         .arg("--target=x86_64-unknown-none")
         .arg("-Cpanic=abort")
         .arg("-Copt-level=2")
+        .arg("-Cdebuginfo=0")
         .arg("-Ccode-model=small")
         .arg("-Crelocation-model=static")
         .arg("-Ctarget-feature=-avx,-avx2,-avx512f")
@@ -43,62 +100,54 @@ fn main() {
         "failed to build rustix-user runtime"
     );
 
-    let child_output = out_dir.join("rustix-child.elf");
-    let child_status = Command::new(&rustc)
-        .current_dir(&root)
-        .env("OUT_DIR", &out_dir)
-        .arg("--crate-name")
-        .arg("rustix_child")
-        .arg("--edition=2021")
-        .arg("--check-cfg=cfg(rustix_child_probe)")
-        .arg("--cfg=rustix_child_probe")
-        .arg("--crate-type=bin")
-        .arg("--target=x86_64-unknown-none")
-        .arg("-Cpanic=abort")
-        .arg("-Copt-level=2")
-        .arg("-Ccode-model=small")
-        .arg("-Crelocation-model=static")
-        .arg("-Ctarget-feature=-avx,-avx2,-avx512f")
-        .arg(format!("-Clink-arg=-T{}", linker_script.display()))
-        .arg("-Clink-arg=--build-id=none")
-        .arg("--extern")
-        .arg(format!("rustix_user={}", runtime.display()))
-        .arg(&source)
-        .arg("-o")
-        .arg(&child_output)
-        .status()
-        .expect("failed to invoke rustc for the child probe payload");
-    assert!(child_status.success(), "failed to build child probe ELF");
+    // Payload build order respects embedded-image dependencies: the exec
+    // tester embeds the exec target, the spawner embeds the plain child, and
+    // init embeds the child, spawner, and exec tester.
+    build_payload(
+        &rustc,
+        &root,
+        &out_dir,
+        &runtime,
+        &source,
+        &linker_script,
+        "rustix_child",
+        &out_dir.join("rustix-child.elf"),
+        &["rustix_child_probe"],
+    );
+    build_payload(
+        &rustc,
+        &root,
+        &out_dir,
+        &runtime,
+        &source,
+        &linker_script,
+        "rustix_exec_target",
+        &out_dir.join("rustix-exec-target.elf"),
+        &["rustix_exec_target_probe"],
+    );
+    build_payload(
+        &rustc,
+        &root,
+        &out_dir,
+        &runtime,
+        &source,
+        &linker_script,
+        "rustix_exec",
+        &out_dir.join("rustix-exec.elf"),
+        &["rustix_exec_probe"],
+    );
+    build_payload(
+        &rustc,
+        &root,
+        &out_dir,
+        &runtime,
+        &source,
+        &linker_script,
+        "rustix_spawner",
+        &out_dir.join("rustix-spawner.elf"),
+        &["rustix_spawner_probe"],
+    );
 
-    let output = out_dir.join("rustix-init.elf");
-    let linker_arg = format!("-T{}", linker_script.display());
-    let mut command = Command::new(rustc);
-    command
-        .current_dir(&root)
-        .env("OUT_DIR", &out_dir)
-        .arg("--crate-name")
-        .arg("rustix_init")
-        .arg("--edition=2021")
-        .arg("--check-cfg=cfg(rustix_fault_probe)")
-        .arg("--check-cfg=cfg(rustix_child_probe)")
-        .arg("--check-cfg=cfg(rustix_user_fault_ud)")
-        .arg("--check-cfg=cfg(rustix_user_fault_page)")
-        .arg("--check-cfg=cfg(rustix_user_fault_gp)")
-        .arg("--check-cfg=cfg(rustix_user_fault_de)")
-        .arg("--crate-type=bin")
-        .arg("--target=x86_64-unknown-none")
-        .arg("-Cpanic=abort")
-        .arg("-Copt-level=2")
-        .arg("-Ccode-model=small")
-        .arg("-Crelocation-model=static")
-        .arg("-Ctarget-feature=-avx,-avx2,-avx512f")
-        .arg(format!("-Clink-arg={linker_arg}"))
-        .arg("-Clink-arg=--build-id=none")
-        .arg("--extern")
-        .arg(format!("rustix_user={}", runtime.display()))
-        .arg(&source)
-        .arg("-o")
-        .arg(&output);
     let fault_modes = [
         ("CARGO_FEATURE_PROBE_USER_FAULT", "rustix_user_fault_ud"),
         (
@@ -113,6 +162,10 @@ fn main() {
             "CARGO_FEATURE_PROBE_USER_DIVIDE_ERROR",
             "rustix_user_fault_de",
         ),
+        (
+            "CARGO_FEATURE_PROBE_USER_INVALID_SYSCALL_RETURN",
+            "rustix_invalid_syscall_return_probe",
+        ),
     ];
     let enabled_fault_modes: Vec<_> = fault_modes
         .iter()
@@ -122,16 +175,20 @@ fn main() {
         enabled_fault_modes.len() <= 1,
         "only one user-fault probe feature may be enabled"
     );
+    let mut init_cfgs: Vec<&str> = Vec::new();
     if let Some((_, mode)) = enabled_fault_modes.first() {
-        command
-            .arg("--cfg=rustix_fault_probe")
-            .arg(format!("--cfg={mode}"));
+        init_cfgs.push("rustix_fault_probe");
+        init_cfgs.push(mode);
     }
-    let status = command
-        .status()
-        .expect("failed to invoke rustc for the init payload");
-    assert!(
-        status.success(),
-        "failed to build the rustix-init ELF payload"
+    build_payload(
+        &rustc,
+        &root,
+        &out_dir,
+        &runtime,
+        &source,
+        &linker_script,
+        "rustix_init",
+        &out_dir.join("rustix-init.elf"),
+        &init_cfgs,
     );
 }

@@ -646,8 +646,10 @@ def fault_smoke_test(kind: str, timeout: int) -> None:
     print(f"Captured serial log: {serial_log.relative_to(ROOT)}")
 
 
-def build_kernel(features: tuple[str, ...] = ()) -> None:
+def build_kernel(features: tuple[str, ...] = (), no_default_features: bool = False) -> None:
     command = ["cargo", "build", "--release", "--target", "x86_64-unknown-none"]
+    if no_default_features:
+        command.append("--no-default-features")
     if features:
         command.extend(["--features", ",".join(features)])
     subprocess.run(command, cwd=ROOT, check=True)
@@ -656,7 +658,7 @@ def build_kernel(features: tuple[str, ...] = ()) -> None:
 def frame_smoke_workflow(timeout: int) -> None:
     failure: BuildError | OSError | subprocess.SubprocessError | None = None
     try:
-        build_kernel(("probe-hhdm-frame",))
+        build_kernel(("probe-hhdm-frame",), no_default_features=True)
         build_image()
         smoke_test(timeout)
         serial_log = TARGET_DIR / "rustix-qemu-serial.log"
@@ -709,10 +711,19 @@ def process_smoke_workflow(timeout: int) -> None:
             "Ring 3 entry stack validated: pid=1,",
             "rustix-init: hello from ring 3",
             "rustix-init: invalid user buffer returned EFAULT",
-            "rustix-child: real child entered ring 3 and is exiting",
+            "rustix-init: spawn copied user ELF and enforced task capacity",
+            "rustix-child: real child entered ring 3 with zeroed two-page stack and is exiting",
             "rustix-init: blocking wait copied child status 7 after EFAULT retry",
             "rustix-init: heap Vec and Box round-trip ok",
             "rustix-init: multi-page mmap zero/write/unmap ok",
+            "rustix-spawner: nested spawn/wait reuse passed five rounds",
+            "rustix-spawner: leaving one orphan for kernel reap",
+            "rustix-init: nested spawn and slot reuse verified",
+            "orphaned process reaped by kernel supervisor: pid=",
+            "rustix-exec: pre-exec image running",
+            "rustix-exec: failed exec left original image usable",
+            "rustix-exec: replacement image entered ring 3 with zeroed stack",
+            "rustix-init: exec replacement and old-image reclamation verified",
             "init process exited with status 42 and was reaped by kernel wait",
             "Ring 3 init passed: write/EFAULT/blocking child wait/exit syscalls, kernel wait, and process-root teardown",
         )
@@ -723,7 +734,23 @@ def process_smoke_workflow(timeout: int) -> None:
                 + ", ".join(repr(marker) for marker in missing)
                 + f"\nSerial output:\n{output}"
             )
-        print("QEMU Ring 3 init write/EFAULT/blocking child wait/exit, kernel wait, and process-root teardown passed.")
+        child_marker = "rustix-child: real child entered ring 3 with zeroed two-page stack and is exiting"
+        # Three init children + five spawner reuse rounds + one orphan.
+        if output.count(child_marker) != 9:
+            raise BuildError(
+                "QEMU did not execute all nine spawned children with two-page stacks"
+                + f"\nSerial output:\n{output}"
+            )
+        reclaimed_marker = "spawned process root reclaimed after wait: pid="
+        # Three init children + five spawner rounds + the spawner itself + the
+        # exec tester; the orphan is reaped by the kernel supervisor after the
+        # runtime drains, not through a user wait.
+        if output.count(reclaimed_marker) != 10:
+            raise BuildError(
+                "QEMU did not reclaim all ten waited child roots as their waits succeeded"
+                + f"\nSerial output:\n{output}"
+            )
+        print("QEMU Ring 3 init spawn-capacity, nested spawn, slot reuse, exec, wait/reap, and root reclamation passed.")
     except (BuildError, OSError, subprocess.SubprocessError) as error:
         failure = error
 
@@ -745,27 +772,77 @@ def process_smoke_workflow(timeout: int) -> None:
     print("Restored the default release kernel and ISO after the Ring 3 init test.")
 
 
+def userspace_failure_smoke_workflow(timeout: int) -> None:
+    failure: BuildError | OSError | subprocess.SubprocessError | None = None
+    try:
+        build_kernel(("probe-userspace-launch-failure",))
+        build_image()
+        smoke_test(timeout)
+        serial_log = TARGET_DIR / "rustix-qemu-serial.log"
+        output = serial_log.read_text(encoding="latin-1") if serial_log.exists() else ""
+        marker = (
+            "normal-boot userspace launch failed: injected userspace launch failure "
+            "after root creation; continuing to Crabshell"
+        )
+        if marker not in output:
+            raise BuildError(
+                "QEMU did not report the normal-boot userspace failure policy; "
+                f"missing serial marker {marker!r}\nSerial output:\n{output}"
+            )
+        if "normal-boot userspace passed" in output:
+            raise BuildError(
+                "QEMU reported userspace success despite the injected launch failure"
+                + f"\nSerial output:\n{output}"
+            )
+        print("QEMU normal-boot userspace failure policy passed: reported and fell back to the shell.")
+    except (BuildError, OSError, subprocess.SubprocessError) as error:
+        failure = error
+
+    try:
+        build_kernel()
+        build_image()
+    except (BuildError, OSError, subprocess.SubprocessError) as restore_error:
+        if failure is not None:
+            raise BuildError(
+                f"userspace-failure workflow failed ({failure}); restoring the default image "
+                f"also failed ({restore_error})"
+            ) from restore_error
+        raise
+
+    if failure is not None:
+        raise BuildError(
+            f"userspace-failure workflow failed; the default release image was restored: {failure}"
+        ) from failure
+    print("Restored the default release kernel and ISO after the userspace failure-policy test.")
+
+
 def user_fault_smoke_workflow(timeout: int) -> None:
     failure: BuildError | OSError | subprocess.SubprocessError | None = None
     probes = (
-        ("probe-user-fault", 6, "invalid opcode"),
-        ("probe-user-page-fault", 14, "page fault"),
-        ("probe-user-general-protection", 13, "general protection fault"),
-        ("probe-user-divide-error", 0, "divide error"),
+        ("probe-user-fault", 6, "invalid opcode", False),
+        ("probe-user-page-fault", 14, "page fault", False),
+        ("probe-user-general-protection", 13, "general protection fault", False),
+        ("probe-user-divide-error", 0, "divide error", False),
+        ("probe-user-invalid-syscall-return", 13, "invalid syscall return", True),
     )
     try:
-        for feature, vector, name in probes:
+        for feature, vector, name, invalid_return in probes:
             build_kernel((feature,))
             build_image()
             smoke_test(timeout)
             serial_log = TARGET_DIR / "rustix-qemu-serial.log"
             output = serial_log.read_text(encoding="latin-1") if serial_log.exists() else ""
+            diagnostic_marker = (
+                "USER SYSCALL RETURN FRAME: invalid; terminating process"
+                if invalid_return
+                else f"USER EXCEPTION: vector {vector} ({name})"
+            )
             markers = (
-                f"USER EXCEPTION: vector {vector} ({name})",
+                diagnostic_marker,
                 f"user fault vector {vector} exited with status {128 + vector} and was reaped by kernel wait",
                 "Ring 3 user fault passed: process exited, was waited on, and its root was torn down",
             )
-            if vector == 14:
+            if vector == 14 and not invalid_return:
                 markers += ("user page fault address (CR2): 0x00007fffffffe000",)
             missing = [marker for marker in markers if marker not in output]
             if missing:
@@ -774,7 +851,7 @@ def user_fault_smoke_workflow(timeout: int) -> None:
                     + ", ".join(repr(marker) for marker in missing)
                     + f"\nSerial output:\n{output}"
                 )
-            print(f"QEMU user-mode vector {vector} ({name}) termination and teardown passed.")
+            print(f"QEMU user-mode {name} termination and teardown passed.")
     except (BuildError, OSError, subprocess.SubprocessError) as error:
         failure = error
 
@@ -799,7 +876,7 @@ def user_fault_smoke_workflow(timeout: int) -> None:
 def active_map_smoke_workflow(timeout: int) -> None:
     failure: BuildError | OSError | subprocess.SubprocessError | None = None
     try:
-        build_kernel(("probe-active-mapping",))
+        build_kernel(("probe-active-mapping",), no_default_features=True)
         build_image()
         smoke_test(timeout)
         serial_log = TARGET_DIR / "rustix-qemu-serial.log"
@@ -835,7 +912,7 @@ def active_map_smoke_workflow(timeout: int) -> None:
 def thread_smoke_workflow(timeout: int) -> None:
     failure: BuildError | OSError | subprocess.SubprocessError | None = None
     try:
-        build_kernel(("probe-kernel-threads",))
+        build_kernel(("probe-kernel-threads",), no_default_features=True)
         build_image()
         uefi_smoke_test(
             timeout,
@@ -876,7 +953,7 @@ def fault_smoke_workflow(timeout: int) -> None:
     failure: BuildError | OSError | subprocess.SubprocessError | None = None
     try:
         for kind, feature in tests:
-            build_kernel((feature,))
+            build_kernel((feature,), no_default_features=True)
             build_image()
             fault_smoke_test(kind, timeout)
     except (BuildError, OSError, subprocess.SubprocessError) as error:
@@ -980,6 +1057,11 @@ def main() -> int:
         "process-smoke", help="run bundled init in Ring 3 and verify syscall/wait/teardown"
     )
     process_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
+    userspace_failure_smoke = subparsers.add_parser(
+        "userspace-failure-smoke",
+        help="inject a normal-boot userspace launch failure and verify the shell fallback",
+    )
+    userspace_failure_smoke.add_argument("--timeout", type=int, default=20, help="QEMU time limit in seconds")
     user_fault_smoke = subparsers.add_parser(
         "user-fault-smoke", help="test Ring 3 #PF/#GP/#UD/#DE termination and process teardown"
     )
@@ -1019,6 +1101,10 @@ def main() -> int:
             if args.timeout <= 0:
                 raise BuildError("--timeout must be a positive number of seconds")
             process_smoke_workflow(args.timeout)
+        elif args.command == "userspace-failure-smoke":
+            if args.timeout <= 0:
+                raise BuildError("--timeout must be a positive number of seconds")
+            userspace_failure_smoke_workflow(args.timeout)
         elif args.command == "user-fault-smoke":
             if args.timeout <= 0:
                 raise BuildError("--timeout must be a positive number of seconds")
@@ -1042,11 +1128,19 @@ def main() -> int:
         elif args.command == "uefi-smoke":
             if args.timeout <= 0:
                 raise BuildError("--timeout must be a positive number of seconds")
-            uefi_smoke_test(args.timeout)
+            uefi_smoke_test(
+                args.timeout,
+                ("normal-boot userspace passed: init ran, exited, and was reaped before the shell",),
+            )
         else:
             if args.timeout <= 0:
                 raise BuildError("--timeout must be a positive number of seconds")
-            smoke_test(args.timeout)
+            smoke_test(
+                args.timeout,
+                additional_expected=(
+                    "normal-boot userspace passed: init ran, exited, and was reaped before the shell",
+                ),
+            )
     except (BuildError, OSError, subprocess.CalledProcessError) as error:
         print(f"Rustix boot workflow failed: {error}", file=sys.stderr)
         return 1

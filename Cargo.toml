@@ -12,17 +12,21 @@ license = "Apache-2.0"
 description = "A freestanding 64-bit Rust kernel for the Rustix operating system"
 
 [features]
-default = []
+# Normal boot launches the controlled Ring 3 init runtime before the shell.
+default = ["boot-userspace"]
 inject-page-fault = []
 inject-invalid-opcode = []
 inject-general-protection = []
 inject-divide-error = []
 probe-hhdm-frame = []
-probe-user-process = []
+boot-userspace = []
+probe-user-process = ["boot-userspace"]
+probe-userspace-launch-failure = ["boot-userspace"]
 probe-user-fault = ["probe-user-process"]
 probe-user-page-fault = ["probe-user-process"]
 probe-user-general-protection = ["probe-user-process"]
 probe-user-divide-error = ["probe-user-process"]
+probe-user-invalid-syscall-return = ["probe-user-process"]
 probe-active-mapping = []
 probe-kernel-threads = []
 # Include full CPU register dumps in the fatal exception path. Off by default:

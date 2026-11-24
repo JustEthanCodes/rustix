@@ -25,9 +25,19 @@ const MAX_THREADS: usize = rustix_kernel::process::MAX_PROCESSES;
 const THREAD_STACK_PAGES: usize = 4;
 const THREAD_STACK_STRIDE: u64 = (THREAD_STACK_PAGES as u64 + 1) * PAGE_SIZE;
 const THREAD_STACK_VIRTUAL_BASE: u64 = 0xffff_c400_0000_0000;
+/// Per-task TSS.RSP0 syscall entry stacks, parallel to the scheduler stacks.
+/// Each slot owns one guarded stack in each window for its whole lifetime.
+const ENTRY_STACK_VIRTUAL_BASE: u64 = 0xffff_c500_0000_0000;
+// Process roots snapshot the kernel half's upper-half PML4 entries when they
+// are created. Both stack windows must therefore fit inside one 2 MiB region
+// (one pre-created page-table path) so later leaf-only map/unmap cycles remain
+// visible through the shared intermediate tables in every process root.
+const _: () = assert!(THREAD_STACK_STRIDE * MAX_THREADS as u64 <= 2 * 1024 * 1024);
+const _: () = assert!(THREAD_STACK_VIRTUAL_BASE & (2 * 1024 * 1024 - 1) == 0);
+const _: () = assert!(ENTRY_STACK_VIRTUAL_BASE & (2 * 1024 * 1024 - 1) == 0);
 const CONTEXT_COUNT: usize = MAX_THREADS + 1;
-const QUEUE_COUNT: usize = MAX_THREADS + 3;
-const _: [(); QUEUE_COUNT] = [(); MAX_THREADS + 3];
+const QUEUE_COUNT: usize = MAX_THREADS + 2;
+const _: [(); QUEUE_COUNT] = [(); MAX_THREADS + 2];
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -87,18 +97,14 @@ struct KernelThreadRuntime {
     fx_state: [FxSaveArea; CONTEXT_COUNT],
     thread_ids: [Option<ThreadId>; MAX_THREADS],
     stack_virtual_starts: [Option<u64>; MAX_THREADS],
+    #[cfg(all(target_os = "none", feature = "boot-userspace"))]
+    entry_stack_tops: [Option<u64>; MAX_THREADS],
     entries: [Option<ThreadEntry>; MAX_THREADS],
     arguments: [usize; MAX_THREADS],
     deadlines: [Option<u64>; MAX_THREADS],
     event_queue: WaitQueueId,
-    #[cfg(feature = "probe-user-process")]
+    #[cfg(all(target_os = "none", feature = "boot-userspace"))]
     process_exit_queue: WaitQueueId,
-    #[cfg(feature = "probe-user-process")]
-    process_start_queue: WaitQueueId,
-    #[cfg(feature = "probe-user-process")]
-    process_start_published: bool,
-    #[cfg(feature = "probe-user-process")]
-    process_start_closed: bool,
     timer_queues: [WaitQueueId; MAX_THREADS],
     current_context: usize,
     input_events_enabled: bool,
@@ -114,28 +120,22 @@ impl KernelThreadRuntime {
         for queue in &mut timer_queues {
             *queue = policy.create_wait_queue()?;
         }
-        #[cfg(feature = "probe-user-process")]
+        #[cfg(all(target_os = "none", feature = "boot-userspace"))]
         let process_exit_queue = policy.create_wait_queue()?;
-        #[cfg(feature = "probe-user-process")]
-        let process_start_queue = policy.create_wait_queue()?;
         Ok(Self {
             policy,
             saved_rsp: [0; CONTEXT_COUNT],
             fx_state: [FxSaveArea::INITIAL; CONTEXT_COUNT],
             thread_ids: [None; MAX_THREADS],
             stack_virtual_starts: [None; MAX_THREADS],
+            #[cfg(all(target_os = "none", feature = "boot-userspace"))]
+            entry_stack_tops: [None; MAX_THREADS],
             entries: [None; MAX_THREADS],
             arguments: [0; MAX_THREADS],
             deadlines: [None; MAX_THREADS],
             event_queue,
-            #[cfg(feature = "probe-user-process")]
+            #[cfg(all(target_os = "none", feature = "boot-userspace"))]
             process_exit_queue,
-            #[cfg(feature = "probe-user-process")]
-            process_start_queue,
-            #[cfg(feature = "probe-user-process")]
-            process_start_published: false,
-            #[cfg(feature = "probe-user-process")]
-            process_start_closed: false,
             timer_queues,
             current_context: 0,
             input_events_enabled: false,
@@ -324,90 +324,301 @@ pub fn run_shell<M: CandidatePageTableMemory>(
 /// Own scheduler state and the guarded stacks prepared for a bounded process run.
 /// The value must stay at a stable address after stack preparation because each
 /// synthetic thread context retains a pointer to its runtime.
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) struct PreparedProcessTasks {
     runtime: KernelThreadRuntime,
-    count: usize,
     _pin: core::marker::PhantomPinned,
 }
 
-/// Construct an empty process-task set before preparing its stacks.
-#[cfg(feature = "probe-user-process")]
+/// Construct an empty process-task set before preparing its stack tables.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) fn new_process_tasks(
     ticks: &'static AtomicTickCounter,
 ) -> Result<PreparedProcessTasks, &'static str> {
     Ok(PreparedProcessTasks {
         runtime: KernelThreadRuntime::new(ticks)
             .map_err(|_| "process scheduler wait-queue capacity exhausted")?,
-        count: 0,
         _pin: core::marker::PhantomPinned,
     })
 }
 
-/// Map scheduler-owned stacks before process roots borrow the active candidate's
-/// kernel half. The prepared runtime must remain at the same address afterward.
-#[cfg(feature = "probe-user-process")]
-pub(crate) fn prepare_process_task_stacks<M: CandidatePageTableMemory>(
+/// Expose the pinned runtime pointer for task creation and process helpers.
+///
+/// # Safety
+/// The caller must keep the returned runtime pinned and live until every
+/// process task exits, and obey the single-vCPU IF-disabled ownership contract.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+pub(crate) unsafe fn process_runtime_pointer(
     prepared: core::pin::Pin<&mut PreparedProcessTasks>,
+) -> *mut () {
+    // SAFETY: The caller maintains the pin; this only reads the stable address.
+    let prepared = unsafe { prepared.get_unchecked_mut() };
+    core::ptr::addr_of_mut!(prepared.runtime).cast::<()>()
+}
+
+/// Pre-create the page-table paths for every scheduler and entry stack slot.
+///
+/// Process roots snapshot the kernel half's upper-half PML4 entries at creation
+/// time, so every table needed by later dynamic stack mappings must exist before
+/// the kernel half is shared. Each slot's stacks are mapped and then unmapped
+/// here; the candidate retains the intermediate tables, and later spawn/reap
+/// cycles only add or remove leaves inside those shared tables.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+pub(crate) fn prepare_process_stack_tables<M: CandidatePageTableMemory>(
     candidate: &mut CandidatePageTables<'_, M>,
     allocator: &mut FrameAllocator,
     cpu_info: &crate::arch::x86_64::cpu::CpuInfo,
-    count: usize,
 ) -> Result<(), &'static str> {
-    // SAFETY: The caller pins this !Unpin runtime before any thread stores its
-    // address in a synthetic context; this function never moves the runtime.
-    let prepared = unsafe { prepared.get_unchecked_mut() };
-    if count == 0 || count > MAX_THREADS || prepared.count != 0 {
-        return Err("process thread set is empty, exceeds capacity, or was already prepared");
-    }
     let flags = disable_interrupts();
-    let runtime_pointer = core::ptr::addr_of_mut!(prepared.runtime);
-    for _ in 0..count {
-        // The placeholder is replaced before dispatch; creating the scheduler
-        // context now maps its stack before process roots share the kernel half.
-        let spawned = spawn_thread(
-            &mut prepared.runtime,
-            candidate,
-            allocator,
-            cpu_info,
-            runtime_pointer,
-            unstarted_process_task,
-            0,
-        );
-        if spawned.is_err() {
-            cancel_unstarted_threads(&mut prepared.runtime);
-            reap_exited_stacks(&mut prepared.runtime, candidate, allocator);
-            restore_interrupts(flags);
-            return Err("process kernel stack preparation failed");
+    for slot in 0..MAX_THREADS {
+        for base in [THREAD_STACK_VIRTUAL_BASE, ENTRY_STACK_VIRTUAL_BASE] {
+            let stack_start = match prepare_stack_region(candidate, allocator, cpu_info, slot, base)
+            {
+                Ok(stack_start) => stack_start,
+                Err(error) => {
+                    restore_interrupts(flags);
+                    return Err(error);
+                }
+            };
+            rollback_stack(candidate, allocator, stack_start, THREAD_STACK_PAGES);
         }
-        prepared.count += 1;
     }
     restore_interrupts(flags);
     Ok(())
 }
 
-/// Run prepared tasks with IF disabled; process waits are explicit scheduler
-/// block operations, not timer-preempted user contexts.
-#[cfg(feature = "probe-user-process")]
-pub(crate) fn run_prepared_processes(
+/// Create one process task with its scheduler stack and TSS entry stack.
+///
+/// The caller must publish the task's callback context before the current task
+/// next blocks, yields, or exits; with IF clear on this single vCPU no other
+/// task can dispatch in between. Returns the generation-checked thread identity
+/// and the top of its guarded syscall entry stack.
+///
+/// # Safety
+/// `runtime_pointer` must point to the live, pinned process-task runtime, and
+/// the caller must hold the single-vCPU IF-disabled execution state.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+pub(crate) unsafe fn spawn_process_task<M: CandidatePageTableMemory>(
+    runtime_pointer: *mut (),
+    candidate: &mut CandidatePageTables<'_, M>,
+    allocator: &mut FrameAllocator,
+    cpu_info: &crate::arch::x86_64::cpu::CpuInfo,
+    entry: ThreadEntry,
+    argument: usize,
+) -> Result<(ThreadId, u64), &'static str> {
+    if runtime_pointer.is_null() {
+        return Err("process runtime is not installed");
+    }
+    // SAFETY: IF is clear and the caller guarantees the pinned runtime remains
+    // live; no other task can run while this setup completes.
+    let runtime = unsafe { &mut *runtime_pointer.cast::<KernelThreadRuntime>() };
+    let slot = free_thread_slot(runtime)?;
+    let stack_start = prepare_stack_region(
+        candidate,
+        allocator,
+        cpu_info,
+        slot,
+        THREAD_STACK_VIRTUAL_BASE,
+    )?;
+    let entry_stack_start = match prepare_stack_region(
+        candidate,
+        allocator,
+        cpu_info,
+        slot,
+        ENTRY_STACK_VIRTUAL_BASE,
+    ) {
+        Ok(stack_start) => stack_start,
+        Err(error) => {
+            rollback_stack(candidate, allocator, stack_start, THREAD_STACK_PAGES);
+            return Err(error);
+        }
+    };
+    let entry_stack_top = entry_stack_start + THREAD_STACK_PAGES as u64 * PAGE_SIZE;
+    let saved_rsp = match initialize_thread_stack(
+        candidate,
+        allocator,
+        stack_start,
+        slot,
+        runtime_pointer.cast::<KernelThreadRuntime>(),
+    ) {
+        Ok(saved_rsp) => saved_rsp,
+        Err(error) => {
+            rollback_stack(candidate, allocator, entry_stack_start, THREAD_STACK_PAGES);
+            rollback_stack(candidate, allocator, stack_start, THREAD_STACK_PAGES);
+            return Err(error);
+        }
+    };
+    let thread = match runtime.policy.create_thread() {
+        Ok(thread) if thread.slot_index() == slot => thread,
+        Ok(_) => {
+            rollback_stack(candidate, allocator, entry_stack_start, THREAD_STACK_PAGES);
+            rollback_stack(candidate, allocator, stack_start, THREAD_STACK_PAGES);
+            return Err("scheduler slot and stack slot diverged");
+        }
+        Err(_) => {
+            rollback_stack(candidate, allocator, entry_stack_start, THREAD_STACK_PAGES);
+            rollback_stack(candidate, allocator, stack_start, THREAD_STACK_PAGES);
+            return Err("scheduler thread capacity exhausted");
+        }
+    };
+    runtime.thread_ids[slot] = Some(thread);
+    runtime.stack_virtual_starts[slot] = Some(stack_start);
+    runtime.entry_stack_tops[slot] = Some(entry_stack_top);
+    runtime.entries[slot] = Some(entry);
+    runtime.arguments[slot] = argument;
+    runtime.saved_rsp[slot + 1] = saved_rsp;
+    Ok((thread, entry_stack_top))
+}
+
+/// Reclaim one exited process task's stacks and scheduler slot for reuse.
+///
+/// The thread must have exited: its scheduler continuation has switched away
+/// and no syscall continuation can remain on its entry stack. The caller must
+/// run with the kernel root active and local interrupts disabled.
+///
+/// # Safety
+/// `runtime_pointer` must point to the live, pinned process-task runtime, and
+/// the caller must hold the single-vCPU IF-disabled execution state.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+pub(crate) unsafe fn reap_exited_process_task<M: CandidatePageTableMemory>(
+    runtime_pointer: *mut (),
+    candidate: &mut CandidatePageTables<'_, M>,
+    allocator: &mut FrameAllocator,
+    thread: ThreadId,
+) -> Result<(), &'static str> {
+    if runtime_pointer.is_null() {
+        return Err("process runtime is not installed");
+    }
+    // SAFETY: IF is clear and the caller guarantees the pinned runtime remains live.
+    let runtime = unsafe { &mut *runtime_pointer.cast::<KernelThreadRuntime>() };
+    if runtime.policy.state(thread) != Ok(ThreadState::Exited) {
+        return Err("process task has not exited and cannot be reaped");
+    }
+    let slot = thread.slot_index();
+    if let Some(entry_top) = runtime.entry_stack_tops[slot].take() {
+        let entry_start = entry_top - THREAD_STACK_PAGES as u64 * PAGE_SIZE;
+        rollback_stack(candidate, allocator, entry_start, THREAD_STACK_PAGES);
+    }
+    let stack_start =
+        runtime.stack_virtual_starts[slot].unwrap_or_else(|| halt_on_stack_cleanup_failure());
+    rollback_stack(candidate, allocator, stack_start, THREAD_STACK_PAGES);
+    runtime
+        .policy
+        .reap(thread)
+        .unwrap_or_else(|_| halt_on_stack_cleanup_failure());
+    runtime.thread_ids[slot] = None;
+    runtime.stack_virtual_starts[slot] = None;
+    runtime.entries[slot] = None;
+    runtime.arguments[slot] = 0;
+    runtime.deadlines[slot] = None;
+    Ok(())
+}
+
+/// Look up the live scheduler identity occupying one process task slot.
+///
+/// # Safety
+/// `runtime_pointer` must point to the live, pinned process-task runtime, and
+/// the caller must hold the single-vCPU IF-disabled execution state.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+pub(crate) unsafe fn process_task_thread(
+    runtime_pointer: *mut (),
+    slot: usize,
+) -> Option<ThreadId> {
+    if runtime_pointer.is_null() || slot >= MAX_THREADS {
+        return None;
+    }
+    // SAFETY: IF is clear and the runtime remains live through process execution.
+    unsafe { (*runtime_pointer.cast::<KernelThreadRuntime>()).thread_ids[slot] }
+}
+
+/// Cooperatively yield until the given task has exited.
+///
+/// Used by a waiting parent after the child recorded its process exit: the
+/// child's exit trampoline still has to return to its scheduler stack and mark
+/// the thread exited before its stacks can be reclaimed. Returns false if the
+/// identity is stale or the task does not exit within the bounded turn budget.
+///
+/// # Safety
+/// `runtime_pointer` must point to the live, pinned process-task runtime that
+/// owns the current cooperative task; the call may context-switch.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+pub(crate) unsafe fn wait_for_task_exit(runtime_pointer: *mut (), thread: ThreadId) -> bool {
+    const TURN_BUDGET: usize = 1024;
+    for _ in 0..TURN_BUDGET {
+        let flags = disable_interrupts();
+        let switch = {
+            // SAFETY: IF is clear and the caller guarantees the pinned runtime
+            // stays live; the borrow ends before any context switch.
+            let runtime = unsafe { &mut *runtime_pointer.cast::<KernelThreadRuntime>() };
+            match runtime.policy.state(thread) {
+                Ok(ThreadState::Exited) => {
+                    restore_interrupts(flags);
+                    return true;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    restore_interrupts(flags);
+                    return false;
+                }
+            }
+            runtime.wake_ready_events();
+            let Some(current) = runtime.policy.current() else {
+                restore_interrupts(flags);
+                return false;
+            };
+            let old_context = runtime.current_context;
+            let next = match runtime.policy.yield_current() {
+                Ok(next) => next,
+                Err(_) => {
+                    restore_interrupts(flags);
+                    return false;
+                }
+            };
+            let next_context = next.slot_index() + 1;
+            runtime.current_context = next_context;
+            if current == next {
+                // No other task can run; the target cannot make progress.
+                restore_interrupts(flags);
+                return false;
+            }
+            Some((
+                core::ptr::addr_of_mut!(runtime.saved_rsp[old_context]),
+                runtime.saved_rsp[next_context],
+                core::ptr::addr_of_mut!(runtime.fx_state[old_context]),
+                core::ptr::addr_of_mut!(runtime.fx_state[next_context]),
+            ))
+        };
+        if let Some((old_rsp, new_rsp, old_fx_state, new_fx_state)) = switch {
+            // SAFETY: Both contexts are live kernel stacks owned by this runtime;
+            // the temporary scheduler borrows ended before the switch.
+            unsafe {
+                rustix_arch_context_switch(
+                    old_rsp,
+                    new_rsp as *mut usize,
+                    old_fx_state,
+                    new_fx_state,
+                )
+            };
+        }
+        restore_interrupts(flags);
+    }
+    false
+}
+
+/// Run the process-task runtime until every created task has exited.
+///
+/// Tasks are created dynamically by `spawn_process_task`; the init task must
+/// exist before this call. The runtime returns only when no live task remains,
+/// so no future spawn can appear after return.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+pub(crate) fn run_process_runtime(
     prepared: core::pin::Pin<&mut PreparedProcessTasks>,
-    entries: &[(ThreadEntry, usize)],
 ) -> Result<(), &'static str> {
     let runtime_pointer = {
         // SAFETY: The caller maintains the pin until every scheduler context exits.
         let prepared = unsafe { prepared.get_unchecked_mut() };
-        if entries.len() != prepared.count || prepared.count == 0 {
-            return Err("process task entries do not match prepared stack count");
-        }
-        for (slot, (entry, argument)) in entries.iter().copied().enumerate() {
-            let Some(thread) = prepared.runtime.thread_ids[slot] else {
-                return Err("process task context is not ready for initial dispatch");
-            };
-            if prepared.runtime.policy.state(thread) != Ok(ThreadState::Ready) {
-                return Err("process task context is not ready for initial dispatch");
-            }
-            prepared.runtime.entries[slot] = Some(entry);
-            prepared.runtime.arguments[slot] = argument;
+        if prepared.runtime.thread_ids.iter().all(Option::is_none) {
+            return Err("process runtime has no initial task");
         }
         core::ptr::addr_of_mut!(prepared.runtime)
     };
@@ -422,9 +633,9 @@ pub(crate) fn run_prepared_processes(
     Ok(())
 }
 
-/// Reclaim the scheduler stacks after all roots that shared their kernel mappings
-/// have been destroyed and their borrow of the candidate root has ended.
-#[cfg(feature = "probe-user-process")]
+/// Reclaim the scheduler and entry stacks after all roots that shared their
+/// kernel mappings have been destroyed and their borrow of the candidate ended.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) fn reclaim_process_task_stacks<M: CandidatePageTableMemory>(
     prepared: core::pin::Pin<&mut PreparedProcessTasks>,
     candidate: &mut CandidatePageTables<'_, M>,
@@ -440,19 +651,23 @@ pub(crate) fn reclaim_process_task_stacks<M: CandidatePageTableMemory>(
         halt_on_stack_cleanup_failure();
     }
     let frames_before = allocator.free_frames();
-    let expected_frames = (prepared.count * THREAD_STACK_PAGES) as u64;
+    let mut expected_frames = 0u64;
+    for slot in 0..MAX_THREADS {
+        if prepared.runtime.thread_ids[slot].is_some() {
+            expected_frames += THREAD_STACK_PAGES as u64;
+        }
+        if prepared.runtime.entry_stack_tops[slot].is_some() {
+            expected_frames += THREAD_STACK_PAGES as u64;
+        }
+    }
     let flags = disable_interrupts();
     reap_exited_stacks(&mut prepared.runtime, candidate, allocator);
-    prepared.count = 0;
     restore_interrupts(flags);
     if allocator.free_frames().checked_sub(frames_before) != Some(expected_frames) {
         return Err("scheduler task stack frames were not fully reclaimed");
     }
     Ok(())
 }
-
-#[cfg(feature = "probe-user-process")]
-extern "C" fn unstarted_process_task(_runtime: *mut (), _argument: usize) {}
 
 /// Block the current cooperative thread until an input IRQ publishes an event.
 pub(crate) fn wait_for_input(runtime_pointer: *mut ()) {
@@ -463,110 +678,12 @@ pub(crate) fn wait_for_input(runtime_pointer: *mut ()) {
     }
 }
 
-/// Block the current process task until its process execution context is published.
-/// Returns `false` if process execution was closed before start or blocking failed.
-///
-/// # Safety
-/// `runtime_pointer` must point to the live, pinned process-task runtime that
-/// owns the current cooperative task. The call may context-switch; no other CPU
-/// may access this single-vCPU runtime.
-#[cfg(feature = "probe-user-process")]
-pub(crate) unsafe fn wait_for_process_start(runtime_pointer: *mut ()) -> bool {
-    if runtime_pointer.is_null() {
-        return false;
-    }
-    let runtime = runtime_pointer.cast::<KernelThreadRuntime>();
-    loop {
-        let flags = disable_interrupts();
-        // SAFETY: The caller keeps this runtime pinned and alive, while IF
-        // exclusion serializes the state read with start/close publication.
-        let (published, closed, queue) = unsafe {
-            let runtime = &*runtime;
-            (
-                runtime.process_start_published,
-                runtime.process_start_closed,
-                runtime.process_start_queue,
-            )
-        };
-        if closed {
-            restore_interrupts(flags);
-            return false;
-        }
-        if published {
-            restore_interrupts(flags);
-            return true;
-        }
-        // Keep IF disabled between checking the persistent state and queueing,
-        // so a start/close publication cannot be lost in that interval.
-        // SAFETY: The same pinned runtime owns the current cooperative task;
-        // the helper releases its mutable scheduler borrow before switching.
-        let blocked = unsafe { block_current_on_queue(runtime, queue) };
-        restore_interrupts(flags);
-        if !blocked {
-            return false;
-        }
-    }
-}
-
-/// Publish a ready process context and wake the single deferred scheduler task.
-///
-/// The caller must publish the process context and all callback state before
-/// calling this function. The publication flag also covers the case where the
-/// deferred task has not yet reached its wait call.
-///
-/// # Safety
-/// `runtime_pointer` must point to the live, pinned process-task runtime. The
-/// published process context must remain valid until its task exits, and the
-/// caller must obey the runtime's single-vCPU ownership contract.
-#[cfg(feature = "probe-user-process")]
-pub(crate) unsafe fn wake_process_start_waiter(runtime_pointer: *mut ()) -> bool {
-    if runtime_pointer.is_null() {
-        return false;
-    }
-    let flags = disable_interrupts();
-    // SAFETY: IF is clear and the caller guarantees the pinned runtime remains
-    // live; no mutable reference survives the scheduler operation.
-    let result = unsafe {
-        let runtime = &mut *runtime_pointer.cast::<KernelThreadRuntime>();
-        if runtime.process_start_closed {
-            false
-        } else {
-            runtime.process_start_published = true;
-            runtime.policy.wake_one(runtime.process_start_queue).is_ok()
-        }
-    };
-    restore_interrupts(flags);
-    result
-}
-
-/// Close process start and release a task that never received a start context.
-/// This is idempotent and also wakes a task already blocked on the start queue.
-///
-/// # Safety
-/// `runtime_pointer` must point to the live, pinned process-task runtime, and
-/// the caller must obey the runtime's single-vCPU ownership contract.
-#[cfg(feature = "probe-user-process")]
-pub(crate) unsafe fn close_process_start(runtime_pointer: *mut ()) -> bool {
-    if runtime_pointer.is_null() {
-        return false;
-    }
-    let flags = disable_interrupts();
-    // SAFETY: IF is clear and the runtime remains live through process execution.
-    let result = unsafe {
-        let runtime = &mut *runtime_pointer.cast::<KernelThreadRuntime>();
-        runtime.process_start_closed = true;
-        runtime.policy.wake_all(runtime.process_start_queue).is_ok()
-    };
-    restore_interrupts(flags);
-    result
-}
-
 /// Block the current process thread until some process publishes an exit.
 ///
 /// # Safety
 /// `runtime_pointer` must point to the live, pinned process-task runtime that
 /// owns the currently running cooperative thread. The call may context-switch.
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) unsafe fn wait_for_process_exit(runtime_pointer: *mut ()) -> bool {
     if runtime_pointer.is_null() {
         return false;
@@ -585,7 +702,7 @@ pub(crate) unsafe fn wait_for_process_exit(runtime_pointer: *mut ()) -> bool {
 /// # Safety
 /// `runtime_pointer` must point to the live, pinned process-task runtime, and
 /// the caller must hold the single-vCPU scheduler's IF-disabled execution state.
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) unsafe fn wake_process_exit_waiters(runtime_pointer: *mut ()) -> bool {
     if runtime_pointer.is_null() {
         return false;
@@ -617,6 +734,7 @@ pub fn smoke<M: CandidatePageTableMemory>(
     kprintln!("IRQ-save lock path passed: prior IF state preserved");
 
     let mut runtime = KernelThreadRuntime::new(ticks).map_err(|_| "scheduler setup failed")?;
+    runtime.enable_thread_interrupts = true;
     let runtime_pointer = core::ptr::addr_of_mut!(runtime);
 
     let flags = disable_interrupts();
@@ -723,6 +841,7 @@ fn timer_preemption_smoke<M: CandidatePageTableMemory>(
 
     let mut runtime =
         KernelThreadRuntime::new(ticks).map_err(|_| "preemption scheduler setup failed")?;
+    runtime.enable_thread_interrupts = true;
     let runtime_pointer = core::ptr::addr_of_mut!(runtime);
     let ticks_pointer = ticks as *const AtomicTickCounter as usize;
 
@@ -831,21 +950,24 @@ extern "C" fn non_yielding_preemption_worker_b(_runtime: *mut (), _ticks_pointer
     PREEMPTION_B_STARTED.store(1, Ordering::Release);
 }
 
-fn spawn_thread<M: CandidatePageTableMemory>(
-    runtime: &mut KernelThreadRuntime,
-    candidate: &mut CandidatePageTables<'_, M>,
-    allocator: &mut FrameAllocator,
-    cpu_info: &crate::arch::x86_64::cpu::CpuInfo,
-    runtime_pointer: *mut KernelThreadRuntime,
-    entry: ThreadEntry,
-    argument: usize,
-) -> Result<ThreadId, &'static str> {
-    let slot = runtime
+fn free_thread_slot(runtime: &KernelThreadRuntime) -> Result<usize, &'static str> {
+    runtime
         .thread_ids
         .iter()
         .position(Option::is_none)
-        .ok_or("thread capacity exhausted")?;
-    let region_start = THREAD_STACK_VIRTUAL_BASE
+        .ok_or("thread capacity exhausted")
+}
+
+/// Verify one slot's guard/stack window is unmapped, then map its guarded stack.
+/// Returns the low address of the mapped stack pages. The caller owns rollback.
+fn prepare_stack_region<M: CandidatePageTableMemory>(
+    candidate: &mut CandidatePageTables<'_, M>,
+    allocator: &mut FrameAllocator,
+    cpu_info: &crate::arch::x86_64::cpu::CpuInfo,
+    slot: usize,
+    window_base: u64,
+) -> Result<u64, &'static str> {
+    let region_start = window_base
         .checked_add(
             (slot as u64)
                 .checked_mul(THREAD_STACK_STRIDE)
@@ -939,9 +1061,21 @@ fn spawn_thread<M: CandidatePageTableMemory>(
         }
         mapped_pages += 1;
     }
+    Ok(stack_start)
+}
 
+/// Build the initial cooperative context frame at the top of a mapped stack.
+fn initialize_thread_stack<M: CandidatePageTableMemory>(
+    candidate: &mut CandidatePageTables<'_, M>,
+    allocator: &mut FrameAllocator,
+    stack_start: u64,
+    slot: usize,
+    runtime_pointer: *mut KernelThreadRuntime,
+) -> Result<usize, &'static str> {
     let stack_top = stack_start + THREAD_STACK_PAGES as u64 * PAGE_SIZE;
     let frame_word_count = 16;
+    // SAFETY: The stack pages were just mapped supervisor RW/NX in the active
+    // root and are exclusively owned by this runtime slot; IF is clear.
     let frame_words = unsafe {
         core::slice::from_raw_parts_mut(
             (stack_top as *mut usize).sub(frame_word_count),
@@ -955,17 +1089,42 @@ fn spawn_thread<M: CandidatePageTableMemory>(
         kernel_thread_trampoline as *const () as usize,
     );
     let Some(saved_rsp) = saved_rsp else {
-        rollback_stack(candidate, allocator, stack_start, mapped_pages);
+        rollback_stack(candidate, allocator, stack_start, THREAD_STACK_PAGES);
         return Err("thread initial context frame did not fit");
     };
+    Ok(saved_rsp)
+}
+
+fn spawn_thread<M: CandidatePageTableMemory>(
+    runtime: &mut KernelThreadRuntime,
+    candidate: &mut CandidatePageTables<'_, M>,
+    allocator: &mut FrameAllocator,
+    cpu_info: &crate::arch::x86_64::cpu::CpuInfo,
+    runtime_pointer: *mut KernelThreadRuntime,
+    entry: ThreadEntry,
+    argument: usize,
+) -> Result<ThreadId, &'static str> {
+    let slot = free_thread_slot(runtime)?;
+    let stack_start = prepare_stack_region(
+        candidate,
+        allocator,
+        cpu_info,
+        slot,
+        THREAD_STACK_VIRTUAL_BASE,
+    )?;
+    let saved_rsp =
+        match initialize_thread_stack(candidate, allocator, stack_start, slot, runtime_pointer) {
+            Ok(saved_rsp) => saved_rsp,
+            Err(error) => return Err(error),
+        };
     let thread = match runtime.policy.create_thread() {
         Ok(thread) if thread.slot_index() == slot => thread,
         Ok(_) => {
-            rollback_stack(candidate, allocator, stack_start, mapped_pages);
+            rollback_stack(candidate, allocator, stack_start, THREAD_STACK_PAGES);
             return Err("scheduler slot and stack slot diverged");
         }
         Err(_) => {
-            rollback_stack(candidate, allocator, stack_start, mapped_pages);
+            rollback_stack(candidate, allocator, stack_start, THREAD_STACK_PAGES);
             return Err("scheduler thread capacity exhausted");
         }
     };
@@ -1005,6 +1164,11 @@ fn reap_exited_stacks<M: CandidatePageTableMemory>(
         if runtime.policy.state(thread) != Ok(ThreadState::Exited) {
             continue;
         }
+        #[cfg(all(target_os = "none", feature = "boot-userspace"))]
+        if let Some(entry_top) = runtime.entry_stack_tops[slot].take() {
+            let entry_start = entry_top - THREAD_STACK_PAGES as u64 * PAGE_SIZE;
+            rollback_stack(candidate, allocator, entry_start, THREAD_STACK_PAGES);
+        }
         let stack_start =
             runtime.stack_virtual_starts[slot].unwrap_or_else(|| halt_on_stack_cleanup_failure());
         rollback_stack(candidate, allocator, stack_start, THREAD_STACK_PAGES);
@@ -1020,7 +1184,10 @@ fn reap_exited_stacks<M: CandidatePageTableMemory>(
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(any(
+    all(target_os = "none", feature = "boot-userspace"),
+    feature = "probe-kernel-threads"
+))]
 fn cancel_unstarted_threads(runtime: &mut KernelThreadRuntime) {
     loop {
         match runtime.policy.dispatch() {
@@ -1237,7 +1404,7 @@ unsafe fn block_current(runtime_pointer: *mut KernelThreadRuntime, delay: Option
     true
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 unsafe fn block_current_on_queue(
     runtime_pointer: *mut KernelThreadRuntime,
     queue: WaitQueueId,

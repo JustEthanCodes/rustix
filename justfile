@@ -48,9 +48,13 @@ active-map-smoke:
 frame-smoke:
     python3 scripts/boot.py frame-smoke
 
-# Run bundled init in Ring 3 and verify syscalls, wait status, and root teardown in QEMU.
+# Run bundled init in Ring 3 and verify syscalls, nested spawn, reuse, exec, and teardown in QEMU.
 process-smoke:
     python3 scripts/boot.py process-smoke
+
+# Inject a normal-boot userspace launch failure and verify report + shell fallback in QEMU.
+userspace-failure-smoke:
+    python3 scripts/boot.py userspace-failure-smoke
 
 # Terminate Ring 3 processes on #PF/#GP/#UD/#DE and verify wait/reap plus teardown in QEMU.
 user-fault-smoke:
@@ -77,4 +81,4 @@ test:
     cargo test --workspace --lib
 
 # Run formatting, host tests, target checks, and the boot, scheduler, input, and process QEMU smokes.
-verify: fmt test check smoke uefi-smoke active-map-smoke thread-smoke input-smoke fault-smoke process-smoke user-fault-smoke
+verify: fmt test check smoke uefi-smoke active-map-smoke thread-smoke input-smoke fault-smoke process-smoke userspace-failure-smoke user-fault-smoke

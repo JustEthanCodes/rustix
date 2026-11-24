@@ -138,10 +138,10 @@ static mut IRQ_HANDLERS: [Option<IrqHandler>; 256] = [None; 256];
 static IN_FATAL_EXCEPTION: AtomicBool = AtomicBool::new(false);
 static USER_VIRTUAL_ADDRESS_BITS: AtomicU8 = AtomicU8::new(0);
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) type UserSyscallHandler =
     extern "C" fn(*mut rustix_kernel::syscall::SyscallContext, *mut ()) -> i64;
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) type UserExceptionHandler = extern "C" fn(u64, *mut ()) -> bool;
 
 #[derive(Clone, Copy)]
@@ -163,7 +163,7 @@ pub(crate) struct UserEntryState {
     kernel_fx_state: UserKernelFxState,
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 impl UserEntryState {
     pub(crate) const fn new() -> Self {
         Self {
@@ -188,14 +188,14 @@ const _: [(); 32] = [(); core::mem::offset_of!(UserEntryState, kernel_fx_state)]
 #[no_mangle]
 static mut RUSTIX_ACTIVE_USER_ENTRY: *mut UserEntryState = core::ptr::null_mut();
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 #[derive(Clone, Copy)]
 struct UserSyscallRuntime {
     handler: UserSyscallHandler,
     exception_handler: UserExceptionHandler,
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 static mut USER_SYSCALL_RUNTIME: Option<UserSyscallRuntime> = None;
 
 /// A device interrupt callback. The callback is responsible for issuing EOI.
@@ -257,12 +257,12 @@ extern "C" {
     static irq_stub_table: [usize; IRQ_STUB_COUNT];
     fn rustix_load_gdt(descriptor_table_pointer: *const DescriptorTablePointer);
     fn rustix_syscall_stub();
-    #[cfg(feature = "probe-user-process")]
+    #[cfg(all(target_os = "none", feature = "boot-userspace"))]
     fn rustix_enter_user(
         frame: *const rustix_kernel::syscall::UserIretFrame,
         state: *mut UserEntryState,
     ) -> i32;
-    #[cfg(feature = "probe-user-process")]
+    #[cfg(all(target_os = "none", feature = "boot-userspace"))]
     fn rustix_user_exception_exit() -> !;
 
 }
@@ -419,7 +419,7 @@ pub enum KernelEntryStackError {
     Misaligned,
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserRuntimeError {
     InterruptsEnabled,
@@ -483,7 +483,7 @@ pub unsafe fn restore_bootstrap_kernel_entry_stack(
 /// # Safety
 /// Local interrupts must be disabled, no other CPU may access this state, and
 /// `context` must remain live until the callback is cleared after user return.
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) unsafe fn install_user_syscall_handler(
     handler: UserSyscallHandler,
     exception_handler: UserExceptionHandler,
@@ -516,7 +516,7 @@ pub(crate) unsafe fn install_user_syscall_handler(
 ///
 /// # Safety
 /// Local interrupts must be disabled, and no syscall callback may be in flight.
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) unsafe fn clear_user_syscall_handler() {
     // SAFETY: IF is clear and no user-entry trampoline may remain active when
     // clearing the callback or its process-local state.
@@ -533,7 +533,7 @@ pub(crate) unsafe fn clear_user_syscall_handler() {
 /// # Safety
 /// The kernel root must be active, the process root must no longer be active,
 /// and execution must be on this single CPU with maskable interrupts disabled.
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) unsafe fn request_user_process_exit(status: i32) {
     // SAFETY: IF is clear and the active entry points to the live process state
     // whose syscall or exception callback is currently executing.
@@ -558,7 +558,7 @@ pub(crate) unsafe fn request_user_process_exit(status: i32) {
 /// The process root must already be active in CR3, TSS.RSP0 must point to a live
 /// supervisor stack mapped in both roots, syscall and user-fault callbacks must
 /// be installed, and maskable interrupts must be disabled.
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 pub(crate) unsafe fn enter_user(
     frame: rustix_kernel::syscall::ValidatedUserIretFrame,
     state: *mut UserEntryState,
@@ -684,7 +684,29 @@ pub extern "C" fn rustix_syscall_dispatch(context: *mut rustix_kernel::syscall::
     };
     let frame = match sanitize_user_syscall_return_frame(frame, address_bits) {
         Ok(frame) => frame.into_raw(),
-        Err(_) => fatal_irq_halt(),
+        Err(_) => {
+            #[cfg(all(target_os = "none", feature = "boot-userspace"))]
+            {
+                let runtime = core::ptr::addr_of!(USER_SYSCALL_RUNTIME);
+                // SAFETY: IF is clear; the runtime is installed only for a live
+                // synchronous Ring 3 entry on this single CPU.
+                if let Some(runtime) = unsafe { runtime.read() } {
+                    let state = unsafe { core::ptr::addr_of!(RUSTIX_ACTIVE_USER_ENTRY).read() };
+                    if state.is_null() {
+                        fatal_irq_halt();
+                    }
+                    // SAFETY: The active entry and callback context remain live
+                    // until the syscall assembly observes its pending exit.
+                    let callback_context =
+                        unsafe { core::ptr::addr_of!((*state).syscall_context).read() };
+                    crate::kprintln!("USER SYSCALL RETURN FRAME: invalid; terminating process");
+                    if (runtime.exception_handler)(13, callback_context) {
+                        return;
+                    }
+                }
+            }
+            fatal_irq_halt()
+        }
     };
     context.instruction_pointer = frame.instruction_pointer;
     context.code_selector = frame.code_selector;
@@ -700,7 +722,7 @@ pub extern "C" fn rustix_syscall_dispatch(context: *mut rustix_kernel::syscall::
         r8: context.r8,
         r9: context.r9,
     };
-    #[cfg(feature = "probe-user-process")]
+    #[cfg(all(target_os = "none", feature = "boot-userspace"))]
     let result = {
         let runtime = core::ptr::addr_of!(USER_SYSCALL_RUNTIME);
         // SAFETY: IF is clear and only this CPU can update the function table.
@@ -718,7 +740,7 @@ pub extern "C" fn rustix_syscall_dispatch(context: *mut rustix_kernel::syscall::
             fallback_syscall_result(context.rax, arguments)
         }
     };
-    #[cfg(not(feature = "probe-user-process"))]
+    #[cfg(not(all(target_os = "none", feature = "boot-userspace")))]
     let result = fallback_syscall_result(context.rax, arguments);
     context.rax = result as u64;
 }
@@ -736,6 +758,7 @@ fn fallback_syscall_result(
             | SyscallRequest::Write { .. }
             | SyscallRequest::Wait { .. }
             | SyscallRequest::Spawn { .. }
+            | SyscallRequest::Exec { .. }
             | SyscallRequest::Mmap { .. }
             | SyscallRequest::Munmap { .. }
             | SyscallRequest::MmapRegion { .. }
@@ -760,7 +783,7 @@ pub extern "C" fn rustix_exception_dispatch(context: *const ExceptionContext) ->
     // SAFETY: The common assembly stub passes a pointer to its normalized stack
     // frame, which remains live for the duration of this non-returning handler.
     let context = unsafe { &*context };
-    #[cfg(feature = "probe-user-process")]
+    #[cfg(all(target_os = "none", feature = "boot-userspace"))]
     if context.cs & 3 == 3 && !matches!(context.vector, 2 | 8 | 18) {
         let runtime = core::ptr::addr_of!(USER_SYSCALL_RUNTIME);
         // SAFETY: Exceptions arrive with IF clear; the diagnostic process runtime

@@ -9,11 +9,11 @@
     all(feature = "probe-kernel-threads", feature = "inject-invalid-opcode"),
     all(feature = "probe-kernel-threads", feature = "probe-hhdm-frame"),
     all(feature = "probe-kernel-threads", feature = "probe-active-mapping"),
-    all(feature = "probe-user-process", feature = "inject-page-fault"),
-    all(feature = "probe-user-process", feature = "inject-invalid-opcode"),
-    all(feature = "probe-user-process", feature = "probe-kernel-threads"),
-    all(feature = "probe-user-process", feature = "probe-hhdm-frame"),
-    all(feature = "probe-user-process", feature = "probe-active-mapping"),
+    all(feature = "boot-userspace", feature = "inject-page-fault"),
+    all(feature = "boot-userspace", feature = "inject-invalid-opcode"),
+    all(feature = "boot-userspace", feature = "probe-kernel-threads"),
+    all(feature = "boot-userspace", feature = "probe-hhdm-frame"),
+    all(feature = "boot-userspace", feature = "probe-active-mapping"),
     all(feature = "inject-page-fault", feature = "inject-general-protection"),
     all(feature = "inject-page-fault", feature = "inject-divide-error"),
     all(
@@ -31,11 +31,11 @@
         feature = "inject-general-protection",
         feature = "probe-active-mapping"
     ),
-    all(feature = "inject-general-protection", feature = "probe-user-process"),
+    all(feature = "inject-general-protection", feature = "boot-userspace"),
     all(feature = "inject-divide-error", feature = "probe-hhdm-frame"),
     all(feature = "inject-divide-error", feature = "probe-kernel-threads"),
     all(feature = "inject-divide-error", feature = "probe-active-mapping"),
-    all(feature = "inject-divide-error", feature = "probe-user-process"),
+    all(feature = "inject-divide-error", feature = "boot-userspace"),
     all(feature = "probe-user-fault", feature = "probe-user-page-fault"),
     all(
         feature = "probe-user-fault",
@@ -48,8 +48,28 @@
     ),
     all(feature = "probe-user-page-fault", feature = "probe-user-divide-error"),
     all(
+        feature = "probe-user-fault",
+        feature = "probe-user-invalid-syscall-return"
+    ),
+    all(
+        feature = "probe-user-page-fault",
+        feature = "probe-user-invalid-syscall-return"
+    ),
+    all(
+        feature = "probe-user-general-protection",
+        feature = "probe-user-invalid-syscall-return"
+    ),
+    all(
+        feature = "probe-user-divide-error",
+        feature = "probe-user-invalid-syscall-return"
+    ),
+    all(
         feature = "probe-user-general-protection",
         feature = "probe-user-divide-error"
+    ),
+    all(
+        feature = "probe-userspace-launch-failure",
+        feature = "probe-user-process"
     )
 ))]
 compile_error!("opt-in QEMU diagnostic features are mutually exclusive");
@@ -68,29 +88,22 @@ const LOCAL_APIC_VIRTUAL_ADDRESS: u64 = 0xffff_c100_0000_0000;
 const IO_APIC_VIRTUAL_ADDRESS: u64 = LOCAL_APIC_VIRTUAL_ADDRESS + rustix_kernel::paging::PAGE_SIZE;
 const KERNEL_HEAP_GROWTH_VIRTUAL_BASE: u64 = 0xffff_c200_0000_0000;
 const KERNEL_HEAP_GROWTH_MAX_PAGES: usize = 256;
-#[cfg(feature = "probe-user-process")]
-const USER_KERNEL_STACK_SIZE: usize = 16 * 1024;
-#[cfg(feature = "probe-user-process")]
-#[derive(Clone, Copy)]
-#[repr(C, align(4096))]
-struct UserKernelStack([u8; USER_KERNEL_STACK_SIZE]);
-#[cfg(feature = "probe-user-process")]
-static mut USER_KERNEL_ENTRY_STACKS: [UserKernelStack; rustix_kernel::process::MAX_PROCESSES] =
-    [UserKernelStack([0; USER_KERNEL_STACK_SIZE]); rustix_kernel::process::MAX_PROCESSES];
 #[cfg(target_os = "none")]
 const INIT_ELF_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rustix-init.elf"));
-#[cfg(all(target_os = "none", feature = "probe-user-process"))]
-const CHILD_ELF_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rustix-child.elf"));
-#[cfg(feature = "probe-user-process")]
+
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 static mut SPAWN_IMAGE_STAGING: [u8; rustix_kernel::syscall::MAX_SPAWN_IMAGE_BYTES as usize] =
     [0; rustix_kernel::syscall::MAX_SPAWN_IMAGE_BYTES as usize];
 #[cfg(any(
     feature = "probe-user-fault",
     feature = "probe-user-page-fault",
     feature = "probe-user-general-protection",
-    feature = "probe-user-divide-error"
+    feature = "probe-user-divide-error",
+    feature = "probe-user-invalid-syscall-return"
 ))]
-const PROBE_USER_FAULT_VECTOR: u64 = if cfg!(feature = "probe-user-fault") {
+const PROBE_USER_FAULT_VECTOR: u64 = if cfg!(feature = "probe-user-invalid-syscall-return") {
+    13
+} else if cfg!(feature = "probe-user-fault") {
     6
 } else if cfg!(feature = "probe-user-page-fault") {
     14
@@ -235,14 +248,20 @@ unsafe impl rustix_kernel::paging::CandidatePageTableMemory for LimineHhdmCandid
     }
 }
 
-#[cfg(any(feature = "probe-hhdm-frame", feature = "probe-user-process"))]
+#[cfg(any(
+    feature = "probe-hhdm-frame",
+    all(target_os = "none", feature = "boot-userspace")
+))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LimineUserFrameMemoryError {
     OutOfBounds,
     Address(rustix_kernel::memory::HhdmAddressError),
 }
 
-#[cfg(any(feature = "probe-hhdm-frame", feature = "probe-user-process"))]
+#[cfg(any(
+    feature = "probe-hhdm-frame",
+    all(target_os = "none", feature = "boot-userspace")
+))]
 struct LimineHhdmUserFrameMemory<'a> {
     memory_map: &'a rustix_kernel::memory::MemoryMap,
     hhdm_offset: u64,
@@ -250,7 +269,10 @@ struct LimineHhdmUserFrameMemory<'a> {
     virtual_address_bits: u8,
 }
 
-#[cfg(any(feature = "probe-hhdm-frame", feature = "probe-user-process"))]
+#[cfg(any(
+    feature = "probe-hhdm-frame",
+    all(target_os = "none", feature = "boot-userspace")
+))]
 impl LimineHhdmUserFrameMemory<'_> {
     fn frame_slice_address(
         &self,
@@ -285,7 +307,10 @@ impl LimineHhdmUserFrameMemory<'_> {
     }
 }
 
-#[cfg(any(feature = "probe-hhdm-frame", feature = "probe-user-process"))]
+#[cfg(any(
+    feature = "probe-hhdm-frame",
+    all(target_os = "none", feature = "boot-userspace")
+))]
 // SAFETY: The non-copyable Frame token and checked HHDM conversion authorize a
 // complete Usable page. Each operation checks its subrange, accesses only that
 // page, and uses raw copies rather than forming user virtual references. The
@@ -1233,7 +1258,7 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
     }
     probe_kernel_heap();
 
-    #[cfg(feature = "probe-user-process")]
+    #[cfg(all(target_os = "none", feature = "boot-userspace"))]
     {
         let probe_flags: u64;
         // SAFETY: This is the single-vCPU bootstrap path; retain IF for restoration.
@@ -1269,21 +1294,41 @@ fn activate_cloned_page_tables_and_run(boot_info: &mut boot::BootInfo) -> ! {
             unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
         }
         if let Err(error) = probe_result {
-            kprintln!("process-root probe failed: {}", error);
-            halt_forever();
+            #[cfg(feature = "probe-user-process")]
+            {
+                kprintln!("process-root probe failed: {}", error);
+                halt_forever();
+            }
+            // Normal-boot failure policy: report the launch failure over the
+            // serial console and fall back to the kernel shell so diagnostics
+            // remain reachable. The runtime reclaims every root and stack it
+            // created before returning an error.
+            #[cfg(not(feature = "probe-user-process"))]
+            kprintln!(
+                "normal-boot userspace launch failed: {}; continuing to Crabshell",
+                error
+            );
         }
         #[cfg(not(any(
             feature = "probe-user-fault",
             feature = "probe-user-page-fault",
             feature = "probe-user-general-protection",
-            feature = "probe-user-divide-error"
+            feature = "probe-user-divide-error",
+            feature = "probe-user-invalid-syscall-return"
         )))]
-        kprintln!("Ring 3 init passed: write/EFAULT/blocking child wait/exit syscalls, kernel wait, and process-root teardown");
+        {
+            if probe_result.is_ok() {
+                kprintln!("Ring 3 init passed: write/EFAULT/blocking child wait/exit syscalls, kernel wait, and process-root teardown");
+                #[cfg(not(feature = "probe-user-process"))]
+                kprintln!("normal-boot userspace passed: init ran, exited, and was reaped before the shell");
+            }
+        }
         #[cfg(any(
             feature = "probe-user-fault",
             feature = "probe-user-page-fault",
             feature = "probe-user-general-protection",
-            feature = "probe-user-divide-error"
+            feature = "probe-user-divide-error",
+            feature = "probe-user-invalid-syscall-return"
         ))]
         kprintln!(
             "Ring 3 user fault passed: process exited, was waited on, and its root was torn down"
@@ -2044,10 +2089,10 @@ fn probe_kernel_heap() {
     kprintln!("kernel heap probe passed: bootstrap exhaustion, frame-backed growth, reuse");
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 struct SerialProcessProbeOutput;
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 impl rustix_kernel::syscall::ConsoleOutput for SerialProcessProbeOutput {
     type Error = ();
 
@@ -2062,11 +2107,12 @@ impl rustix_kernel::syscall::ConsoleOutput for SerialProcessProbeOutput {
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 struct ActiveUserProcessSyscallContext {
     roots: *mut (),
-    kernel_entry_stack_tops: *const u64,
-    cr3_low_bits: u16,
+    kernel_candidate: *mut (),
+    cpu_info: *const arch::x86_64::cpu::CpuInfo,
+    cr3_low_bits: rustix_kernel::paging::Cr3LowBits,
     user_memory: *mut (),
     allocator: *mut rustix_kernel::frame::FrameAllocator,
     user_regions: *mut rustix_kernel::process::UserRegionTable,
@@ -2079,73 +2125,38 @@ struct ActiveUserProcessSyscallContext {
     kernel_entry_stack_top: u64,
     runtime_pointer: *mut (),
     user_frame: rustix_kernel::syscall::ValidatedUserIretFrame,
-    child_context: *mut SpawnedProcessTask,
+    slots: *mut ProcessTaskSlot,
+    task_slot: usize,
     pat: rustix_kernel::paging::PatLayout,
     normal_caching: bool,
     physical_address_bits: u8,
     virtual_address_bits: u8,
 }
 
-#[cfg(feature = "probe-user-process")]
-struct SpawnedProcessTask {
-    ready: bool,
+/// One reusable scheduler-slot record for a process task.
+///
+/// `occupied` means the context is published and the task owns its stacks until
+/// it is reaped; `root_owned` tracks whether the process root still needs
+/// teardown. Slot indices are scheduler slots, never PID arithmetic.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+struct ProcessTaskSlot {
+    occupied: bool,
+    root_owned: bool,
     regions: core::mem::MaybeUninit<rustix_kernel::process::UserRegionTable>,
     context: core::mem::MaybeUninit<ActiveUserProcessSyscallContext>,
 }
 
-#[cfg(feature = "probe-user-process")]
-fn user_kernel_stack_top(process_id: rustix_kernel::process::ProcessId) -> Option<u64> {
-    let index = usize::try_from(process_id.get().checked_sub(1)?).ok()?;
-    user_kernel_stack_top_for_slot(index)
-}
-
-#[cfg(feature = "probe-user-process")]
-fn user_kernel_stack_top_for_slot(index: usize) -> Option<u64> {
-    if index >= rustix_kernel::process::MAX_PROCESSES {
-        return None;
-    }
-    // SAFETY: The index is within the fixed stack table. Each process slot has
-    // a distinct stack, and this single-vCPU probe runs one process at a time.
-    let stack = unsafe {
-        core::ptr::addr_of_mut!(USER_KERNEL_ENTRY_STACKS)
-            .cast::<UserKernelStack>()
-            .add(index)
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+impl ProcessTaskSlot {
+    const EMPTY: Self = Self {
+        occupied: false,
+        root_owned: false,
+        regions: core::mem::MaybeUninit::uninit(),
+        context: core::mem::MaybeUninit::uninit(),
     };
-    // SAFETY: This raw address stays inside the selected static stack object.
-    let stack_start = unsafe { core::ptr::addr_of_mut!((*stack).0).cast::<u8>() };
-    // SAFETY: Stack size is its exact byte extent and is page/alignment-multiple.
-    Some(unsafe { stack_start.add(USER_KERNEL_STACK_SIZE) } as u64)
 }
 
-#[cfg(feature = "probe-user-process")]
-fn process_kernel_entry_stack_top<M: rustix_kernel::paging::CandidatePageTableMemory>(
-    candidate: &rustix_kernel::paging::CandidatePageTables<'_, M>,
-    process_id: rustix_kernel::process::ProcessId,
-) -> Option<u64> {
-    let index = usize::try_from(process_id.get().checked_sub(1)?).ok()?;
-    process_kernel_entry_stack_top_for_slot(candidate, index)
-}
-
-#[cfg(feature = "probe-user-process")]
-fn process_kernel_entry_stack_top_for_slot<M: rustix_kernel::paging::CandidatePageTableMemory>(
-    candidate: &rustix_kernel::paging::CandidatePageTables<'_, M>,
-    index: usize,
-) -> Option<u64> {
-    let entry_top = user_kernel_stack_top_for_slot(index)?;
-    let stack_start = entry_top.checked_sub(USER_KERNEL_STACK_SIZE as u64)?;
-    for address in (stack_start..entry_top).step_by(rustix_kernel::paging::PAGE_SIZE as usize) {
-        match candidate.walk(address) {
-            Ok(rustix_kernel::paging::PageWalkOutcome::Mapped(translation))
-                if translation.permissions.writable
-                    && !translation.permissions.executable
-                    && !translation.permissions.user_accessible => {}
-            _ => return None,
-        }
-    }
-    Some(entry_top)
-}
-
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn finish_active_user_process<M: rustix_kernel::paging::CandidatePageTableMemory>(
     state: &mut ActiveUserProcessSyscallContext,
     roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
@@ -2172,9 +2183,7 @@ fn finish_active_user_process<M: rustix_kernel::paging::CandidatePageTableMemory
         halt_forever();
     }
     // SAFETY: This exit callback runs with IF clear inside a live pinned process task.
-    if !unsafe { crate::kernel_threads::wake_process_exit_waiters(state.runtime_pointer) }
-        || !unsafe { crate::kernel_threads::close_process_start(state.runtime_pointer) }
-    {
+    if !unsafe { crate::kernel_threads::wake_process_exit_waiters(state.runtime_pointer) } {
         halt_forever();
     }
     // SAFETY: The kernel root is active, process root is inactive, and IF=0.
@@ -2182,7 +2191,7 @@ fn finish_active_user_process<M: rustix_kernel::paging::CandidatePageTableMemory
     0
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 extern "C" fn dispatch_active_user_process_syscall(
     raw_context: *mut rustix_kernel::syscall::SyscallContext,
     opaque: *mut (),
@@ -2252,6 +2261,20 @@ extern "C" fn dispatch_active_user_process_syscall(
     } = request
     {
         return dispatch_user_spawn(state_ptr, image_address, image_length, stack_pages);
+    }
+    if let SyscallRequest::Exec {
+        image_address,
+        image_length,
+        stack_pages,
+    } = request
+    {
+        return dispatch_user_exec(
+            state_ptr,
+            raw_context,
+            image_address,
+            image_length,
+            stack_pages,
+        );
     }
 
     // These mutable references are created only after the blocking-wait branch
@@ -2331,11 +2354,12 @@ extern "C" fn dispatch_active_user_process_syscall(
             }
         }
         SyscallRequest::Spawn { .. } => unreachable!("spawn is dispatched before mutable borrows"),
+        SyscallRequest::Exec { .. } => unreachable!("exec is dispatched before mutable borrows"),
         SyscallRequest::Wait { .. } => unreachable!("wait is dispatched before mutable borrows"),
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn dispatch_user_spawn(
     state_ptr: *mut ActiveUserProcessSyscallContext,
     image_address: u64,
@@ -2355,12 +2379,13 @@ fn dispatch_user_spawn(
     let Some(state) = (unsafe { state_ptr.as_ref() }) else {
         return SyscallError::Io.return_value();
     };
-    let slot = state.child_context;
-    if slot.is_null() || unsafe { core::ptr::addr_of!((*slot).ready).read() } {
+    if state.slots.is_null() {
         return SyscallError::NotSupported.return_value();
     }
+    if let Err(error) = copy_user_image_to_staging(state, image_address, image_length) {
+        return error.return_value();
+    }
 
-    let staging = core::ptr::addr_of_mut!(SPAWN_IMAGE_STAGING).cast::<u8>();
     let roots_ptr =
         state
             .roots
@@ -2370,10 +2395,49 @@ fn dispatch_user_spawn(
                 '_,
                 LimineHhdmCandidateMemory<'_>,
             >>();
-    let user_memory_ptr = state.user_memory.cast::<LimineHhdmUserFrameMemory<'_>>();
-    let roots = unsafe { &*roots_ptr };
-    let Some(user_memory) = (unsafe { user_memory_ptr.as_mut() }) else {
-        return SyscallError::Io.return_value();
+    let state = unsafe { &mut *state_ptr };
+    let roots = unsafe { &mut *roots_ptr };
+    switch_process_to_kernel_root(state, roots);
+    let staging = core::ptr::addr_of_mut!(SPAWN_IMAGE_STAGING).cast::<u8>();
+    let image = unsafe { core::slice::from_raw_parts(staging.cast_const(), image_length) };
+    let result = spawn_child_process(state, roots, image, stack_pages);
+    switch_kernel_to_process_root(state, roots);
+    match result {
+        Ok(pid) => pid as i64,
+        Err(error) => error.return_value(),
+    }
+}
+
+/// Copy a bounded user ELF image into kernel-owned staging storage.
+///
+/// Runs while the caller's process root is active; user bytes are accessed only
+/// through checked frame-token copies, never by dereferencing user addresses.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+fn copy_user_image_to_staging(
+    state: &ActiveUserProcessSyscallContext,
+    image_address: u64,
+    image_length: usize,
+) -> Result<(), rustix_kernel::syscall::SyscallError> {
+    use rustix_kernel::syscall::SyscallError;
+
+    let staging = core::ptr::addr_of_mut!(SPAWN_IMAGE_STAGING).cast::<u8>();
+    let roots = unsafe {
+        &*state
+            .roots
+            .cast::<rustix_kernel::paging::ProcessAddressSpaceRoots<
+                '_,
+                '_,
+                '_,
+                LimineHhdmCandidateMemory<'_>,
+            >>()
+    };
+    let Some(user_memory) = (unsafe {
+        state
+            .user_memory
+            .cast::<LimineHhdmUserFrameMemory<'_>>()
+            .as_mut()
+    }) else {
+        return Err(SyscallError::Io);
     };
     let mut copied = 0usize;
     while copied < image_length {
@@ -2385,38 +2449,108 @@ fn dispatch_user_spawn(
         // only through checked frame-token access while the caller root is active.
         match unsafe { roots.copy_from_user(state.process, source, destination, user_memory) } {
             Ok(length) if length == destination.len() => copied += length,
-            Ok(_) => return SyscallError::Fault.return_value(),
+            Ok(_) => return Err(SyscallError::Fault),
             Err(failure) => {
-                return match failure.cause {
-                    rustix_kernel::paging::ProcessUserCopyError::Memory(_) => {
-                        SyscallError::Io.return_value()
-                    }
-                    _ => SyscallError::Fault.return_value(),
-                };
+                return Err(match failure.cause {
+                    rustix_kernel::paging::ProcessUserCopyError::Memory(_) => SyscallError::Io,
+                    _ => SyscallError::Fault,
+                });
             }
         }
     }
+    Ok(())
+}
 
+/// Compute the initial user stack base just below the lower-half canonical end.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+fn initial_user_stack_base(
+    virtual_address_bits: u8,
+    stack_pages: usize,
+) -> Result<u64, rustix_kernel::syscall::SyscallError> {
+    use rustix_kernel::syscall::SyscallError;
+
+    let stack_bytes = (stack_pages as u64)
+        .checked_mul(rustix_kernel::paging::PAGE_SIZE)
+        .ok_or(SyscallError::Overflow)?;
+    let lower_half_shift = u32::from(
+        virtual_address_bits
+            .checked_sub(1)
+            .ok_or(SyscallError::InvalidArgument)?,
+    );
+    let stack_top = 1u64
+        .checked_shl(lower_half_shift)
+        .ok_or(SyscallError::InvalidArgument)?;
+    stack_top
+        .checked_sub(stack_bytes)
+        .ok_or(SyscallError::InvalidArgument)
+}
+
+/// Replace the calling process's image, root, and stack (syscall 11).
+///
+/// On success the saved syscall return frame is rewritten to the replacement
+/// image's validated entry, so the normal IRETQ path resumes Ring 3 there; the
+/// old root is destroyed and the process keeps its PID, descriptors, parent,
+/// children, and task/entry stacks. On any failure the old root is restored
+/// active and the caller continues in the original image.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+fn dispatch_user_exec(
+    state_ptr: *mut ActiveUserProcessSyscallContext,
+    raw_context: *mut rustix_kernel::syscall::SyscallContext,
+    image_address: u64,
+    image_length: usize,
+    stack_pages: usize,
+) -> i64 {
+    use rustix_kernel::syscall::SyscallError;
+
+    if image_length == 0
+        || image_length > rustix_kernel::syscall::MAX_SPAWN_IMAGE_BYTES as usize
+        || stack_pages == 0
+        || stack_pages > rustix_kernel::syscall::MAX_SPAWN_STACK_PAGES as usize
+        || image_address.checked_add(image_length as u64).is_none()
+    {
+        return SyscallError::InvalidArgument.return_value();
+    }
+    let Some(state) = (unsafe { state_ptr.as_ref() }) else {
+        return SyscallError::Io.return_value();
+    };
+    if let Err(error) = copy_user_image_to_staging(state, image_address, image_length) {
+        return error.return_value();
+    }
+
+    let roots_ptr =
+        state
+            .roots
+            .cast::<rustix_kernel::paging::ProcessAddressSpaceRoots<
+                '_,
+                '_,
+                '_,
+                LimineHhdmCandidateMemory<'_>,
+            >>();
     let state = unsafe { &mut *state_ptr };
     let roots = unsafe { &mut *roots_ptr };
     switch_process_to_kernel_root(state, roots);
+    let staging = core::ptr::addr_of_mut!(SPAWN_IMAGE_STAGING).cast::<u8>();
     let image = unsafe { core::slice::from_raw_parts(staging.cast_const(), image_length) };
-    let result = prepare_spawned_user_process(state, roots, slot, image, stack_pages);
-    switch_kernel_to_process_root(state, roots);
-    match result {
-        Ok(pid) => pid as i64,
-        Err(error) => error.return_value(),
+    match exec_replace_process(state, roots, image, stack_pages, raw_context) {
+        Ok(()) => 0,
+        Err(error) => {
+            // The replacement failed; the original root is still owned and the
+            // process must resume in its original image.
+            switch_kernel_to_process_root(state, roots);
+            error.return_value()
+        }
     }
 }
 
-#[cfg(feature = "probe-user-process")]
-fn prepare_spawned_user_process<M: rustix_kernel::paging::CandidatePageTableMemory>(
+/// Prepare and commit one exec replacement with the kernel root active.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+fn exec_replace_process<M: rustix_kernel::paging::CandidatePageTableMemory>(
     state: &mut ActiveUserProcessSyscallContext,
     roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
-    slot: *mut SpawnedProcessTask,
     image: &[u8],
     stack_pages: usize,
-) -> Result<u64, rustix_kernel::syscall::SyscallError> {
+    raw_context: *mut rustix_kernel::syscall::SyscallContext,
+) -> Result<(), rustix_kernel::syscall::SyscallError> {
     use rustix_kernel::paging::CachePolicy;
     use rustix_kernel::process::UserProgramPrepareErrorKind;
     use rustix_kernel::syscall::SyscallError;
@@ -2443,15 +2577,15 @@ fn prepare_spawned_user_process<M: rustix_kernel::paging::CandidatePageTableMemo
                 mtrr_layout,
                 state.normal_caching,
             )
-            .map_err(|_| "no uniform write-back cache policy for spawned process page")
+            .map_err(|_| "no uniform write-back cache policy for exec process page")
     };
-    const USER_STACK_BASE: u64 = 0x0000_7fff_ffff_f000;
+    let stack_base = initial_user_stack_base(state.virtual_address_bits, stack_pages)?;
     let program = match rustix_kernel::process::prepare_user_program(
         roots,
         allocator,
         user_memory,
         image,
-        USER_STACK_BASE,
+        stack_base,
         stack_pages as u64,
         1,
         state.physical_address_bits,
@@ -2478,48 +2612,177 @@ fn prepare_spawned_user_process<M: rustix_kernel::paging::CandidatePageTableMemo
             return Err(error);
         }
     };
+    let new_root_address = match roots.root_physical_address(program.process) {
+        Ok(address) => address,
+        Err(_) => {
+            roots
+                .destroy(allocator, program.process)
+                .unwrap_or_else(|_| halt_forever());
+            return Err(SyscallError::Io);
+        }
+    };
+    let new_cr3 = match rustix_kernel::paging::encode_cr3_value(
+        new_root_address,
+        state.cr3_low_bits,
+        state.physical_address_bits,
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            roots
+                .destroy(allocator, program.process)
+                .unwrap_or_else(|_| halt_forever());
+            return Err(SyscallError::Io);
+        }
+    };
 
-    let process_table_ptr = state.process_table;
-    let Some(process_table) = (unsafe { process_table_ptr.as_mut() }) else {
+    // The old root is inactive (kernel root active). Reclaim it before the
+    // switch; if reclamation fails it remains owned and the exec is rejected.
+    let old_process = state.process;
+    if roots.destroy(allocator, old_process).is_err() {
         roots
             .destroy(allocator, program.process)
             .unwrap_or_else(|_| halt_forever());
         return Err(SyscallError::Io);
+    }
+
+    // SAFETY: The replacement root is complete and owned; IF is clear on this
+    // single vCPU and the shared kernel stacks remain mapped in both roots.
+    unsafe { arch::x86_64::cpu::write_cr3_with_global_flush(new_cr3) };
+    if arch::x86_64::cpu::read_cr3_raw() != new_cr3 {
+        halt_forever();
+    }
+    // SAFETY: CR3 now names the replacement root; the old root was destroyed.
+    if unsafe { roots.mark_active(program.process) }.is_err() {
+        halt_forever();
+    }
+    state.process = program.process;
+    state.process_cr3 = new_cr3;
+    state.user_frame = program.user_frame;
+    let Some(regions) = (unsafe { state.user_regions.as_mut() }) else {
+        halt_forever();
+    };
+    *regions = program.regions;
+
+    // Rewrite the saved return frame so the entry stub's IRETQ resumes Ring 3
+    // at the replacement image. The stub restores the saved user x87/SSE image;
+    // exec deliberately preserves it, and the new entry observes RAX=0.
+    let Some(context) = (unsafe { raw_context.as_mut() }) else {
+        halt_forever();
+    };
+    let frame = program.user_frame.into_raw();
+    context.instruction_pointer = frame.instruction_pointer;
+    context.code_selector = frame.code_selector;
+    context.flags = frame.flags;
+    context.stack_pointer = frame.stack_pointer;
+    context.stack_selector = frame.stack_selector;
+    Ok(())
+}
+
+/// Create one child of the calling process: record, private root, and task.
+///
+/// Runs with the kernel root active and IF clear. Every failure after the
+/// process record is reserved rolls the record back; every failure after root
+/// creation destroys the root; task creation failure leaves no scheduler state.
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+fn spawn_child_process<M: rustix_kernel::paging::CandidatePageTableMemory>(
+    state: &mut ActiveUserProcessSyscallContext,
+    roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+    image: &[u8],
+    stack_pages: usize,
+) -> Result<u64, rustix_kernel::syscall::SyscallError> {
+    use rustix_kernel::paging::CachePolicy;
+    use rustix_kernel::process::UserProgramPrepareErrorKind;
+    use rustix_kernel::syscall::SyscallError;
+
+    let Some(allocator) = (unsafe { state.allocator.as_mut() }) else {
+        return Err(SyscallError::Io);
+    };
+    let Some(user_memory) = (unsafe {
+        state
+            .user_memory
+            .cast::<LimineHhdmUserFrameMemory<'_>>()
+            .as_mut()
+    }) else {
+        return Err(SyscallError::Io);
+    };
+    let Some(mtrr_layout) = (unsafe { state.mtrr_layout.as_ref() }) else {
+        return Err(SyscallError::Io);
+    };
+    let Some(process_table) = (unsafe { state.process_table.as_mut() }) else {
+        return Err(SyscallError::Io);
     };
     let child_id = match process_table.spawn(state.process_id) {
         Ok(pid) => pid,
-        Err(rustix_kernel::process::ProcessTableError::Capacity) => {
-            roots
-                .destroy(allocator, program.process)
-                .unwrap_or_else(|_| halt_forever());
+        Err(rustix_kernel::process::ProcessTableError::Capacity)
+        | Err(rustix_kernel::process::ProcessTableError::ProcessIdExhausted) => {
             return Err(SyscallError::OutOfMemory);
         }
-        Err(_) => {
-            roots
-                .destroy(allocator, program.process)
-                .unwrap_or_else(|_| halt_forever());
-            return Err(SyscallError::InvalidArgument);
+        Err(_) => return Err(SyscallError::InvalidArgument),
+    };
+    let mut select_cache = |mapping: rustix_kernel::paging::ValidatedMappingRange| {
+        mapping
+            .select_cache_attributes(
+                CachePolicy::WriteBack,
+                state.pat,
+                mtrr_layout,
+                state.normal_caching,
+            )
+            .map_err(|_| "no uniform write-back cache policy for spawned process page")
+    };
+    let stack_base = initial_user_stack_base(state.virtual_address_bits, stack_pages)?;
+    let program = match rustix_kernel::process::prepare_user_program(
+        roots,
+        allocator,
+        user_memory,
+        image,
+        stack_base,
+        stack_pages as u64,
+        1,
+        state.physical_address_bits,
+        state.virtual_address_bits,
+        arch::x86_64::interrupts::USER_CODE_SELECTOR,
+        arch::x86_64::interrupts::USER_DATA_SELECTOR,
+        &mut select_cache,
+    ) {
+        Ok(program) => program,
+        Err(failure) => {
+            let error = match failure.kind {
+                UserProgramPrepareErrorKind::InvalidElf
+                | UserProgramPrepareErrorKind::RegionReservation
+                | UserProgramPrepareErrorKind::StackGuard
+                | UserProgramPrepareErrorKind::InvalidInitialState
+                | UserProgramPrepareErrorKind::InvalidIretFrame => SyscallError::InvalidArgument,
+                UserProgramPrepareErrorKind::RootCreation
+                | UserProgramPrepareErrorKind::StackAllocation => SyscallError::OutOfMemory,
+                _ => SyscallError::Io,
+            };
+            if failure.cleanup(roots, allocator).is_err() {
+                halt_forever();
+            }
+            rollback_unstarted_child(process_table, state.process_id, child_id);
+            return Err(error);
         }
     };
-    let child_stack_index = match usize::try_from(child_id.get().checked_sub(1).unwrap_or(u64::MAX))
+
+    let slot_index = match (0..rustix_kernel::process::MAX_PROCESSES)
+        .find(|index| !unsafe { core::ptr::addr_of!((*state.slots.add(*index)).occupied).read() })
     {
-        Ok(index) if index < rustix_kernel::process::MAX_PROCESSES => index,
-        _ => {
-            rollback_unstarted_child(process_table, child_id);
+        Some(index) => index,
+        None => {
             roots
                 .destroy(allocator, program.process)
                 .unwrap_or_else(|_| halt_forever());
+            rollback_unstarted_child(process_table, state.process_id, child_id);
             return Err(SyscallError::OutOfMemory);
         }
     };
-    let child_stack_top = unsafe { *state.kernel_entry_stack_tops.add(child_stack_index) };
     let child_root_address = match roots.root_physical_address(program.process) {
         Ok(address) => address,
         Err(_) => {
-            rollback_unstarted_child(process_table, child_id);
             roots
                 .destroy(allocator, program.process)
                 .unwrap_or_else(|_| halt_forever());
+            rollback_unstarted_child(process_table, state.process_id, child_id);
             return Err(SyscallError::Io);
         }
     };
@@ -2530,27 +2793,75 @@ fn prepare_spawned_user_process<M: rustix_kernel::paging::CandidatePageTableMemo
     ) {
         Ok(value) => value,
         Err(_) => {
-            rollback_unstarted_child(process_table, child_id);
             roots
                 .destroy(allocator, program.process)
                 .unwrap_or_else(|_| halt_forever());
+            rollback_unstarted_child(process_table, state.process_id, child_id);
             return Err(SyscallError::Io);
         }
     };
 
-    // SAFETY: The slot remains stable on the outer probe stack until the task
+    let Some(candidate) = (unsafe {
+        state
+            .kernel_candidate
+            .cast::<rustix_kernel::paging::CandidatePageTables<'_, LimineHhdmCandidateMemory<'_>>>()
+            .as_mut()
+    }) else {
+        roots
+            .destroy(allocator, program.process)
+            .unwrap_or_else(|_| halt_forever());
+        rollback_unstarted_child(process_table, state.process_id, child_id);
+        return Err(SyscallError::Io);
+    };
+    let Some(cpu_info) = (unsafe { state.cpu_info.as_ref() }) else {
+        roots
+            .destroy(allocator, program.process)
+            .unwrap_or_else(|_| halt_forever());
+        rollback_unstarted_child(process_table, state.process_id, child_id);
+        return Err(SyscallError::Io);
+    };
+    // SAFETY: The slot array lives on the outer runtime stack until every task
+    // exits; this slot is unoccupied and unpublished.
+    let slot = unsafe { &mut *state.slots.add(slot_index) };
+    let context_pointer =
+        core::ptr::addr_of_mut!(slot.context).cast::<ActiveUserProcessSyscallContext>();
+    // SAFETY: IF is clear and the pinned runtime stays live. The task becomes
+    // Ready here, but the current task does not block, yield, or exit before
+    // the context is published below, so it cannot dispatch prematurely.
+    let spawned = unsafe {
+        crate::kernel_threads::spawn_process_task(
+            state.runtime_pointer,
+            candidate,
+            allocator,
+            cpu_info,
+            run_user_process_task,
+            context_pointer as usize,
+        )
+    };
+    let (_child_thread, entry_stack_top) = match spawned {
+        Ok(spawned) => spawned,
+        Err(_) => {
+            roots
+                .destroy(allocator, program.process)
+                .unwrap_or_else(|_| halt_forever());
+            rollback_unstarted_child(process_table, state.process_id, child_id);
+            return Err(SyscallError::OutOfMemory);
+        }
+    };
+
+    // SAFETY: The slot remains stable on the outer runtime stack until the task
     // runtime returns, and it has not previously been initialized or published.
     unsafe {
-        core::ptr::addr_of_mut!((*slot).regions)
-            .write(core::mem::MaybeUninit::new(program.regions));
-        core::ptr::addr_of_mut!((*slot).context).write(core::mem::MaybeUninit::new(
+        core::ptr::addr_of_mut!(slot.regions).write(core::mem::MaybeUninit::new(program.regions));
+        core::ptr::addr_of_mut!(slot.context).write(core::mem::MaybeUninit::new(
             ActiveUserProcessSyscallContext {
                 roots: state.roots,
-                kernel_entry_stack_tops: state.kernel_entry_stack_tops,
+                kernel_candidate: state.kernel_candidate,
+                cpu_info: state.cpu_info,
                 cr3_low_bits: state.cr3_low_bits,
                 user_memory: state.user_memory,
                 allocator: state.allocator,
-                user_regions: core::ptr::addr_of_mut!((*slot).regions)
+                user_regions: core::ptr::addr_of_mut!(slot.regions)
                     .cast::<rustix_kernel::process::UserRegionTable>(),
                 process_table: state.process_table,
                 mtrr_layout: state.mtrr_layout,
@@ -2558,34 +2869,34 @@ fn prepare_spawned_user_process<M: rustix_kernel::paging::CandidatePageTableMemo
                 process_id: child_id,
                 kernel_cr3: state.kernel_cr3,
                 process_cr3,
-                kernel_entry_stack_top: child_stack_top,
+                kernel_entry_stack_top: entry_stack_top,
                 runtime_pointer: core::ptr::null_mut(),
                 user_frame: program.user_frame,
-                child_context: core::ptr::null_mut(),
+                slots: state.slots,
+                task_slot: slot_index,
                 pat: state.pat,
                 normal_caching: state.normal_caching,
                 physical_address_bits: state.physical_address_bits,
                 virtual_address_bits: state.virtual_address_bits,
             },
         ));
-        core::ptr::addr_of_mut!((*slot).ready).write(true);
-    }
-    // SAFETY: The child context and all referenced storage are initialized before
-    // publishing the start event; the pinned scheduler runtime remains live.
-    if !unsafe { crate::kernel_threads::wake_process_start_waiter(state.runtime_pointer) } {
-        halt_forever();
+        core::ptr::addr_of_mut!(slot.root_owned).write(true);
+        core::ptr::addr_of_mut!(slot.occupied).write(true);
     }
     Ok(child_id.get())
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn rollback_unstarted_child(
     process_table: &mut rustix_kernel::process::ProcessTable,
+    parent: rustix_kernel::process::ProcessId,
     child_id: rustix_kernel::process::ProcessId,
 ) {
+    // The record was never published to a task; reap it through its real parent
+    // so the slot returns to the pool without leaving a zombie behind.
     if process_table.exit(child_id, 127).is_err()
         || !matches!(
-            process_table.try_wait(rustix_kernel::process::KERNEL_PROCESS_ID, child_id.get()),
+            process_table.try_wait(parent, child_id.get()),
             Ok(rustix_kernel::process::WaitResult::Exited { pid, .. }) if pid == child_id
         )
     {
@@ -2593,7 +2904,37 @@ fn rollback_unstarted_child(
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+fn destroy_spawned_child_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
+    roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+    allocator: &mut rustix_kernel::frame::FrameAllocator,
+    slot: &mut ProcessTaskSlot,
+) -> Result<(), &'static str> {
+    if !slot.occupied || !slot.root_owned {
+        return Ok(());
+    }
+    // SAFETY: A ready slot is initialized before the scheduler can dispatch it.
+    let process = unsafe { slot.context.assume_init_ref() }.process;
+    roots
+        .destroy(allocator, process)
+        .map_err(|_| "inactive spawned process root teardown failed")?;
+    slot.root_owned = false;
+    Ok(())
+}
+
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+fn destroy_spawned_child_roots<M: rustix_kernel::paging::CandidatePageTableMemory>(
+    roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
+    allocator: &mut rustix_kernel::frame::FrameAllocator,
+    slots: &mut [ProcessTaskSlot],
+) -> Result<(), &'static str> {
+    for slot in slots {
+        destroy_spawned_child_root(roots, allocator, slot)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn dispatch_user_wait(
     state_ptr: *mut ActiveUserProcessSyscallContext,
     child_pid: u64,
@@ -2610,7 +2951,7 @@ fn dispatch_user_wait(
         runtime_pointer,
         entry_stack_top,
         virtual_address_bits,
-        child_ptr,
+        slots_ptr,
     ) = unsafe {
         (
             core::ptr::addr_of!((*state_ptr).process_id).read(),
@@ -2626,7 +2967,7 @@ fn dispatch_user_wait(
             core::ptr::addr_of!((*state_ptr).runtime_pointer).read(),
             core::ptr::addr_of!((*state_ptr).kernel_entry_stack_top).read(),
             core::ptr::addr_of!((*state_ptr).virtual_address_bits).read(),
-            core::ptr::addr_of!((*state_ptr).child_context).read(),
+            core::ptr::addr_of!((*state_ptr).slots).read(),
         )
     };
     let result = loop {
@@ -2640,13 +2981,20 @@ fn dispatch_user_wait(
         let rustix_kernel::process::WaitResult::Running { pid } = result else {
             break result;
         };
-        if child_ptr.is_null() || !unsafe { core::ptr::addr_of!((*child_ptr).ready).read() } {
+        if slots_ptr.is_null() {
             return SyscallError::NotSupported.return_value();
         }
-        let child_process = unsafe {
-            core::ptr::addr_of!((*child_ptr).context).cast::<ActiveUserProcessSyscallContext>()
-        };
-        if unsafe { core::ptr::addr_of!((*child_process).process_id).read() } != pid {
+        let child_matches = (0..rustix_kernel::process::MAX_PROCESSES).any(|index| {
+            let slot = unsafe { slots_ptr.add(index) };
+            if !unsafe { core::ptr::addr_of!((*slot).occupied).read() } {
+                return false;
+            }
+            let child_process = unsafe {
+                core::ptr::addr_of!((*slot).context).cast::<ActiveUserProcessSyscallContext>()
+            };
+            unsafe { core::ptr::addr_of!((*child_process).process_id).read() == pid }
+        });
+        if !child_matches {
             return SyscallError::NotSupported.return_value();
         }
 
@@ -2676,7 +3024,7 @@ fn dispatch_user_wait(
     let rustix_kernel::process::WaitResult::Exited { pid, status } = result else {
         return SyscallError::Io.return_value();
     };
-    let (process, roots_ptr, user_memory_ptr) = unsafe {
+    let (process, roots_ptr, user_memory_ptr, allocator_ptr) = unsafe {
         (
             core::ptr::addr_of!((*state_ptr).process).read(),
             core::ptr::addr_of!((*state_ptr).roots)
@@ -2690,6 +3038,9 @@ fn dispatch_user_wait(
             core::ptr::addr_of!((*state_ptr).user_memory)
                 .read()
                 .cast::<LimineHhdmUserFrameMemory<'_>>(),
+            core::ptr::addr_of!((*state_ptr).allocator)
+                .read()
+                .cast::<rustix_kernel::frame::FrameAllocator>(),
         )
     };
     if let Some(user_address) = status_address {
@@ -2711,15 +3062,95 @@ fn dispatch_user_wait(
             }
         }
     }
-    match unsafe { &mut *process_table_ptr }.reap_exited(process_id, pid) {
-        Ok(rustix_kernel::process::WaitResult::Exited { pid: reaped, .. }) if reaped == pid => {
-            pid.get() as i64
-        }
-        _ => SyscallError::InvalidArgument.return_value(),
+
+    let child_slot = if slots_ptr.is_null() {
+        return SyscallError::NotSupported.return_value();
+    } else {
+        (0..rustix_kernel::process::MAX_PROCESSES).find_map(|index| {
+            let slot = unsafe { slots_ptr.add(index) };
+            if !unsafe { core::ptr::addr_of!((*slot).occupied).read() } {
+                return None;
+            }
+            let child_context = unsafe {
+                core::ptr::addr_of!((*slot).context).cast::<ActiveUserProcessSyscallContext>()
+            };
+            (unsafe { core::ptr::addr_of!((*child_context).process_id).read() } == pid)
+                .then_some(slot)
+        })
+    };
+    let Some(child_slot) = child_slot else {
+        return SyscallError::NotSupported.return_value();
+    };
+    // Status copyout must succeed before releasing the child's address space.
+    // If teardown itself fails, the zombie and root ownership remain retryable.
+    let roots = unsafe { &mut *roots_ptr };
+    let allocator = unsafe { &mut *allocator_ptr };
+    let child_slot = unsafe { &mut *child_slot };
+    // SAFETY: An occupied slot was initialized before its task became runnable.
+    let child_task_slot = unsafe { child_slot.context.assume_init_ref() }.task_slot;
+    let state = unsafe { &*state_ptr };
+    // Stack reclamation maps/unmaps in the active kernel root; the child root
+    // is already inactive because its exit path switched away before waking us.
+    switch_process_to_kernel_root(state, roots);
+    let root_was_owned = child_slot.root_owned;
+    if destroy_spawned_child_root(roots, allocator, child_slot).is_err() {
+        switch_kernel_to_process_root(state, roots);
+        return SyscallError::Io.return_value();
     }
+    if root_was_owned {
+        kprintln!(
+            "spawned process root reclaimed after wait: pid={}",
+            pid.get()
+        );
+    }
+    let reaped = matches!(
+        unsafe { &mut *process_table_ptr }.reap_exited(process_id, pid),
+        Ok(rustix_kernel::process::WaitResult::Exited { pid: reaped, .. }) if reaped == pid
+    );
+    if !reaped {
+        switch_kernel_to_process_root(state, roots);
+        return SyscallError::InvalidArgument.return_value();
+    }
+    // The child recorded its exit before waking waiters, but its exit trampoline
+    // may still be returning to its scheduler stack. Yield until the thread has
+    // exited so no continuation can remain on either of its stacks, then return
+    // both stacks and the scheduler slot to their pools for reuse.
+    let Some(child_thread) = (unsafe {
+        crate::kernel_threads::process_task_thread(state.runtime_pointer, child_task_slot)
+    }) else {
+        halt_forever();
+    };
+    if !unsafe { crate::kernel_threads::wait_for_task_exit(state.runtime_pointer, child_thread) } {
+        halt_forever();
+    }
+    let Some(candidate) = (unsafe {
+        state
+            .kernel_candidate
+            .cast::<rustix_kernel::paging::CandidatePageTables<'_, LimineHhdmCandidateMemory<'_>>>()
+            .as_mut()
+    }) else {
+        halt_forever();
+    };
+    // SAFETY: IF is clear, the kernel root is active, the runtime stays pinned,
+    // and the child thread has exited, so both of its stacks are dead.
+    if unsafe {
+        crate::kernel_threads::reap_exited_process_task(
+            state.runtime_pointer,
+            candidate,
+            allocator,
+            child_thread,
+        )
+    }
+    .is_err()
+    {
+        halt_forever();
+    }
+    child_slot.occupied = false;
+    switch_kernel_to_process_root(state, roots);
+    pid.get() as i64
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 extern "C" fn run_user_process_task(runtime_pointer: *mut (), context: usize) {
     let state_ptr = context as *mut ActiveUserProcessSyscallContext;
     if state_ptr.is_null() || runtime_pointer.is_null() {
@@ -2792,32 +3223,7 @@ extern "C" fn run_user_process_task(runtime_pointer: *mut (), context: usize) {
     }
 }
 
-#[cfg(feature = "probe-user-process")]
-extern "C" fn run_deferred_user_process_task(runtime_pointer: *mut (), context: usize) {
-    let slot = context as *mut SpawnedProcessTask;
-    if slot.is_null() || runtime_pointer.is_null() {
-        halt_forever();
-    }
-    loop {
-        // SAFETY: The slot is initialized before the scheduler starts and remains
-        // on the outer probe stack. `ready` is published with IF disabled before
-        // the process-start queue wakes this task.
-        if unsafe { core::ptr::addr_of!((*slot).ready).read() } {
-            let process_context = unsafe {
-                core::ptr::addr_of_mut!((*slot).context).cast::<ActiveUserProcessSyscallContext>()
-            };
-            run_user_process_task(runtime_pointer, process_context as usize);
-            return;
-        }
-        // SAFETY: The scheduler owns this currently running cooperative task;
-        // the pinned runtime stays live until this entry exits.
-        if !unsafe { crate::kernel_threads::wait_for_process_start(runtime_pointer) } {
-            return;
-        }
-    }
-}
-
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn descriptor_error_to_syscall(
     error: rustix_kernel::process::ProcessTableError,
 ) -> rustix_kernel::syscall::SyscallError {
@@ -2831,7 +3237,7 @@ fn descriptor_error_to_syscall(
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn map_anonymous_user_page<M, U>(
     state: &mut ActiveUserProcessSyscallContext,
     roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
@@ -2867,7 +3273,7 @@ where
     map_result.map(|()| region.start())
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn map_anonymous_user_region<M, U>(
     state: &mut ActiveUserProcessSyscallContext,
     roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
@@ -2926,7 +3332,7 @@ where
     result.map(|()| region.start())
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn unmap_anonymous_user_region<M, U>(
     state: &mut ActiveUserProcessSyscallContext,
     roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
@@ -2996,7 +3402,7 @@ where
     Ok(())
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn allocate_and_map_user_page<M, U>(
     state: &mut ActiveUserProcessSyscallContext,
     roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
@@ -3042,7 +3448,7 @@ where
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn unmap_anonymous_user_page<M, U>(
     state: &mut ActiveUserProcessSyscallContext,
     roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
@@ -3121,7 +3527,7 @@ where
     Ok(())
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn user_mapping_attributes(
     state: &ActiveUserProcessSyscallContext,
     virtual_address: u64,
@@ -3165,7 +3571,7 @@ fn user_mapping_attributes(
     Ok((mapping, cache_attributes))
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn switch_process_to_kernel_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
     state: &ActiveUserProcessSyscallContext,
     roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
@@ -3181,7 +3587,7 @@ fn switch_process_to_kernel_root<M: rustix_kernel::paging::CandidatePageTableMem
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn switch_kernel_to_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
     state: &ActiveUserProcessSyscallContext,
     roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
@@ -3199,7 +3605,7 @@ fn switch_kernel_to_process_root<M: rustix_kernel::paging::CandidatePageTableMem
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn user_region_error_to_syscall(
     error: rustix_kernel::process::UserRegionError,
 ) -> rustix_kernel::syscall::SyscallError {
@@ -3215,7 +3621,7 @@ fn user_region_error_to_syscall(
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn page_map_error_to_syscall<E>(
     error: rustix_kernel::paging::ProcessPageMapError<E>,
 ) -> rustix_kernel::syscall::SyscallError {
@@ -3236,7 +3642,7 @@ fn page_map_error_to_syscall<E>(
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 extern "C" fn dispatch_active_user_process_exception(vector: u64, opaque: *mut ()) -> bool {
     if vector >= 128 {
         return false;
@@ -3259,10 +3665,10 @@ extern "C" fn dispatch_active_user_process_exception(vector: u64, opaque: *mut (
     finish_active_user_process(state, roots, 128 + vector as i32) == 0
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 type PreparedUserProgram = rustix_kernel::process::PreparedUserProgram;
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn prepare_user_program<M, U, F>(
     roots: &mut rustix_kernel::paging::ProcessAddressSpaceRoots<'_, '_, '_, M>,
     allocator: &mut rustix_kernel::frame::FrameAllocator,
@@ -3305,7 +3711,7 @@ where
     }
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
 fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
     candidate: &mut rustix_kernel::paging::CandidatePageTables<'_, M>,
     memory_map: &rustix_kernel::memory::MemoryMap,
@@ -3317,13 +3723,13 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
     let mut process_tasks = core::pin::pin!(crate::kernel_threads::new_process_tasks(
         &BOOTSTRAP_TIMER_TICKS
     )?);
-    crate::kernel_threads::prepare_process_task_stacks(
-        process_tasks.as_mut(),
-        candidate,
-        allocator,
-        cpu_info,
-        2,
-    )?;
+    // Pre-create every stack-slot table path before any process root snapshots
+    // the kernel half; later spawn/reap cycles only touch leaves inside them.
+    crate::kernel_threads::prepare_process_stack_tables(candidate, allocator, cpu_info)?;
+    // Table paths created above are retained by the candidate; the baseline
+    // excludes them. Init's task stacks are created inside the probe and are
+    // reclaimed below, so full frame restoration is checked after that.
+    let process_setup_free_frames = allocator.free_frames();
     let result = probe_user_process_root_with_tasks(
         candidate,
         memory_map,
@@ -3338,10 +3744,17 @@ fn probe_user_process_root<M: rustix_kernel::paging::CandidatePageTableMemory>(
         candidate,
         allocator,
     )?;
+    if allocator.free_frames() != process_setup_free_frames {
+        return Err("process-root teardown did not restore its frame count");
+    }
     result
 }
 
-#[cfg(feature = "probe-user-process")]
+#[cfg(all(target_os = "none", feature = "boot-userspace"))]
+#[cfg_attr(
+    feature = "probe-userspace-launch-failure",
+    allow(unused_variables, unused_imports, unused_mut, unreachable_code)
+)]
 fn probe_user_process_root_with_tasks<M: rustix_kernel::paging::CandidatePageTableMemory>(
     candidate: &mut rustix_kernel::paging::CandidatePageTables<'_, M>,
     memory_map: &rustix_kernel::memory::MemoryMap,
@@ -3353,12 +3766,10 @@ fn probe_user_process_root_with_tasks<M: rustix_kernel::paging::CandidatePageTab
 ) -> Result<(), &'static str> {
     use rustix_kernel::paging::{CachePolicy, MtrrState, PatLayout, ProcessAddressSpaceRoots};
 
-    let process_setup_free_frames = allocator.free_frames();
-    let mut kernel_entry_stack_tops = [0; rustix_kernel::process::MAX_PROCESSES];
-    for (index, stack_top) in kernel_entry_stack_tops.iter_mut().enumerate() {
-        *stack_top = process_kernel_entry_stack_top_for_slot(candidate, index)
-            .ok_or("per-process kernel entry stack is not mapped RW/NX and supervisor-only")?;
-    }
+    // Capture the candidate's raw address before the kernel-half snapshot borrows
+    // it; task creation later re-derives a temporary mutable reference from this
+    // pointer while no live reference to the candidate exists (single vCPU, IF=0).
+    let kernel_candidate_pointer = core::ptr::addr_of_mut!(*candidate).cast::<()>();
     let kernel_half = candidate
         .share_supervisor_kernel_half()
         .map_err(|_| "active kernel half could not be shared safely")?;
@@ -3425,19 +3836,23 @@ fn probe_user_process_root_with_tasks<M: rustix_kernel::paging::CandidatePageTab
         Err(error) => return Err(error),
     };
     let process = init_program.process;
-    let mut user_regions = init_program.regions;
     let user_frame = init_program.user_frame;
+
+    // Opt-in normal-boot failure injection: fail after the init root exists so
+    // the error path must reclaim it, restore the frame count, and let the boot
+    // path report the failure and fall back to the shell.
+    #[cfg(feature = "probe-userspace-launch-failure")]
+    {
+        roots
+            .destroy(allocator, process)
+            .map_err(|_| "injected launch failure could not reclaim the init root")?;
+        return Err("injected userspace launch failure after root creation");
+    }
 
     let mut process_table = rustix_kernel::process::ProcessTable::new();
     let process_id = process_table
         .create_initial()
         .map_err(|_| "initial process record could not be created")?;
-    let process_kernel_stack_top = kernel_entry_stack_tops[0];
-    kprintln!(
-        "Ring 3 entry stack validated: pid={}, entry={:#x}",
-        process_id.get(),
-        process_kernel_stack_top
-    );
 
     let root_address = match roots.root_physical_address(process) {
         Ok(address) => address,
@@ -3476,33 +3891,8 @@ fn probe_user_process_root_with_tasks<M: rustix_kernel::paging::CandidatePageTab
         }
     };
 
-    let mut spawned_child_task = SpawnedProcessTask {
-        ready: false,
-        regions: core::mem::MaybeUninit::uninit(),
-        context: core::mem::MaybeUninit::uninit(),
-    };
-    let mut process_context = ActiveUserProcessSyscallContext {
-        roots: core::ptr::addr_of_mut!(roots).cast(),
-        kernel_entry_stack_tops: core::ptr::addr_of!(kernel_entry_stack_tops).cast(),
-        cr3_low_bits: kernel_cr3_root.low_bits(),
-        user_memory: core::ptr::addr_of_mut!(user_memory).cast(),
-        allocator: core::ptr::addr_of_mut!(*allocator),
-        user_regions: core::ptr::addr_of_mut!(user_regions),
-        process_table: core::ptr::addr_of_mut!(process_table),
-        mtrr_layout: core::ptr::addr_of!(mtrr_layout),
-        process,
-        process_id,
-        kernel_cr3,
-        process_cr3,
-        kernel_entry_stack_top: process_kernel_stack_top,
-        runtime_pointer: core::ptr::null_mut(),
-        user_frame,
-        child_context: core::ptr::addr_of_mut!(spawned_child_task),
-        pat,
-        normal_caching: cpu_info.normal_caching,
-        physical_address_bits,
-        virtual_address_bits: cpu_info.active_linear_address_bits,
-    };
+    let mut process_slots: [ProcessTaskSlot; rustix_kernel::process::MAX_PROCESSES] =
+        core::array::from_fn(|_| ProcessTaskSlot::EMPTY);
     // SAFETY: IF was disabled by the caller; all pointer targets remain live
     // until the synchronous user entry returns through its exit syscall.
     if unsafe {
@@ -3513,36 +3903,97 @@ fn probe_user_process_root_with_tasks<M: rustix_kernel::paging::CandidatePageTab
     }
     .is_err()
     {
-        roots
-            .destroy(allocator, child_program.process)
-            .map_err(|_| "child root could not be destroyed after syscall handler setup failed")?;
         roots.destroy(allocator, process).map_err(|_| {
             "process root could not be destroyed after syscall handler setup failed"
         })?;
         return Err("user syscall handler setup failed");
     }
-    let tasks = [
-        (
-            run_user_process_task as crate::kernel_threads::ThreadEntry,
-            core::ptr::addr_of_mut!(process_context) as usize,
-        ),
-        (
-            run_user_process_task as crate::kernel_threads::ThreadEntry,
-            core::ptr::addr_of_mut!(child_context) as usize,
-        ),
-    ];
-    if let Err(error) =
-        crate::kernel_threads::run_prepared_processes(process_tasks.as_mut(), &tasks)
-    {
+
+    // Publish the init context, then create its task. The entry-stack top is
+    // patched after stack mapping and before any dispatch can occur.
+    let slots_pointer = process_slots.as_mut_ptr();
+    // SAFETY: Slot zero is inside the live slot array and is unoccupied.
+    let init_slot = unsafe { &mut *slots_pointer };
+    // SAFETY: The slot array lives on this stack until every task exits; slot
+    // zero is unoccupied and unpublished.
+    unsafe {
+        core::ptr::addr_of_mut!(init_slot.regions)
+            .write(core::mem::MaybeUninit::new(init_program.regions));
+        core::ptr::addr_of_mut!(init_slot.context).write(core::mem::MaybeUninit::new(
+            ActiveUserProcessSyscallContext {
+                roots: core::ptr::addr_of_mut!(roots).cast(),
+                kernel_candidate: kernel_candidate_pointer,
+                cpu_info: core::ptr::from_ref(cpu_info),
+                cr3_low_bits: kernel_cr3_root.low_bits(),
+                user_memory: core::ptr::addr_of_mut!(user_memory).cast(),
+                allocator: core::ptr::addr_of_mut!(*allocator),
+                user_regions: core::ptr::addr_of_mut!(init_slot.regions)
+                    .cast::<rustix_kernel::process::UserRegionTable>(),
+                process_table: core::ptr::addr_of_mut!(process_table),
+                mtrr_layout: core::ptr::addr_of!(mtrr_layout),
+                process,
+                process_id,
+                kernel_cr3,
+                process_cr3,
+                kernel_entry_stack_top: 0,
+                runtime_pointer: core::ptr::null_mut(),
+                user_frame,
+                slots: slots_pointer,
+                task_slot: 0,
+                pat,
+                normal_caching: cpu_info.normal_caching,
+                physical_address_bits,
+                virtual_address_bits: cpu_info.active_linear_address_bits,
+            },
+        ));
+        core::ptr::addr_of_mut!(init_slot.root_owned).write(true);
+        core::ptr::addr_of_mut!(init_slot.occupied).write(true);
+    }
+    // SAFETY: Slot zero is inside the live, exclusively owned slot array.
+    let init_context_pointer = unsafe {
+        core::ptr::addr_of_mut!((*slots_pointer).context).cast::<ActiveUserProcessSyscallContext>()
+    };
+    // SAFETY: The pinned runtime stays at a stable address until all tasks exit.
+    let runtime_pointer =
+        unsafe { crate::kernel_threads::process_runtime_pointer(process_tasks.as_mut()) };
+    // SAFETY: IF is clear, the runtime is pinned, and the init context is
+    // published before the task can dispatch. The candidate reference is
+    // re-derived from its raw address; no live reference aliases it here.
+    let (init_thread, init_entry_stack_top) = match unsafe {
+        crate::kernel_threads::spawn_process_task(
+            runtime_pointer,
+            &mut *kernel_candidate_pointer
+                .cast::<rustix_kernel::paging::CandidatePageTables<'_, LimineHhdmCandidateMemory<'_>>>(),
+            allocator,
+            cpu_info,
+            run_user_process_task,
+            init_context_pointer as usize,
+        )
+    } {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            unsafe { arch::x86_64::interrupts::clear_user_syscall_handler() };
+            destroy_spawned_child_roots(&mut roots, allocator, &mut process_slots)?;
+            return Err(error);
+        }
+    };
+    // SAFETY: The init task has not dispatched; IF remains clear on this CPU.
+    unsafe {
+        core::ptr::addr_of_mut!((*init_context_pointer).kernel_entry_stack_top)
+            .write(init_entry_stack_top);
+        core::ptr::addr_of_mut!((*init_context_pointer).task_slot).write(init_thread.slot_index());
+    }
+    kprintln!(
+        "Ring 3 entry stack validated: pid={}, entry={:#x}",
+        process_id.get(),
+        init_entry_stack_top
+    );
+
+    if let Err(error) = crate::kernel_threads::run_process_runtime(process_tasks.as_mut()) {
         // No process entry began if task preparation failed; the process roots
         // remain inactive and can be reclaimed before returning the setup error.
         unsafe { arch::x86_64::interrupts::clear_user_syscall_handler() };
-        roots
-            .destroy(allocator, child_program.process)
-            .map_err(|_| "inactive child root could not be destroyed after scheduler failure")?;
-        roots
-            .destroy(allocator, process)
-            .map_err(|_| "inactive process root could not be destroyed after scheduler failure")?;
+        destroy_spawned_child_roots(&mut roots, allocator, &mut process_slots)?;
         return Err(error);
     }
     if arch::x86_64::cpu::read_cr3_raw() != kernel_cr3 {
@@ -3554,14 +4005,7 @@ fn probe_user_process_root_with_tasks<M: rustix_kernel::paging::CandidatePageTab
     let exit_status = match process_table.state(process_id) {
         Some(rustix_kernel::process::ProcessState::Exited(status)) => status,
         _ => {
-            roots
-                .destroy(allocator, child_program.process)
-                .map_err(|_| {
-                    "inactive child root could not be destroyed after missing init exit"
-                })?;
-            roots.destroy(allocator, process).map_err(|_| {
-                "inactive process root could not be destroyed after missing init exit"
-            })?;
+            destroy_spawned_child_roots(&mut roots, allocator, &mut process_slots)?;
             return Err("init process task returned without recording its exit");
         }
     };
@@ -3569,14 +4013,7 @@ fn probe_user_process_root_with_tasks<M: rustix_kernel::paging::CandidatePageTab
         match process_table.try_wait(rustix_kernel::process::KERNEL_PROCESS_ID, process_id.get()) {
             Ok(result) => result,
             Err(_) => {
-                roots
-                    .destroy(allocator, child_program.process)
-                    .map_err(|_| {
-                        "inactive child root could not be destroyed after kernel wait failed"
-                    })?;
-                roots.destroy(allocator, process).map_err(|_| {
-                    "inactive process root could not be destroyed after wait failed"
-                })?;
+                destroy_spawned_child_roots(&mut roots, allocator, &mut process_slots)?;
                 return Err("kernel wait could not inspect the init process");
             }
         };
@@ -3584,14 +4021,16 @@ fn probe_user_process_root_with_tasks<M: rustix_kernel::paging::CandidatePageTab
         feature = "probe-user-fault",
         feature = "probe-user-page-fault",
         feature = "probe-user-general-protection",
-        feature = "probe-user-divide-error"
+        feature = "probe-user-divide-error",
+        feature = "probe-user-invalid-syscall-return"
     ))]
     let expected_status = 128 + PROBE_USER_FAULT_VECTOR as i32;
     #[cfg(not(any(
         feature = "probe-user-fault",
         feature = "probe-user-page-fault",
         feature = "probe-user-general-protection",
-        feature = "probe-user-divide-error"
+        feature = "probe-user-divide-error",
+        feature = "probe-user-invalid-syscall-return"
     )))]
     let expected_status = 42;
     if !matches!(
@@ -3606,69 +4045,57 @@ fn probe_user_process_root_with_tasks<M: rustix_kernel::paging::CandidatePageTab
             exit_status,
             expected_status
         );
-        roots
-            .destroy(allocator, child_program.process)
-            .map_err(|_| "inactive child root could not be destroyed after init wait mismatch")?;
-        roots
-            .destroy(allocator, process)
-            .map_err(|_| "inactive process root could not be destroyed after wait mismatch")?;
+        destroy_spawned_child_roots(&mut roots, allocator, &mut process_slots)?;
         return Err("init exit status was not retained and reaped as expected");
     }
-    if matches!(
-        process_table.state(child_process_id),
-        Some(rustix_kernel::process::ProcessState::Running)
-    ) && process_table.exit(child_process_id, 127).is_err()
-    {
-        roots
-            .destroy(allocator, child_program.process)
-            .map_err(|_| "inactive child root could not be destroyed after child cleanup failed")?;
-        roots.destroy(allocator, process).map_err(|_| {
-            "inactive parent root could not be destroyed after child cleanup failed"
-        })?;
-        return Err("unstarted child process could not be exited during cleanup");
+    for slot in &mut process_slots {
+        if !slot.occupied {
+            continue;
+        }
+        // SAFETY: The scheduler has returned, and this slot was initialized
+        // before its task became runnable. Its process root is now inactive.
+        let child_id = unsafe { slot.context.assume_init_ref() }.process_id;
+        if matches!(
+            process_table.state(child_id),
+            Some(rustix_kernel::process::ProcessState::Running)
+        ) && process_table.exit(child_id, 127).is_err()
+        {
+            destroy_spawned_child_roots(&mut roots, allocator, &mut process_slots)?;
+            return Err("unstarted child process could not be exited during cleanup");
+        }
+        if process_table.state(child_id).is_some()
+            && !matches!(
+                process_table.try_wait(
+                    rustix_kernel::process::KERNEL_PROCESS_ID,
+                    child_id.get()
+                ),
+                Ok(rustix_kernel::process::WaitResult::Exited { pid, .. })
+                    if pid == child_id
+            )
+        {
+            destroy_spawned_child_roots(&mut roots, allocator, &mut process_slots)?;
+            return Err("remaining child process record could not be reaped");
+        }
+        if process_table.state(child_id).is_none() && child_id != process_id {
+            kprintln!(
+                "orphaned process reaped by kernel supervisor: pid={}",
+                child_id.get()
+            );
+        }
     }
-    if process_table.state(child_process_id).is_some()
-        && !matches!(
-            process_table.try_wait(
-                rustix_kernel::process::KERNEL_PROCESS_ID,
-                child_process_id.get()
-            ),
-            Ok(rustix_kernel::process::WaitResult::Exited { pid, .. })
-                if pid == child_process_id
-        )
-    {
-        roots
-            .destroy(allocator, child_program.process)
-            .map_err(|_| "inactive child root could not be destroyed after child reap failed")?;
-        roots
-            .destroy(allocator, process)
-            .map_err(|_| "inactive parent root could not be destroyed after child reap failed")?;
-        return Err("remaining child process record could not be reaped");
-    }
+    // Destroys every still-owned root, including init's, after its record was
+    // reaped above; mid-run waits already reclaimed the children they consumed.
+    destroy_spawned_child_roots(&mut roots, allocator, &mut process_slots)?;
     if process_table.live_records() != 0 {
-        roots
-            .destroy(allocator, child_program.process)
-            .map_err(|_| "inactive child root could not be destroyed after process-table leak")?;
-        roots
-            .destroy(allocator, process)
-            .map_err(|_| "inactive process root could not be destroyed after process-table leak")?;
         return Err("process records remained after process teardown");
-    }
-    roots
-        .destroy(allocator, child_program.process)
-        .map_err(|_| "inactive child process root teardown failed")?;
-    roots
-        .destroy(allocator, process)
-        .map_err(|_| "inactive process root teardown failed")?;
-    if allocator.free_frames() != process_setup_free_frames {
-        return Err("process-root teardown did not restore its frame count");
     }
 
     #[cfg(not(any(
         feature = "probe-user-fault",
         feature = "probe-user-page-fault",
         feature = "probe-user-general-protection",
-        feature = "probe-user-divide-error"
+        feature = "probe-user-divide-error",
+        feature = "probe-user-invalid-syscall-return"
     )))]
     kprintln!(
         "init process exited with status {} and was reaped by kernel wait",
@@ -3678,7 +4105,8 @@ fn probe_user_process_root_with_tasks<M: rustix_kernel::paging::CandidatePageTab
         feature = "probe-user-fault",
         feature = "probe-user-page-fault",
         feature = "probe-user-general-protection",
-        feature = "probe-user-divide-error"
+        feature = "probe-user-divide-error",
+        feature = "probe-user-invalid-syscall-return"
     ))]
     kprintln!(
         "user fault vector {} exited with status {} and was reaped by kernel wait",

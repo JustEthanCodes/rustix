@@ -5,7 +5,7 @@
 //! service. It does not install an entry gate or dispatch requests from hardware.
 
 pub const ABI_MAJOR: u16 = 1;
-pub const ABI_MINOR: u16 = 0;
+pub const ABI_MINOR: u16 = 1;
 pub const ABI_VERSION: u64 = (ABI_MAJOR as u64) << 16 | ABI_MINOR as u64;
 pub const MAX_WRITE_BYTES: u64 = 4096;
 pub const USER_ANONYMOUS_PAGE_BYTES: u64 = crate::paging::PAGE_SIZE;
@@ -33,6 +33,7 @@ pub mod number {
     pub const MMAP_REGION: u64 = 8;
     pub const MUNMAP_REGION: u64 = 9;
     pub const SPAWN: u64 = 10;
+    pub const EXEC: u64 = 11;
 }
 
 /// Stable v1 error numbers. Syscall returns encode these as negative `i64`s.
@@ -230,6 +231,11 @@ pub enum SyscallRequest {
         image_length: usize,
         stack_pages: usize,
     },
+    Exec {
+        image_address: u64,
+        image_length: usize,
+        stack_pages: usize,
+    },
     Mmap {
         length: u64,
     },
@@ -420,6 +426,22 @@ pub const fn decode_syscall(
                 stack_pages: arguments.rdx as usize,
             })
         }
+        number::EXEC => {
+            if arguments.rsi == 0 {
+                return Err(SyscallError::InvalidArgument);
+            }
+            if arguments.rsi > MAX_SPAWN_IMAGE_BYTES {
+                return Err(SyscallError::TooBig);
+            }
+            if arguments.rdx == 0 || arguments.rdx > MAX_SPAWN_STACK_PAGES {
+                return Err(SyscallError::InvalidArgument);
+            }
+            Ok(SyscallRequest::Exec {
+                image_address: arguments.rdi,
+                image_length: arguments.rsi as usize,
+                stack_pages: arguments.rdx as usize,
+            })
+        }
         number::MMAP => {
             if arguments.rdi == 0 {
                 return Err(SyscallError::InvalidArgument);
@@ -504,7 +526,7 @@ mod tests {
 
     #[test]
     fn abi_version_and_syscall_numbers_are_stable() {
-        assert_eq!(ABI_VERSION, 0x0001_0000);
+        assert_eq!(ABI_VERSION, 0x0001_0001);
         assert_eq!(number::ABI_VERSION, 0);
         assert_eq!(number::EXIT, 1);
         assert_eq!(number::WRITE, 2);
@@ -516,10 +538,42 @@ mod tests {
         assert_eq!(number::MMAP_REGION, 8);
         assert_eq!(number::MUNMAP_REGION, 9);
         assert_eq!(number::SPAWN, 10);
+        assert_eq!(number::EXEC, 11);
         assert_eq!(
             decode_syscall(number::ABI_VERSION, EMPTY_ARGUMENTS),
             Ok(SyscallRequest::AbiVersion)
         );
+    }
+
+    #[test]
+    fn exec_decodes_like_spawn_and_rejects_invalid_bounds() {
+        let arguments = SyscallArguments {
+            rdi: 0x4000,
+            rsi: MAX_SPAWN_IMAGE_BYTES,
+            rdx: MAX_SPAWN_STACK_PAGES,
+            ..EMPTY_ARGUMENTS
+        };
+        assert_eq!(
+            decode_syscall(number::EXEC, arguments),
+            Ok(SyscallRequest::Exec {
+                image_address: 0x4000,
+                image_length: MAX_SPAWN_IMAGE_BYTES as usize,
+                stack_pages: MAX_SPAWN_STACK_PAGES as usize,
+            })
+        );
+        for (image_length, stack_pages, expected) in [
+            (0, 1, SyscallError::InvalidArgument),
+            (MAX_SPAWN_IMAGE_BYTES + 1, 1, SyscallError::TooBig),
+            (1, 0, SyscallError::InvalidArgument),
+            (1, MAX_SPAWN_STACK_PAGES + 1, SyscallError::InvalidArgument),
+        ] {
+            let arguments = SyscallArguments {
+                rsi: image_length,
+                rdx: stack_pages,
+                ..EMPTY_ARGUMENTS
+            };
+            assert_eq!(decode_syscall(number::EXEC, arguments), Err(expected));
+        }
     }
 
     #[test]
@@ -929,7 +983,7 @@ mod tests {
     #[test]
     fn unassigned_numbers_return_enosys() {
         assert_eq!(
-            decode_syscall(11, EMPTY_ARGUMENTS),
+            decode_syscall(12, EMPTY_ARGUMENTS),
             Err(SyscallError::NoSys)
         );
         assert_eq!(
